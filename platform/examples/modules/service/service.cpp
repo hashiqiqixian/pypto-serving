@@ -31,10 +31,14 @@ int main(int argc, char *argv[])
   // Gathering topology from the topology manager
   const auto topology = hwlocTopologyManager.queryTopology();
 
-  auto d                  = *topology.getDevices().begin();
-  auto memSpaces          = d->getMemorySpaceList();
-  auto bufferMemorySpace  = *memSpaces.begin();
-  auto computeResourcesIt = d->getComputeResourceList().begin();
+  auto d         = *topology.getDevices().begin();
+  auto memSpaces = d->getMemorySpaceList();
+  if (memSpaces.empty()) HICR_THROW_RUNTIME("No memory spaces found on the queried device");
+  auto bufferMemorySpace = *memSpaces.begin();
+
+  const auto &availableComputeResources = d->getComputeResourceList();
+  if (availableComputeResources.size() < 2) HICR_THROW_RUNTIME("Fewer than 2 compute resources available");
+  auto computeResourcesIt = availableComputeResources.begin();
 
   // Use only 2 cores
   std::vector<std::shared_ptr<HiCR::ComputeResource>> computeResources;

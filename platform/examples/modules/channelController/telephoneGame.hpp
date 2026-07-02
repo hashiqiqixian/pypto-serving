@@ -43,5 +43,6 @@ __INLINE__ void telephoneGame(serving::system::channels::Input  &inputChannel,
     printf("[Instance %lu][TelephoneGame] Sending message: %s\n", instanceId, text.c_str());
     auto output = serving::system::channels::Message(reinterpret_cast<const uint8_t *>(text.data()), text.size(), serving::system::channels::Message::metadata_t{});
     outputChannel.pushMessageLocking(output);
+    inputChannel.popMessage();
   }
 }
