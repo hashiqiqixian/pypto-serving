@@ -75,8 +75,16 @@ class Module final : public serving::modules::Module
     return _desiredConsumers[edgeName];
   }
 
-  [[nodiscard]] __INLINE__ bool hasProducer(const edgeName_t edgeName) const { return _actualProducers.contains(edgeName); }
-  [[nodiscard]] __INLINE__ bool hasConsumer(const edgeName_t edgeName) const { return _actualConsumers.contains(edgeName); }
+  [[nodiscard]] __INLINE__ bool hasProducer(const edgeName_t edgeName) const
+  {
+    std::lock_guard lock(_producerMutex);
+    return _actualProducers.contains(edgeName);
+  }
+  [[nodiscard]] __INLINE__ bool hasConsumer(const edgeName_t edgeName) const
+  {
+    std::lock_guard lock(_consumerMutex);
+    return _actualConsumers.contains(edgeName);
+  }
 
   [[nodiscard]] __INLINE__ std::weak_ptr<output_t> getProducer(const edgeName_t edgeName) const
   {

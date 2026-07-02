@@ -242,7 +242,7 @@ class Deployment final
 
         // Make sure all tasks have at least one output
         if (task->getOutputs().size() == 0 && tasksWithDependencies.contains(task->getFunctionName()) == false)
-          HICR_THROW_LOGIC("Deployment specifies task in partition '%'' with function name '%s' without any outputs or dependents\n",
+          HICR_THROW_LOGIC("Deployment specifies task in partition '%s' with function name '%s' without any outputs or dependents\n",
                            partition->getName().c_str(),
                            task->getFunctionName().c_str());
 
