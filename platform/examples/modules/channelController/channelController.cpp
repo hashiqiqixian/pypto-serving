@@ -37,6 +37,7 @@ int main(int argc, char *argv[])
   {
     fprintf(stderr, "Error: Must provide the config file path.\n");
     runtime.instanceManager->abort(-1);
+    return -1;
   }
 
   readAndParseConfiguration(argv, deployment, runtime.instanceManager);

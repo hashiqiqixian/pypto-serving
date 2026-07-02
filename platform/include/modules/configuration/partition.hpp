@@ -76,7 +76,7 @@ class Partition final
   private:
 
   std::string                           _name;
-  HiCR::Instance::instanceId_t          _coordinatorInstanceId;
+  HiCR::Instance::instanceId_t          _coordinatorInstanceId = 0;
   std::vector<std::shared_ptr<Task>>    _tasks;
   std::vector<std::shared_ptr<Replica>> _replicas;
 }; // class Partition
