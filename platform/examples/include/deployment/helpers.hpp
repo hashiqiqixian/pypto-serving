@@ -207,7 +207,10 @@ __INLINE__ void readAndParseConfiguration(char                                  
 
   inferEdgeEndpointsFromTasks(deployment);
 
-  const auto instancesRequired = deployment.getPartitions().size() + (deployment.getPartitions().size() * replicasPerPartition);
+  // The coordinator is co-located with the first replica, so each partition needs
+  // 1 instance for the coordinator + (replicasPerPartition - 1) extra replica instances.
+  const auto extraReplicasPerPartition = replicasPerPartition > 0 ? replicasPerPartition - 1 : 0;
+  const auto instancesRequired         = deployment.getPartitions().size() + (deployment.getPartitions().size() * extraReplicasPerPartition);
 
   if (instanceManager->getInstances().size() < instancesRequired)
   {
@@ -224,8 +227,10 @@ __INLINE__ void readAndParseConfiguration(char                                  
     partition->setCoordinatorInstanceId(partitionInstanceId);
     for (size_t i = 0; i < replicasPerPartition; i++)
     {
-      const auto replica = std::make_shared<serving::configuration::Replica>(partitionInstanceId);
-      partition->addReplica(replica);
+      // First replica is co-located with the coordinator; subsequent ones get their own instance.
+      const auto replicaInstanceId = (i == 0) ? partitionInstanceId : (*instance)->getId();
+      if (i > 0) ++instance;
+      partition->addReplica(std::make_shared<serving::configuration::Replica>(replicaInstanceId));
     }
   }
 }
