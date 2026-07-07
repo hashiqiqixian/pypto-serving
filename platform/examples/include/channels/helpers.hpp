@@ -118,6 +118,23 @@ __INLINE__ void waitUntilReady(const std::shared_ptr<serving::system::channels::
   while (!channel->isReady()) { std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs)); }
 }
 
+__INLINE__ std::shared_ptr<serving::configuration::Edge> getEdgeByName(serving::configuration::Deployment &deployment, const std::string &edgeName)
+{
+  for (const auto &edge : deployment.getEdges())
+    if (edge->getName() == edgeName) return edge;
+  HICR_THROW_LOGIC("Deployment has no edge named '%s'.", edgeName.c_str());
+}
+
+__INLINE__ std::string makeCoordinatorToReplicaEdgeName(const std::string &edgeName, const HiCR::Instance::instanceId_t coordinatorId, const HiCR::Instance::instanceId_t replicaId)
+{
+  return edgeName + "-coordinator" + std::to_string(coordinatorId) + "-replica" + std::to_string(replicaId);
+}
+
+__INLINE__ std::string makeReplicaToCoordinatorEdgeName(const std::string &edgeName, const HiCR::Instance::instanceId_t replicaId, const HiCR::Instance::instanceId_t coordinatorId)
+{
+  return edgeName + "-replica" + std::to_string(replicaId) + "-coordinator" + std::to_string(coordinatorId);
+}
+
 __INLINE__ serving::configuration::Edge makeInternalEdgeFromTemplate(const std::string &name, const serving::configuration::Edge &edgeTemplate)
 {
   serving::configuration::Edge edge(name, edgeTemplate.getBufferCapacity(), edgeTemplate.getBufferSize());
