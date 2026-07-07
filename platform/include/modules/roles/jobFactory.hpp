@@ -16,13 +16,12 @@ class JobFactory
 {
   public:
 
-  using instanceId_t = HiCR::Instance::instanceId_t;
   using jobName_t    = std::string;
   using dependency_t = std::string;
 
-  JobFactory(const instanceId_t instanceId, const configuration::Deployment &deployment)
-    : _jobInputDependencies(buildTaskInputDependencies(*deployment.getPartitions()[instanceId])),
-      _jobOutputDependencies(buildTaskOutputDependencies(*deployment.getPartitions()[instanceId])),
+  JobFactory(const size_t partitionIndex, const configuration::Deployment &deployment)
+    : _jobInputDependencies(buildTaskInputDependencies(*deployment.getPartitions().at(partitionIndex))),
+      _jobOutputDependencies(buildTaskOutputDependencies(*deployment.getPartitions().at(partitionIndex))),
       _edgeInfos(buildEdgeInfos(deployment))
   {}
 

@@ -118,14 +118,20 @@ class Module final : public serving::modules::Module
     if (_inputNames.contains(inputName) == false) HICR_THROW_RUNTIME("Replica received undeclared input dependency '%s'.", inputName.c_str());
     if (message.getData() == nullptr && message.getSize() > 0) HICR_THROW_RUNTIME("Replica received null input data for dependency '%s' with non-zero size.", inputName.c_str());
 
-    const auto jobId = message.getMetadata().getId();
+    // Copy data before acquiring the lock to avoid serializing memcpy/fence under contention.
+    const auto copiedData = copyMessageData(inputName, message);
+    const auto jobId      = message.getMetadata().getId();
     ActiveJob  activeJob;
     {
       std::lock_guard lock(_activeJobsMutex);
       if (_activeJobs.contains(jobId) == false) _activeJobs[jobId] = ActiveJob{.metadata = message.getMetadata()};
       auto &job = _activeJobs.at(jobId);
-      if (job.inputs.contains(inputName)) HICR_THROW_RUNTIME("Replica received duplicate input dependency '%s' for job %lu.", inputName.c_str(), jobId);
-      job.inputs[inputName] = copyMessageData(inputName, message);
+      if (job.inputs.contains(inputName))
+      {
+        if (copiedData != nullptr) _inputChannels.at(inputName)->getConfig().payloadMemoryManager->freeLocalMemorySlot(copiedData);
+        HICR_THROW_RUNTIME("Replica received duplicate input dependency '%s' for job %lu.", inputName.c_str(), jobId);
+      }
+      job.inputs[inputName] = copiedData;
       if (isReady(job) == false) return;
 
       activeJob = std::move(job);
