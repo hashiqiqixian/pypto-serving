@@ -32,8 +32,8 @@ class Job
 
   ~Job() = default;
 
-  [[nodiscard]] __INLINE__ Dependency &getInputDependency(const dependency_t dependencyName) { return _inputDependencies.at(dependencyName); }
-  [[nodiscard]] __INLINE__ Dependency &getOutputDependency(const dependency_t dependencyName) { return _outputDependencies.at(dependencyName); }
+  [[nodiscard]] __INLINE__ Dependency &getInputDependency(const dependency_t &dependencyName) { return _inputDependencies.at(dependencyName); }
+  [[nodiscard]] __INLINE__ Dependency &getOutputDependency(const dependency_t &dependencyName) { return _outputDependencies.at(dependencyName); }
   [[nodiscard]] __INLINE__ std::unordered_map<dependency_t, Dependency> &getInputDependencies() { return _inputDependencies; }
   [[nodiscard]] __INLINE__ std::unordered_map<dependency_t, Dependency> &getOutputDependencies() { return _outputDependencies; }
   [[nodiscard]] __INLINE__ const std::unordered_map<dependency_t, Dependency> &getInputDependencies() const { return _inputDependencies; }
