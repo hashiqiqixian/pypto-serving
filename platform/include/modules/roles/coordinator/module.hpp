@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -18,6 +19,8 @@
 #include <system/channels/input.hpp>
 #include <system/channels/message.hpp>
 #include <system/channels/output.hpp>
+
+#include <system/runtimePlan.hpp>
 
 #include "../job.hpp"
 #include "../jobFactory.hpp"
@@ -47,8 +50,10 @@ class Module final : public modules::Module
 
   using completionCallback_t = std::function<void(const metadata_t &metadata, const std::vector<JobOutput> &outputs)>;
 
-  Module(const size_t intervalMs)
-    : modules::Module(intervalMs)
+  // partitionName is recorded in RuntimePlan snapshots.
+  Module(const size_t intervalMs, const std::string &partitionName = "")
+    : modules::Module(intervalMs),
+      _partitionName(partitionName)
   {}
 
   using inputChannelMap_t  = std::unordered_map<edgeName_t, output_t>;
@@ -57,11 +62,53 @@ class Module final : public modules::Module
   __INLINE__ void addReplica(const instanceId_t replicaId, const inputChannelMap_t &inputChannels, const outputChannelMap_t &outputChannels)
   {
     if (_replicas.contains(replicaId)) HICR_THROW_LOGIC("Replica %lu already registered.", replicaId);
-    _replicas[replicaId] = ReplicaChannels{
+    _replicas[replicaId] = ReplicaEntry{
       .inputChannels  = inputChannels,
       .outputChannels = outputChannels,
+      .status         = system::RuntimePlan::ReplicaStatus::Active,
     };
     _readyReplicas.push(replicaId);
+    _planVersion.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  // Begin draining replica replicaId: no new jobs will be dispatched to it.
+  // The replica finishes any job currently in flight, then goes idle.
+  // Caller must wait for in-flight work to complete before calling removeReplica.
+  __INLINE__ void drainReplica(const instanceId_t replicaId)
+  {
+    std::lock_guard lock(_replicaStatusMutex);
+    if (_replicas.contains(replicaId) == false) HICR_THROW_LOGIC("drainReplica: unknown replica %lu.", replicaId);
+    if (_replicas.at(replicaId).status != system::RuntimePlan::ReplicaStatus::Active) HICR_THROW_LOGIC("drainReplica: replica %lu is not Active.", replicaId);
+    _replicas.at(replicaId).status = system::RuntimePlan::ReplicaStatus::Draining;
+    _planVersion.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  // Remove a drained replica. The replica must be Draining (not Active).
+  // After this call the replica's channels may be torn down safely.
+  __INLINE__ void removeReplica(const instanceId_t replicaId)
+  {
+    std::lock_guard lock(_replicaStatusMutex);
+    if (_replicas.contains(replicaId) == false) HICR_THROW_LOGIC("removeReplica: unknown replica %lu.", replicaId);
+    if (_replicas.at(replicaId).status != system::RuntimePlan::ReplicaStatus::Draining) HICR_THROW_LOGIC("removeReplica: replica %lu must be Draining before removal.", replicaId);
+    _replicas.at(replicaId).status = system::RuntimePlan::ReplicaStatus::Removed;
+    _planVersion.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  // Return an immutable snapshot of the current deployment runtime state.
+  [[nodiscard]] __INLINE__ system::RuntimePlan getRuntimePlan() const
+  {
+    system::RuntimePlan plan;
+    plan.version = _planVersion.load(std::memory_order_relaxed);
+
+    system::RuntimePlan::PartitionState part;
+    part.name = _partitionName;
+    {
+      std::lock_guard lock(_replicaStatusMutex);
+      part.replicas.reserve(_replicas.size());
+      for (const auto &[id, entry] : _replicas) part.replicas.push_back({id, entry.status});
+    }
+    plan.partitions.push_back(std::move(part));
+    return plan;
   }
 
   __INLINE__ void addMessageType(const messageType_t messageType) { _messageTypes.insert(messageType); }
@@ -133,10 +180,11 @@ class Module final : public modules::Module
 
   private:
 
-  struct ReplicaChannels
+  struct ReplicaEntry
   {
-    inputChannelMap_t  inputChannels;
-    outputChannelMap_t outputChannels;
+    inputChannelMap_t                  inputChannels;
+    outputChannelMap_t                 outputChannels;
+    system::RuntimePlan::ReplicaStatus status{system::RuntimePlan::ReplicaStatus::Active};
   };
 
   __INLINE__ void dispatchReadyJobs()
@@ -156,17 +204,30 @@ class Module final : public modules::Module
       return;
     }
 
+    // Find the next Active replica, discarding any Draining/Removed entries
+    // that were enqueued before a status transition.
     instanceId_t replicaId;
+    bool         found = false;
     {
       std::lock_guard lock(_readyReplicasMutex);
-      if (_readyReplicas.empty())
+      while (!_readyReplicas.empty())
       {
-        std::lock_guard pendingLock(_pendingJobsMutex);
-        _pendingJobs.push(job);
-        return;
+        const auto candidate = _readyReplicas.front();
+        _readyReplicas.pop();
+        std::lock_guard statusLock(_replicaStatusMutex);
+        if (_replicas.contains(candidate) && _replicas.at(candidate).status == system::RuntimePlan::ReplicaStatus::Active)
+        {
+          replicaId = candidate;
+          found     = true;
+          break;
+        }
       }
-      replicaId = _readyReplicas.front();
-      _readyReplicas.pop();
+    }
+    if (!found)
+    {
+      std::lock_guard pendingLock(_pendingJobsMutex);
+      _pendingJobs.push(job);
+      return;
     }
 
     {
@@ -229,6 +290,18 @@ class Module final : public modules::Module
       _replicaJobs.erase(replicaId);
     }
 
+    // Only re-queue the replica if it is still Active; Draining/Removed replicas
+    // go idle after completing their last in-flight job.
+    // Check status under its own lock, then conditionally enqueue under a
+    // separate lock — avoids holding both mutexes simultaneously.  A benign
+    // race (status changes after the check) is handled by dispatchReadyJobs,
+    // which discards non-Active entries when it dequeues them.
+    bool shouldRequeue = false;
+    {
+      std::lock_guard statusLock(_replicaStatusMutex);
+      shouldRequeue = _replicas.contains(replicaId) && _replicas.at(replicaId).status == system::RuntimePlan::ReplicaStatus::Active;
+    }
+    if (shouldRequeue)
     {
       std::lock_guard lock(_readyReplicasMutex);
       _readyReplicas.push(replicaId);
@@ -238,7 +311,11 @@ class Module final : public modules::Module
     for (auto &[_, outputDependency] : job->getOutputDependencies()) { outputDependency.freeDataSlot(); }
   }
 
-  std::unordered_map<instanceId_t, ReplicaChannels> _replicas;
+  std::string           _partitionName;
+  std::atomic<uint64_t> _planVersion{0};
+  mutable std::mutex    _replicaStatusMutex;
+
+  std::unordered_map<instanceId_t, ReplicaEntry> _replicas;
 
   std::unordered_set<messageType_t> _messageTypes;
 
