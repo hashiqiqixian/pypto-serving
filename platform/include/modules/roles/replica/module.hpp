@@ -140,6 +140,25 @@ class Module final : public serving::modules::Module
 
     auto                                 outputConfigs = buildOutputConfigs();
     serving::modules::roles::TaskContext context(_taskName, activeJob.metadata, activeJob.inputs, outputConfigs);
+
+    // Scope guard: if _processFc or any output validation throws, free owned
+    // outputs and input slots before unwinding to prevent slot leaks.
+    struct CleanupGuard
+    {
+      serving::modules::roles::TaskContext &context;
+      ActiveJob                            &activeJob;
+      std::function<void(ActiveJob &)>      freeInputSlotsFn;
+      bool                                  dismissed = false;
+      ~CleanupGuard()
+      {
+        if (!dismissed)
+        {
+          context.freeOwnedOutputs();
+          freeInputSlotsFn(activeJob);
+        }
+      }
+    } guard{context, activeJob, [this](ActiveJob &j) { freeInputSlots(j); }};
+
     _processFc(context);
 
     std::unordered_set<edgeName_t> sentOutputs;
@@ -148,16 +167,23 @@ class Module final : public serving::modules::Module
       if (_outputNames.contains(output.name) == false) HICR_THROW_RUNTIME("Task '%s' set undeclared output dependency '%s'.", _taskName.c_str(), output.name.c_str());
       if (sentOutputs.contains(output.name)) HICR_THROW_RUNTIME("Task '%s' set output dependency '%s' more than once.", _taskName.c_str(), output.name.c_str());
       sentOutputs.insert(output.name);
-
-      const auto response = message_t(
-        output.data == nullptr ? nullptr : static_cast<const uint8_t *>(output.data->getPointer()), output.data == nullptr ? 0 : output.data->getSize(), activeJob.metadata);
-      _outputChannels.at(output.name)->pushMessageLocking(response);
     }
 
     for (const auto &outputName : _outputNames)
       if (sentOutputs.contains(outputName) == false) HICR_THROW_RUNTIME("Task '%s' did not set output dependency '%s'.", _taskName.c_str(), outputName.c_str());
 
-    context.freeOwnedOutputs();
+    // All validation passed. Dismiss the guard so outputs stay alive for the
+    // coordinator completion callback, which is responsible for freeing them.
+    guard.dismissed = true;
+
+    for (const auto &output : context.getOutputs())
+    {
+      const auto response = message_t(
+        output.data == nullptr ? nullptr : static_cast<const uint8_t *>(output.data->getPointer()), output.data == nullptr ? 0 : output.data->getSize(), activeJob.metadata);
+      _outputChannels.at(output.name)->pushMessageLocking(response);
+    }
+
+    // Input slots are no longer needed once outputs have been dispatched.
     freeInputSlots(activeJob);
   }
 

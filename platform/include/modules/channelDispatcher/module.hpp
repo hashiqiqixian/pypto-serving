@@ -74,12 +74,13 @@ class Module final : public modules::Module
     for (const auto &edge : _pollEdges)
     {
       edge->lock();
-
-      if (edge->hasMessage() == false)
+      struct EdgeUnlockGuard
       {
-        edge->unlock();
-        continue;
-      }
+        const std::shared_ptr<channels::Input> &edge;
+        ~EdgeUnlockGuard() { edge->unlock(); }
+      } unlockGuard{edge};
+
+      if (edge->hasMessage() == false) { continue; }
 
       const auto       message     = edge->getMessage();
       const auto       messageType = message.getMetadata().type;
@@ -90,15 +91,13 @@ class Module final : public modules::Module
         if (_subscriptionToHandlerMap.contains(key) == false)
         {
           printf("[ChannelDispatcher] No handler found for message type %u. Message will be ignored.\n", messageType);
-          edge->unlock();
+          edge->popMessage();
           continue;
         }
         handler = _subscriptionToHandlerMap.at(key);
       }
       handler(edge, message);
       edge->popMessage();
-
-      edge->unlock();
     }
   }
 

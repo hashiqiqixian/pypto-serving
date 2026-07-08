@@ -45,7 +45,7 @@ class TaskContext final
   {
     if (_inputs.contains(name) == false) HICR_THROW_RUNTIME("Task '%s' has no input '%s'.", _name.c_str(), name.c_str());
     const auto &input = _inputs.at(name);
-    if (input == nullptr) HICR_THROW_RUNTIME("Task '%s' input '%s' has no memory slot.", _name.c_str(), name.c_str());
+    if (input == nullptr) return _emptySlot;
     return input;
   }
 
@@ -94,6 +94,7 @@ class TaskContext final
 
   private:
 
+  inline static const memorySlot_t                     _emptySlot = std::make_shared<HiCR::LocalMemorySlot>(nullptr, 0);
   const std::string                                    _name;
   const metadata_t                                     _metadata;
   const std::unordered_map<std::string, memorySlot_t> &_inputs;

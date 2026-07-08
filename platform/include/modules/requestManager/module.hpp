@@ -39,7 +39,7 @@ class Module final : public serving::modules::Module
 
     Prompt(const metadata_t metadata, const uint8_t *data, const size_t size)
       : _metadata(metadata),
-        _input(data, data + size)
+        _input((size > 0 && data != nullptr) ? std::vector<uint8_t>(data, data + size) : std::vector<uint8_t>{})
     {}
 
     [[nodiscard]] const metadata_t           &getMetadata() const { return _metadata; }
