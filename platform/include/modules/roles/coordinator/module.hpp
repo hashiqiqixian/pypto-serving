@@ -104,15 +104,43 @@ class Module final : public modules::Module
   }
 
   // Begin draining replica replicaId: no new jobs will be dispatched to it.
-  // The replica finishes any job currently in flight, then goes idle.
-  // Caller must wait for in-flight work to complete before calling removeReplica.
+  // If the replica is idle when drained (no in-flight job), the drainCallback
+  // fires synchronously before this method returns.  If the replica has a job
+  // in flight, the drainCallback fires from replicaResponseHandler when that
+  // job completes.  removeReplica is safe only after the callback fires.
   __INLINE__ void drainReplica(const instanceId_t replicaId)
   {
-    std::unique_lock lock(_replicasMutex);
-    if (_replicas.contains(replicaId) == false) HICR_THROW_LOGIC("drainReplica: unknown replica %lu.", replicaId);
-    if (_replicas.at(replicaId).status != system::RuntimePlan::ReplicaStatus::Active) HICR_THROW_LOGIC("drainReplica: replica %lu is not Active.", replicaId);
-    _replicas.at(replicaId).status = system::RuntimePlan::ReplicaStatus::Draining;
-    _planVersion.fetch_add(1, std::memory_order_relaxed);
+    {
+      std::unique_lock lock(_replicasMutex);
+      if (_replicas.contains(replicaId) == false) HICR_THROW_LOGIC("drainReplica: unknown replica %lu.", replicaId);
+      if (_replicas.at(replicaId).status != system::RuntimePlan::ReplicaStatus::Active) HICR_THROW_LOGIC("drainReplica: replica %lu is not Active.", replicaId);
+      _replicas.at(replicaId).status = system::RuntimePlan::ReplicaStatus::Draining;
+      _planVersion.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Check idle (no in-flight job) outside _replicasMutex to avoid ordering
+    // inversion with _replicaJobsMutex.  A narrow race exists: if dispatch is
+    // mid-assignment (status checked as Active, not yet in _replicaJobs), the
+    // callback may fire before the last job completes.  Callers who drain only
+    // after waiting for all pending completions do not encounter this race.
+    bool idle = false;
+    {
+      std::lock_guard jobsLock(_replicaJobsMutex);
+      idle = !_replicaJobs.contains(replicaId);
+    }
+    if (idle)
+    {
+      bool shouldNotify = false;
+      {
+        std::unique_lock lock(_replicasMutex);
+        auto            &entry = _replicas.at(replicaId);
+        if (!entry.idleNotified)
+        {
+          entry.idleNotified = true;
+          shouldNotify       = true;
+        }
+      }
+      if (shouldNotify && _drainCallback) _drainCallback(replicaId);
+    }
   }
 
   // Remove a drained replica. The replica must be Draining (not Active).

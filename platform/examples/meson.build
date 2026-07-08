@@ -4,6 +4,7 @@ subdir('modules/broadcastDeployment')
 subdir('modules/channelController')
 subdir('modules/coordinatorReplica')
 subdir('modules/singlePartition')
+subdir('modules/dynamicScaling')
 subdir('modules/service')
 
 subdir('system/engine')
