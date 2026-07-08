@@ -49,6 +49,7 @@ class Module final : public modules::Module
   };
 
   using completionCallback_t = std::function<void(const metadata_t &metadata, const std::vector<JobOutput> &outputs)>;
+  using drainCallback_t      = std::function<void(instanceId_t replicaId)>;
 
   // partitionName is recorded in RuntimePlan snapshots.
   Module(const size_t intervalMs, const std::string &partitionName = "")
@@ -114,6 +115,11 @@ class Module final : public modules::Module
   __INLINE__ void addMessageType(const messageType_t messageType) { _messageTypes.insert(messageType); }
 
   __INLINE__ void setCompletionCallback(completionCallback_t callback) { _completionCallback = callback; }
+
+  // Called exactly once per replica when it transitions Draining → idle (no
+  // more in-flight jobs and no new jobs will be assigned).  Safe to call
+  // removeReplica() and tear down channels from inside the callback.
+  __INLINE__ void setDrainCallback(drainCallback_t callback) { _drainCallback = std::move(callback); }
 
   __INLINE__ void submitJob(const std::shared_ptr<Job> &job)
   {
@@ -185,6 +191,7 @@ class Module final : public modules::Module
     inputChannelMap_t                  inputChannels;
     outputChannelMap_t                 outputChannels;
     system::RuntimePlan::ReplicaStatus status{system::RuntimePlan::ReplicaStatus::Active};
+    bool                               idleNotified{false};
   };
 
   __INLINE__ void dispatchReadyJobs()
@@ -205,9 +212,11 @@ class Module final : public modules::Module
     }
 
     // Find the next Active replica, discarding any Draining/Removed entries
-    // that were enqueued before a status transition.
-    instanceId_t replicaId;
-    bool         found = false;
+    // that were enqueued before a status transition.  Collect drain
+    // notifications so the callback fires outside all locks.
+    instanceId_t              replicaId;
+    bool                      found = false;
+    std::vector<instanceId_t> drainNotifications;
     {
       std::lock_guard lock(_readyReplicasMutex);
       while (!_readyReplicas.empty())
@@ -215,14 +224,23 @@ class Module final : public modules::Module
         const auto candidate = _readyReplicas.front();
         _readyReplicas.pop();
         std::lock_guard statusLock(_replicaStatusMutex);
-        if (_replicas.contains(candidate) && _replicas.at(candidate).status == system::RuntimePlan::ReplicaStatus::Active)
+        if (!_replicas.contains(candidate)) continue;
+        auto &entry = _replicas.at(candidate);
+        if (entry.status == system::RuntimePlan::ReplicaStatus::Active)
         {
           replicaId = candidate;
           found     = true;
           break;
         }
+        if (entry.status == system::RuntimePlan::ReplicaStatus::Draining && !entry.idleNotified)
+        {
+          entry.idleNotified = true;
+          drainNotifications.push_back(candidate);
+        }
       }
     }
+    for (const auto id : drainNotifications)
+      if (_drainCallback) _drainCallback(id);
     if (!found)
     {
       std::lock_guard pendingLock(_pendingJobsMutex);
@@ -290,22 +308,31 @@ class Module final : public modules::Module
       _replicaJobs.erase(replicaId);
     }
 
-    // Only re-queue the replica if it is still Active; Draining/Removed replicas
-    // go idle after completing their last in-flight job.
-    // Check status under its own lock, then conditionally enqueue under a
-    // separate lock — avoids holding both mutexes simultaneously.  A benign
-    // race (status changes after the check) is handled by dispatchReadyJobs,
-    // which discards non-Active entries when it dequeues them.
+    // Re-queue only if Active.  If Draining and not yet notified, fire the
+    // drain callback (exactly once, guarded by idleNotified).  Both checks
+    // happen under _replicaStatusMutex; the callback and enqueue happen
+    // outside all locks to avoid inversion and allow re-entrant calls.
     bool shouldRequeue = false;
+    bool drainIdle     = false;
     {
       std::lock_guard statusLock(_replicaStatusMutex);
-      shouldRequeue = _replicas.contains(replicaId) && _replicas.at(replicaId).status == system::RuntimePlan::ReplicaStatus::Active;
+      if (_replicas.contains(replicaId))
+      {
+        auto &entry = _replicas.at(replicaId);
+        if (entry.status == system::RuntimePlan::ReplicaStatus::Active) { shouldRequeue = true; }
+        else if (entry.status == system::RuntimePlan::ReplicaStatus::Draining && !entry.idleNotified)
+        {
+          entry.idleNotified = true;
+          drainIdle          = true;
+        }
+      }
     }
     if (shouldRequeue)
     {
       std::lock_guard lock(_readyReplicasMutex);
       _readyReplicas.push(replicaId);
     }
+    if (drainIdle && _drainCallback) _drainCallback(replicaId);
     if (_completionCallback != nullptr) { _completionCallback(job->getMetadata(), outputs); }
 
     for (auto &[_, outputDependency] : job->getOutputDependencies()) { outputDependency.freeDataSlot(); }
@@ -332,5 +359,6 @@ class Module final : public modules::Module
   std::mutex                                    _replicaJobsMutex;
 
   completionCallback_t _completionCallback;
+  drainCallback_t      _drainCallback;
 };
 } // namespace serving::modules::roles::coordinator
