@@ -25,6 +25,7 @@ platform/
 ## Documentation
 
 - [Architecture](architecture.md): instance roles, module system, channel model, and scope.
+- [Model Support Quick-Start](model-support-quickstart.md): wire your inference kernel into the coordinator→replica path, understand the `processFc` interface, and benchmark framework overhead.
 - [Simpler Integration](simpler-integration.md): how replica ranks launch Simpler, the `processFc` interface, and the path to in-device tensor channels.
 - [Model Support Interface](model-support-interface.md): what Model Support owns, provides, and will consume from the platform.
 - [System](system/README.md): engine lifecycle and cross-instance start/stop control.
