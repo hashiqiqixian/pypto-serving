@@ -543,15 +543,19 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
 
     @classmethod
     def _stage_stacked_decode_weights(cls, model: RuntimeModel) -> dict[str, torch.Tensor]:
-        """Stream per-layer weights straight into pre-allocated stacked shm
-        tensors, one layer at a time.
+        """Stage per-layer weights into pre-allocated stacked shm tensors,
+        copying layers in parallel across worker threads.
 
         Same output as building every per-layer ``_KernelLayerWeights`` and then
-        ``torch.cat``-ing them (see ``_stack_decode_weights``), but never holds
-        the full per-layer staging set and the stacked copy in shared memory at
-        once: peak host memory drops from ~2x the model to ~1x (stacked) plus a
-        single transient layer.
+        ``torch.cat``-ing them (see ``_stack_decode_weights``), and the same ~1x
+        peak host memory as the serial stream (only the stacked destination plus
+        the transient views live at once). The per-layer copies dominate startup
+        (~90s serially for a 14B), so they run on a thread pool: each layer owns a
+        disjoint row-slice of every stacked tensor, and ``copy_`` releases the GIL
+        for the memcpy + dtype cast, so the copies genuinely overlap.
         """
+        from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
         layers = model.layers
         num_layers = len(layers)
         fields = (
@@ -568,26 +572,53 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             ("w_down", "decode_w_down", "proj"),
         )
 
+        def _ready_view(layer, attr: str, kind: str):
+            t = getattr(layer, attr).cpu()
+            return t.transpose(0, 1) if kind == "proj" else t.view(1, -1)
+
+        # Pre-allocate every stacked shm tensor once (shapes taken from layer 0,
+        # uniform across a transformer) so the parallel loop only writes into
+        # already-sized, disjoint slices -- no dict mutation or allocation race.
         stacked: dict[str, torch.Tensor] = {}
-        for i, layer in enumerate(layers):
+        rows_by_key: dict[str, int] = {}
+        first = layers[0]
+        for attr, key, kind in fields:
+            view = _ready_view(first, attr, kind)
+            dtype = torch.bfloat16 if kind == "proj" else torch.float32
+            rows_by_key[key] = view.shape[0]
+            stacked[key] = torch.empty(
+                (num_layers * view.shape[0], *view.shape[1:]), dtype=dtype
+            ).share_memory_()
+
+        def _stage_layer(i: int) -> None:
+            layer = layers[i]
             for attr, key, kind in fields:
-                t = getattr(layer, attr).cpu()
-                if kind == "proj":
-                    t_ready = t.transpose(0, 1)  # [in, out] strided view
-                    dtype = torch.bfloat16
-                else:
-                    t_ready = t.view(1, -1)  # norm gamma -> [1, dim]
-                    dtype = torch.float32
-                rows = t_ready.shape[0]
-                if key not in stacked:
-                    stacked[key] = torch.empty(
-                        (num_layers * rows, *t_ready.shape[1:]), dtype=dtype
-                    ).share_memory_()
-                # copy_ casts dtype and materialises the transpose directly into
-                # the shared slot -- no intermediate contiguous CPU tensor.
-                stacked[key][i * rows:(i + 1) * rows].copy_(t_ready)
+                rows = rows_by_key[key]
+                # Disjoint per-layer slice -> safe to write concurrently.
+                stacked[key][i * rows:(i + 1) * rows].copy_(_ready_view(layer, attr, kind))
             cls._release_layer_weights(layer)
+
+        workers = cls._staging_worker_count(num_layers)
+        if workers <= 1:
+            for i in range(num_layers):
+                _stage_layer(i)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(_stage_layer, range(num_layers)))
         return stacked
+
+    @staticmethod
+    def _staging_worker_count(num_layers: int) -> int:
+        """Thread count for parallel weight staging (env-tunable)."""
+        raw = os.environ.get("PYPTO_STAGING_THREADS")
+        if raw:
+            try:
+                return max(1, min(int(raw), num_layers))
+            except ValueError:
+                pass
+        # Staging is memory-bandwidth bound: it plateaus by ~16-32 threads and
+        # regresses beyond that, so cap the default even on many-core hosts.
+        return max(1, min(num_layers, os.cpu_count() or 8, 32))
 
     @staticmethod
     def _stack_decode_weights(layers: list[_KernelLayerWeights]) -> dict[str, torch.Tensor]:
