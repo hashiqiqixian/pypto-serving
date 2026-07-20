@@ -542,7 +542,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         return dict(getattr(module, "RUNTIME_CONFIG", {}))
 
     @classmethod
-    def _stage_stacked_decode_weights(cls, model) -> dict[str, torch.Tensor]:
+    def _stage_stacked_decode_weights(cls, model: RuntimeModel) -> dict[str, torch.Tensor]:
         """Stream per-layer weights straight into pre-allocated stacked shm
         tensors, one layer at a time.
 
@@ -568,23 +568,24 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             ("w_down", "decode_w_down", "proj"),
         )
 
-        def kernel_ready(layer, attr, kind):
-            t = getattr(layer, attr)
-            if kind == "proj":  # matches _kernel_weight, minus share_memory_
-                return t.transpose(0, 1).to(torch.bfloat16).contiguous().cpu()
-            return t.view(1, -1).float().cpu()  # norm gamma -> [1, dim]
-
         stacked: dict[str, torch.Tensor] = {}
         for i, layer in enumerate(layers):
             for attr, key, kind in fields:
-                t = kernel_ready(layer, attr, kind)
-                rows = t.shape[0]
+                t = getattr(layer, attr).cpu()
+                if kind == "proj":
+                    t_ready = t.transpose(0, 1)  # [in, out] strided view
+                    dtype = torch.bfloat16
+                else:
+                    t_ready = t.view(1, -1)  # norm gamma -> [1, dim]
+                    dtype = torch.float32
+                rows = t_ready.shape[0]
                 if key not in stacked:
                     stacked[key] = torch.empty(
-                        (num_layers * rows, *t.shape[1:]), dtype=t.dtype
+                        (num_layers * rows, *t_ready.shape[1:]), dtype=dtype
                     ).share_memory_()
-                stacked[key][i * rows:(i + 1) * rows].copy_(t)
-                del t
+                # copy_ casts dtype and materialises the transpose directly into
+                # the shared slot -- no intermediate contiguous CPU tensor.
+                stacked[key][i * rows:(i + 1) * rows].copy_(t_ready)
             cls._release_layer_weights(layer)
         return stacked
 
