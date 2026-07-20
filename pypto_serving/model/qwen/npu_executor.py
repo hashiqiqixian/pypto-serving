@@ -579,16 +579,25 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         # Pre-allocate every stacked shm tensor once (shapes taken from layer 0,
         # uniform across a transformer) so the parallel loop only writes into
         # already-sized, disjoint slices -- no dict mutation or allocation race.
+        # Sizes come straight from tensor metadata: a "proj" weight [out, in]
+        # stacks its transpose to [num_layers*in, out]; a "norm" gamma [dim]
+        # stacks to [num_layers, dim]. Reading only .shape/.dtype avoids a
+        # redundant .cpu()/transpose of layer 0 (which _stage_layer(0) redoes).
         stacked: dict[str, torch.Tensor] = {}
         rows_by_key: dict[str, int] = {}
         first = layers[0]
         for attr, key, kind in fields:
-            view = _ready_view(first, attr, kind)
-            dtype = torch.bfloat16 if kind == "proj" else torch.float32
-            rows_by_key[key] = view.shape[0]
-            stacked[key] = torch.empty(
-                (num_layers * view.shape[0], *view.shape[1:]), dtype=dtype
-            ).share_memory_()
+            t = getattr(first, attr)
+            if kind == "proj":
+                rows = t.shape[1]
+                shape = (num_layers * rows, t.shape[0])
+                dtype = torch.bfloat16
+            else:
+                rows = 1
+                shape = (num_layers, t.shape[0])
+                dtype = torch.float32
+            rows_by_key[key] = rows
+            stacked[key] = torch.empty(shape, dtype=dtype).share_memory_()
 
         def _stage_layer(i: int) -> None:
             layer = layers[i]
