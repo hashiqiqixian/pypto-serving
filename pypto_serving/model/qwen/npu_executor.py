@@ -274,15 +274,8 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             )
             embed_weight = torch.cat([embed_weight, padding], dim=0)
         padded_embed_weight = self._shared_tensor(embed_weight.to(torch.bfloat16).contiguous().cpu())
-        layers = []
-        for layer in model.layers:
-            layers.append(self._kernel_layer_weights(layer))
-            self._release_layer_weights(layer)
         final_norm_weight = self._shared_tensor(model.final_norm_weight.view(1, -1).float().cpu())
-        decode_weights = {
-            name: self._shared_tensor(tensor)
-            for name, tensor in self._stack_decode_weights(layers).items()
-        }
+        decode_weights = self._stage_stacked_decode_weights(model)
         prefill_token_ids_buffer = torch.empty(
             (kernel_batch * model.runtime.max_seq_len,),
             dtype=torch.int32,
@@ -547,6 +540,53 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return dict(getattr(module, "RUNTIME_CONFIG", {}))
+
+    @classmethod
+    def _stage_stacked_decode_weights(cls, model) -> dict[str, torch.Tensor]:
+        """Stream per-layer weights straight into pre-allocated stacked shm
+        tensors, one layer at a time.
+
+        Same output as building every per-layer ``_KernelLayerWeights`` and then
+        ``torch.cat``-ing them (see ``_stack_decode_weights``), but never holds
+        the full per-layer staging set and the stacked copy in shared memory at
+        once: peak host memory drops from ~2x the model to ~1x (stacked) plus a
+        single transient layer.
+        """
+        layers = model.layers
+        num_layers = len(layers)
+        fields = (
+            ("input_rms_weight", "decode_input_rms_weight", "norm"),
+            ("wq", "decode_wq", "proj"),
+            ("wk", "decode_wk", "proj"),
+            ("wv", "decode_wv", "proj"),
+            ("q_norm_weight", "decode_q_norm_weight", "norm"),
+            ("k_norm_weight", "decode_k_norm_weight", "norm"),
+            ("wo", "decode_wo", "proj"),
+            ("post_rms_weight", "decode_post_rms_weight", "norm"),
+            ("w_gate", "decode_w_gate", "proj"),
+            ("w_up", "decode_w_up", "proj"),
+            ("w_down", "decode_w_down", "proj"),
+        )
+
+        def kernel_ready(layer, attr, kind):
+            t = getattr(layer, attr)
+            if kind == "proj":  # matches _kernel_weight, minus share_memory_
+                return t.transpose(0, 1).to(torch.bfloat16).contiguous().cpu()
+            return t.view(1, -1).float().cpu()  # norm gamma -> [1, dim]
+
+        stacked: dict[str, torch.Tensor] = {}
+        for i, layer in enumerate(layers):
+            for attr, key, kind in fields:
+                t = kernel_ready(layer, attr, kind)
+                rows = t.shape[0]
+                if key not in stacked:
+                    stacked[key] = torch.empty(
+                        (num_layers * rows, *t.shape[1:]), dtype=t.dtype
+                    ).share_memory_()
+                stacked[key][i * rows:(i + 1) * rows].copy_(t)
+                del t
+            cls._release_layer_weights(layer)
+        return stacked
 
     @staticmethod
     def _stack_decode_weights(layers: list[_KernelLayerWeights]) -> dict[str, torch.Tensor]:
