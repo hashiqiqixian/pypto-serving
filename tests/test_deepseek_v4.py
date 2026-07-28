@@ -170,6 +170,134 @@ def test_deepseek_mtp_token_step_uses_grouped_cache_helper_contract(
         )
 
 
+def test_deepseek_mtp_token_step_packs_one_active_row_per_request(monkeypatch):
+    runner, _model = _runner_for_prepared_inputs()
+    layout = deepseek_v4_decode_layout(3)
+    runner._compiled.layout = layout
+    buffers = SimpleNamespace(
+        decode_input_ids=torch.empty((layout.ranks, layout.decode_tokens), dtype=torch.long),
+        decode_hidden_in=torch.empty((layout.ranks, layout.decode_tokens, 4), dtype=torch.bfloat16),
+        decode_prev_hidden_in=torch.empty(
+            (layout.ranks, layout.decode_tokens, 4, 1),
+            dtype=torch.float32,
+        ),
+        decode_position_ids=torch.empty(
+            (layout.ranks, layout.decode_tokens),
+            dtype=torch.int32,
+        ),
+        decode_slot_mapping=torch.empty(
+            (layout.ranks, layout.decode_tokens),
+            dtype=torch.long,
+        ),
+        decode_swa_indices=torch.empty(
+            (layout.ranks, layout.decode_tokens, layout.sliding_window),
+            dtype=torch.int32,
+        ),
+        decode_swa_lens=torch.empty(
+            (layout.ranks, layout.decode_tokens),
+            dtype=torch.int32,
+        ),
+        decode_hidden_out=torch.empty(
+            (layout.ranks, layout.decode_tokens, 4),
+            dtype=torch.bfloat16,
+        ),
+        decode_pre_hc_out=torch.empty(
+            (layout.ranks, layout.decode_tokens, 4, 1),
+            dtype=torch.float32,
+        ),
+        decode_logits=torch.empty(
+            (layout.ranks, layout.decode_tokens, 32),
+            dtype=torch.float32,
+        ),
+        decode_logit_row_indices=torch.empty(
+            (layout.ranks, layout.decode_tokens),
+            dtype=torch.int32,
+        ),
+    )
+    runner._mtp_buffers = buffers
+    indices_by_rank = ((0, 1),) + ((),) * (layout.ranks - 1)
+    assignment = SimpleNamespace(
+        ranks=(0, 0),
+        local_rows=(0, 1),
+        per_rank_counts=(2,) + (0,) * (layout.ranks - 1),
+        indices_by_rank=indices_by_rank,
+    )
+    monkeypatch.setattr(runner, "_decode_assignment", lambda batch: assignment)
+    monkeypatch.setattr(
+        runner,
+        "_normalize_group_block_ids",
+        lambda block_ids_by_group, actual_batch: [{"ori": [7]}, {"ori": [8]}],
+    )
+    monkeypatch.setattr(
+        runner,
+        "_pad_group_block_ids",
+        lambda active_rows, *, group_name, kernel_rows: tuple(tuple(row) for row in active_rows),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_scratch_group_block_ids",
+        lambda *, group_name, kernel_rows: tuple((100 + row,) for row in range(kernel_rows)),
+    )
+
+    class CacheMetadata:
+        @staticmethod
+        def paged_decode_slot_mapping_from_ids(block_rows, position_rows):
+            return torch.tensor(
+                [
+                    [int(block_ids[0]) * layout.block_size + int(positions[0])]
+                    for block_ids, positions in zip(block_rows, position_rows, strict=True)
+                ],
+                dtype=torch.long,
+            )
+
+        @staticmethod
+        def swa_window_indices_and_lens_from_ids(block_rows, position_rows):
+            rows = len(block_rows)
+            indices = torch.full((rows, layout.sliding_window), -1, dtype=torch.int32)
+            lens = torch.ones((rows,), dtype=torch.int32)
+            return indices, lens
+
+    runner.cache_metadata = CacheMetadata()
+    monkeypatch.setattr(
+        runner,
+        "_embedding_rows",
+        lambda token_ids, dtype: token_ids.reshape(-1, 1).expand(-1, 4).to(dtype),
+    )
+    monkeypatch.setattr(runner, "_mtp_decode_args", lambda: ())
+    monkeypatch.setattr(runner, "_require_mtp_decode_callable", lambda: object())
+    captured = {}
+
+    def fake_run_l3(callable_spec, *args):
+        captured["num_tokens"] = int(args[-1].item())
+        buffers.decode_logits[0, 0, 11] = 1
+        buffers.decode_logits[0, 1, 21] = 1
+        buffers.decode_pre_hc_out[0, 0].fill_(1)
+        buffers.decode_pre_hc_out[0, 1].fill_(2)
+
+    monkeypatch.setattr(runner, "_run_l3", fake_run_l3)
+    next_tokens, next_hidden = runner._run_mtp_token_step(
+        DecodeBatch(
+            request_ids=["req-a", "req-b"],
+            token_ids=torch.tensor([[9], [19]], dtype=torch.long),
+            hidden_states=torch.zeros((2, 4), dtype=torch.bfloat16),
+            seq_lens=torch.tensor([129, 130], dtype=torch.int32),
+            block_ids_by_group=[{"ori": [7]}, {"ori": [8]}],
+        ),
+        torch.tensor([10, 20], dtype=torch.long),
+        torch.stack((torch.full((4, 1), 3.0), torch.full((4, 1), 4.0))),
+        torch.tensor([129, 130], dtype=torch.int32),
+    )
+
+    assert captured["num_tokens"] == 2
+    assert buffers.decode_input_ids[0, :2].tolist() == [10, 20]
+    assert buffers.decode_position_ids[0, :2].tolist() == [129, 130]
+    assert buffers.decode_slot_mapping[0, :2].tolist() == [1025, 1154]
+    assert buffers.decode_slot_mapping[0, 2:].tolist() == [-1] * 6
+    assert buffers.decode_logit_row_indices[0, :2].tolist() == [0, 1]
+    assert next_tokens.tolist() == [11, 21]
+    torch.testing.assert_close(next_hidden[:, 0, 0], torch.tensor([1.0, 2.0]))
+
+
 def test_deepseek_mtp_target_verification_chunks_arbitrary_depth(monkeypatch):
     runner, _model = _runner_for_prepared_inputs()
     runner._compiled.layout = deepseek_v4_decode_layout(9)
