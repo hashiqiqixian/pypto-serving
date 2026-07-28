@@ -590,6 +590,33 @@ class DeepSeekV4CacheLayout:
             raise ValueError("DeepSeekV4 W8A8 kernels require Flash shape: " + mismatch)
 
 
+def deepseek_v4_decode_layout(num_speculative_tokens: int) -> DeepSeekV4CacheLayout:
+    """Select the smallest fixed eight-row decode tile for one MTP chunk.
+
+    The pypto-lib decode programs always process eight rows per DP rank. MTP
+    groups those rows into power-of-two request-local sequences so the target
+    can verify as many drafts as possible without sacrificing more batch
+    capacity than necessary. Draft depths larger than seven use repeated S=8
+    target chunks.
+    """
+    num_speculative_tokens = int(num_speculative_tokens)
+    if num_speculative_tokens < 0:
+        raise ValueError("num_speculative_tokens must be non-negative")
+    if num_speculative_tokens == 0:
+        decode_seq = 1
+    elif num_speculative_tokens == 1:
+        decode_seq = 2
+    elif num_speculative_tokens <= 3:
+        decode_seq = 4
+    else:
+        decode_seq = 8
+    return DeepSeekV4CacheLayout(
+        decode_batch=DEEPSEEK_V4_DECODE_TOKENS // decode_seq,
+        decode_seq=decode_seq,
+        decode_tokens=DEEPSEEK_V4_DECODE_TOKENS,
+    )
+
+
 @dataclass(frozen=True)
 class DeepSeekV4CacheMetadataBuilder:
     """Build kernel metadata from scheduler-owned rank-local cache block IDs."""
@@ -879,22 +906,15 @@ class DeepSeekV4InputBuilder:
         token_rows = embeddings.unsqueeze(1).expand(-1, self.layout.decode_seq, -1)
         return self._pack_decode_x_hc(token_rows, ranks=ranks, local_rows=local_rows)
 
-    def mtp_decode_x_hc(
+    def decode_token_rows_x_hc(
         self,
         embeddings: torch.Tensor,
         *,
-        prev_embeddings: torch.Tensor,
         ranks: Sequence[int],
         local_rows: Sequence[int],
     ) -> torch.Tensor:
-        """Pack the committed-token and draft-token pair used by MTP verification."""
-        if self.layout.decode_seq != 2:
-            raise ValueError("DeepSeekV4 MTP verification requires decode_seq=2")
-        if prev_embeddings.shape != embeddings.shape:
-            raise ValueError("MTP previous embeddings must align with draft embeddings")
-        token_rows = prev_embeddings.unsqueeze(1).expand(-1, self.layout.decode_seq, -1).clone()
-        token_rows[:, -1].copy_(embeddings)
-        return self._pack_decode_x_hc(token_rows, ranks=ranks, local_rows=local_rows)
+        """Pack explicit request-local token rows for target verification."""
+        return self._pack_decode_x_hc(embeddings, ranks=ranks, local_rows=local_rows)
 
     def _pack_decode_x_hc(
         self,
@@ -1023,7 +1043,7 @@ class DeepSeekV4CompiledKernels:
     n_routed_experts: int = 256
     num_hash_layers: int = 3
     embedding_weight: torch.Tensor | None = None
-    enable_mtp: bool = False
+    num_speculative_tokens: int = 0
 
     def l3_callables(self) -> tuple[DeepSeekV4L3Callable, ...]:
         """Return every compiled L3 program that the shared worker may run."""
@@ -1122,6 +1142,17 @@ class _DeepSeekV4MainDecodeOutput:
     logits: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _DeepSeekV4MtpVerification:
+    """Accepted tokens and recurrent inputs produced by target verification."""
+
+    accepted_token_ids: list[list[int]]
+    tail_token_ids: torch.Tensor
+    tail_pre_hc_hidden: torch.Tensor
+    tail_positions: torch.Tensor
+    first_logits: torch.Tensor
+
+
 @dataclass
 class _DeepSeekV4DecodeSharedBuffers:
     """Reusable decode shared-memory buffers inherited by the L3 chip workers."""
@@ -1204,9 +1235,8 @@ class _DeepSeekV4MtpRequestState:
 
     prefill_context: _DeepSeekV4MtpPrefillContext | None = None
     draft_token_id: int | None = None
-    tail_token_id: int | None = None
-    tail_pre_hc_hidden: torch.Tensor | None = None
-    tail_position: int | None = None
+    draft_pre_hc_hidden: torch.Tensor | None = None
+    draft_position: int | None = None
     proposed_tokens: int = 0
     accepted_tokens: int = 0
 
@@ -1255,26 +1285,22 @@ def build_deepseek_v4_layer_plan(
 
 
 def accept_mtp_tokens(main_token_ids: torch.Tensor, draft_token_ids: torch.Tensor) -> list[list[int]]:
-    """Accept one MTP draft against two-token main-model greedy predictions.
-
-    ``main_token_ids[:, 0]`` is always committed.  The second main prediction is
-    committed only when the draft equals the first prediction, matching the
-    ``next_n=1`` reference algorithm.
-    """
+    """Accept the longest matching MTP prefix plus one target-model token."""
     main = main_token_ids.detach().cpu().to(torch.long)
-    draft = draft_token_ids.detach().cpu().to(torch.long).reshape(-1)
-    if main.ndim != 2 or main.shape[1] != 2:
-        raise ValueError(f"main_token_ids must have shape [batch, 2], got {tuple(main.shape)}")
-    if draft.numel() != main.shape[0]:
+    draft = draft_token_ids.detach().cpu().to(torch.long)
+    if main.ndim != 2 or main.shape[1] < 2:
+        raise ValueError(f"main_token_ids must have shape [batch, K+1], got {tuple(main.shape)}")
+    if draft.ndim != 2 or draft.shape != (main.shape[0], main.shape[1] - 1):
         raise ValueError(
-            f"draft_token_ids must have {main.shape[0]} entries, got {draft.numel()}"
+            "draft_token_ids must have shape "
+            f"{(main.shape[0], main.shape[1] - 1)}, got {tuple(draft.shape)}"
         )
     accepted: list[list[int]] = []
     for row in range(main.shape[0]):
-        row_tokens = [int(main[row, 0].item())]
-        if int(draft[row].item()) == row_tokens[0]:
-            row_tokens.append(int(main[row, 1].item()))
-        accepted.append(row_tokens)
+        matched = 0
+        while matched < draft.shape[1] and int(draft[row, matched]) == int(main[row, matched]):
+            matched += 1
+        accepted.append([int(token) for token in main[row, : matched + 1]])
     return accepted
 
 
@@ -1314,7 +1340,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._mtp_request_states: dict[str, _DeepSeekV4MtpRequestState] = {}
         self._mtp_proposed_tokens = 0
         self._mtp_accepted_tokens = 0
-        if compiled.enable_mtp:
+        if compiled.num_speculative_tokens:
             self._decode_flow = self._run_mtp_decode
             self._prefill_completion = self._capture_mtp_prefill_context
         else:
@@ -1647,39 +1673,71 @@ class DeepSeekV4ModelRunner(ModelRunner):
             ),
         )
 
-    def prepare_mtp_decode_inputs(
+    def prepare_mtp_target_inputs(
         self,
         model: RuntimeModel,
         batch: DecodeBatch,
+        *,
+        token_rows: torch.Tensor,
+        positions: Sequence[Sequence[int]],
+        active_width: int,
     ) -> DeepSeekV4PreparedDecodeInputs:
-        """Build paired main-model verification inputs for the MTP flow."""
-        hidden_states = self._require_decode_hidden_states(batch)
-        if batch.prev_token_ids is None or batch.prev_hidden_states is None:
-            raise ValueError("DeepSeekV4 MTP decode requires previous token IDs and embeddings")
+        """Build one fixed-width target-verification chunk."""
+        layout = self._compiled.layout
+        actual_batch = len(batch.request_ids)
+        if token_rows.shape != (actual_batch, layout.decode_seq):
+            raise ValueError(
+                "MTP target token rows must have shape "
+                f"{(actual_batch, layout.decode_seq)}, got {tuple(token_rows.shape)}"
+            )
+        if not 1 <= int(active_width) <= layout.decode_seq:
+            raise ValueError("MTP target active width must fit the fixed decode sequence")
+        position_rows = tuple(tuple(int(value) for value in row) for row in positions)
+        if len(position_rows) != actual_batch or any(
+            len(row) != layout.decode_seq for row in position_rows
+        ):
+            raise ValueError("MTP target positions must align with the fixed decode sequence")
         assignment = self._decode_assignment(batch)
         builder = self._require_input_builder()
-        actual_batch = len(batch.request_ids)
-        positions = self._mtp_decode_positions(batch, actual_batch)
-        embeddings = hidden_states.to(torch.float32).cpu()
-        previous_embeddings = batch.prev_hidden_states.to(torch.float32).cpu()
-        return self._prepare_decode_inputs(
+        token_rows = token_rows.detach().cpu().to(torch.long)
+        embeddings = self._embedding_rows(token_rows.reshape(-1), torch.float32).reshape(
+            actual_batch,
+            layout.decode_seq,
+            -1,
+        )
+        prepared = self._prepare_decode_inputs(
             model,
             batch,
             assignment=assignment,
-            active_seq=self._compiled.layout.decode_seq,
-            positions=positions,
-            token_rows=self._mtp_decode_token_rows(
-                batch.token_ids,
-                batch.prev_token_ids,
-                actual_batch,
-            ),
-            x_hc=builder.mtp_decode_x_hc(
+            active_seq=layout.decode_seq,
+            positions=position_rows,
+            token_rows=token_rows,
+            x_hc=builder.decode_token_rows_x_hc(
                 embeddings,
-                prev_embeddings=previous_embeddings,
                 ranks=assignment.ranks,
                 local_rows=assignment.local_rows,
             ),
         )
+        if active_width < layout.decode_seq:
+            for rank, local_row in zip(
+                prepared.ranks,
+                prepared.local_rows,
+                strict=True,
+            ):
+                padding_start = local_row * layout.decode_seq + active_width
+                padding_end = (local_row + 1) * layout.decode_seq
+                for name in (
+                    "ori_slot_mapping",
+                    "swa_slot_mapping",
+                    "hca_cmp_slot_mapping",
+                    "hca_state_slot_mapping",
+                    "csa_cmp_slot_mapping",
+                    "csa_idx_slot_mapping",
+                    "csa_state_slot_mapping",
+                    "csa_inner_state_slot_mapping",
+                ):
+                    getattr(prepared, name)[rank, padding_start:padding_end].fill_(-1)
+        return prepared
 
     def _prepare_decode_inputs(
         self,
@@ -2112,65 +2170,210 @@ class DeepSeekV4ModelRunner(ModelRunner):
         ).float()
         return DecodeResult(hidden_states=None, logits=logits)
 
+    def _verify_mtp_drafts(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+        drafts: torch.Tensor,
+    ) -> _DeepSeekV4MtpVerification:
+        """Verify arbitrary draft depth with fixed-width target chunks."""
+        layout = self._compiled.layout
+        width = layout.decode_seq
+        actual_batch = len(batch.request_ids)
+        drafts = drafts.detach().cpu().to(torch.long)
+        if drafts.ndim != 2 or drafts.shape[0] != actual_batch:
+            raise ValueError(
+                f"MTP drafts must have shape [batch, K], got {tuple(drafts.shape)}"
+            )
+
+        current = batch.token_ids[:actual_batch].detach().cpu().to(torch.long).reshape(actual_batch, -1)[
+            :, 0
+        ]
+        input_sequences = torch.cat((current.reshape(-1, 1), drafts), dim=1)
+        base_seq_lens = batch.seq_lens[:actual_batch].detach().cpu().to(torch.int32)
+        accepted: list[list[int]] = [[] for _ in range(actual_batch)]
+        first_logits: list[torch.Tensor | None] = [None] * actual_batch
+        tail_tokens: list[int | None] = [None] * actual_batch
+        tail_hidden: list[torch.Tensor | None] = [None] * actual_batch
+        tail_positions: list[int | None] = [None] * actual_batch
+        pending: dict[int, tuple[int, torch.Tensor, int]] = {}
+        active = list(range(actual_batch))
+        input_offset = 0
+
+        while active:
+            if input_offset:
+                continuing = []
+                for request_index in active:
+                    predicted, previous_hidden, position = pending.pop(request_index)
+                    accepted[request_index].append(predicted)
+                    if predicted == int(drafts[request_index, input_offset - 1]):
+                        continuing.append(request_index)
+                    else:
+                        tail_tokens[request_index] = predicted
+                        tail_hidden[request_index] = previous_hidden
+                        tail_positions[request_index] = position
+                active = continuing
+                if not active:
+                    break
+
+            real_width = min(width, input_sequences.shape[1] - input_offset)
+            active_rows = input_sequences[active, input_offset : input_offset + real_width]
+            if real_width < width:
+                active_rows = torch.cat(
+                    (
+                        active_rows,
+                        active_rows[:, -1:].expand(-1, width - real_width),
+                    ),
+                    dim=1,
+                )
+            position_rows = []
+            for request_index in active:
+                first_position = int(base_seq_lens[request_index]) - 1 + input_offset
+                real_positions = tuple(first_position + offset for offset in range(real_width))
+                position_rows.append(
+                    real_positions + (real_positions[-1],) * (width - real_width)
+                )
+
+            chunk_batch = self._select_decode_batch_rows(batch, active)
+            chunk_batch.seq_lens = torch.tensor(
+                [
+                    int(base_seq_lens[request_index]) + input_offset + real_width - 1
+                    for request_index in active
+                ],
+                dtype=torch.int32,
+            )
+            output = self._execute_main_decode(
+                model,
+                self.prepare_mtp_target_inputs(
+                    model,
+                    chunk_batch,
+                    token_rows=active_rows,
+                    positions=position_rows,
+                    active_width=real_width,
+                ),
+                active_seq=width,
+            )
+
+            continuing = []
+            for chunk_index, request_index in enumerate(active):
+                rank = output.inputs.ranks[chunk_index]
+                row_start = output.inputs.local_rows[chunk_index] * width
+                row_logits = output.logits[rank, row_start : row_start + real_width].float()
+                row_predictions = row_logits.argmax(dim=-1)
+                if first_logits[request_index] is None:
+                    first_logits[request_index] = row_logits[0].clone()
+
+                rejected = False
+                for offset in range(real_width - 1):
+                    predicted = int(row_predictions[offset])
+                    accepted[request_index].append(predicted)
+                    draft_index = input_offset + offset
+                    if predicted != int(drafts[request_index, draft_index]):
+                        tail_tokens[request_index] = predicted
+                        tail_hidden[request_index] = (
+                            output.pre_hc_hidden[rank, row_start + offset].detach().cpu().clone()
+                        )
+                        tail_positions[request_index] = position_rows[chunk_index][offset] + 1
+                        rejected = True
+                        break
+                if rejected:
+                    continue
+
+                last_offset = real_width - 1
+                predicted = int(row_predictions[last_offset])
+                previous_hidden = (
+                    output.pre_hc_hidden[rank, row_start + last_offset].detach().cpu().clone()
+                )
+                position = position_rows[chunk_index][last_offset] + 1
+                if input_offset + last_offset == drafts.shape[1]:
+                    accepted[request_index].append(predicted)
+                    tail_tokens[request_index] = predicted
+                    tail_hidden[request_index] = previous_hidden
+                    tail_positions[request_index] = position
+                else:
+                    pending[request_index] = (predicted, previous_hidden, position)
+                    continuing.append(request_index)
+
+            active = continuing
+            input_offset += real_width
+
+        if (
+            any(value is None for value in first_logits)
+            or any(value is None for value in tail_tokens)
+            or any(value is None for value in tail_hidden)
+            or any(value is None for value in tail_positions)
+        ):
+            raise RuntimeError("DeepSeekV4 MTP target verification left incomplete request state")
+        return _DeepSeekV4MtpVerification(
+            accepted_token_ids=accepted,
+            tail_token_ids=torch.tensor(tail_tokens, dtype=torch.long),
+            tail_pre_hc_hidden=torch.stack(tail_hidden),
+            tail_positions=torch.tensor(tail_positions, dtype=torch.int32),
+            first_logits=torch.stack(first_logits).float(),
+        )
+
     def _run_mtp_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
-        """Verify request-local MTP drafts and advance the accepted windows."""
+        """Generate and verify the configured number of request-local MTP drafts."""
         if not batch.allow_device_greedy_sampling:
             raise RuntimeError("DeepSeekV4 MTP decode currently requires greedy device sampling")
-        self._initialize_mtp_drafts(batch)
-        draft_token_ids = self._mtp_drafts_for_requests(batch.request_ids)
-        speculative_batch = self._main_speculative_batch(model, batch, draft_token_ids)
-        output = self._execute_main_decode(
-            model,
-            self.prepare_mtp_decode_inputs(model, speculative_batch),
-            active_seq=self._compiled.layout.decode_seq,
-        )
-        inputs = output.inputs
-        decode_seq = self._compiled.layout.decode_seq
-        pair_logits = torch.stack(
-            tuple(
-                output.logits[rank, local_row * decode_seq + offset]
-                for rank, local_row in zip(inputs.ranks, inputs.local_rows, strict=True)
-                for offset in range(decode_seq)
-            )
-        ).float()
-        main_ids = pair_logits.argmax(dim=-1).reshape(inputs.actual_batch, decode_seq)
-        accepted = accept_mtp_tokens(main_ids, draft_token_ids)
-        self._mtp_proposed_tokens += inputs.actual_batch
-        self._mtp_accepted_tokens += sum(len(tokens) == decode_seq for tokens in accepted)
-        for request_id, tokens in zip(inputs.request_ids, accepted, strict=True):
+        num_drafts = self._mtp_draft_count(model, batch)
+        drafts = self._propose_mtp_tokens(batch, num_drafts=num_drafts)
+        verification = self._verify_mtp_drafts(model, batch, drafts)
+        accepted = verification.accepted_token_ids
+        proposed = len(batch.request_ids) * drafts.shape[1]
+        accepted_drafts = sum(len(tokens) - 1 for tokens in accepted)
+        self._mtp_proposed_tokens += proposed
+        self._mtp_accepted_tokens += accepted_drafts
+        for request_id, tokens in zip(batch.request_ids, accepted, strict=True):
             state = self._require_mtp_request_state(request_id)
-            state.proposed_tokens += 1
-            state.accepted_tokens += int(len(tokens) == decode_seq)
+            state.proposed_tokens += drafts.shape[1]
+            state.accepted_tokens += len(tokens) - 1
         logger.info(
             "DeepSeekV4 MTP acceptance progress: accepted=%d proposed=%d rate=%.2f%%",
             self._mtp_accepted_tokens,
             self._mtp_proposed_tokens,
-            100.0 * self._mtp_accepted_tokens / self._mtp_proposed_tokens,
+            (
+                100.0 * self._mtp_accepted_tokens / self._mtp_proposed_tokens
+                if self._mtp_proposed_tokens
+                else 0.0
+            ),
         )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "DeepSeekV4 MTP step: draft=%s main=%s",
-                draft_token_ids.detach().cpu().tolist(),
-                main_ids.detach().cpu().tolist(),
+                drafts.tolist(),
+                accepted,
             )
-        # Match the reference accepted_num flow: update the MTP window from
-        # committed main-model outputs immediately, even after rejection.
+
         with profile_span(
             "DeepSeekV4ModelRunner.decode.mtp_advance",
             cat="executor",
             args={"accepted_counts": tuple(len(tokens) for tokens in accepted)},
         ):
-            self._advance_mtp_drafts(
-                inputs,
-                main_ids,
-                output.pre_hc_hidden,
-                accepted_counts=tuple(len(tokens) for tokens in accepted),
+            next_drafts, next_hidden = self._run_mtp_token_step(
+                batch,
+                verification.tail_token_ids,
+                verification.tail_pre_hc_hidden,
+                verification.tail_positions,
             )
+            for index, request_id in enumerate(batch.request_ids):
+                state = self._require_mtp_request_state(request_id)
+                state.draft_token_id = int(next_drafts[index])
+                state.draft_pre_hc_hidden = next_hidden[index].clone()
+                state.draft_position = int(verification.tail_positions[index]) + 1
         return DecodeResult(
             hidden_states=None,
-            logits=pair_logits[::decode_seq],
+            logits=verification.first_logits,
             accepted_token_ids=accepted,
         )
+
+    def _mtp_draft_count(self, model: RuntimeModel, batch: DecodeBatch) -> int:
+        """Cap this step's draft depth at the shortest remaining context."""
+        remaining_context = min(
+            model.runtime.max_seq_len - int(seq_len)
+            for seq_len in batch.seq_lens[: len(batch.request_ids)]
+        )
+        return min(self._compiled.num_speculative_tokens, max(0, remaining_context))
 
     def _execute_main_decode(
         self,
@@ -2551,26 +2754,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._compiled.embedding_weight = embed
         return embed.index_select(0, token_ids.detach().cpu().to(torch.long).reshape(-1)).to(dtype)
 
-    def _main_speculative_batch(
-        self,
-        model: RuntimeModel,
-        batch: DecodeBatch,
-        draft_token_ids: torch.Tensor,
-    ) -> DecodeBatch:
-        actual_batch = len(batch.request_ids)
-        draft = draft_token_ids[:actual_batch].detach().cpu().to(torch.long)
-        current = batch.token_ids[:actual_batch].detach().cpu().to(torch.long).reshape(-1)
-        current_hidden = self._require_decode_hidden_states(batch)[:actual_batch].detach().cpu()
-        draft_hidden = self._embedding_rows(draft, current_hidden.dtype)
-        return replace(
-            batch,
-            token_ids=draft.reshape(actual_batch, 1),
-            hidden_states=draft_hidden,
-            prev_token_ids=current,
-            prev_hidden_states=current_hidden,
-            seq_lens=batch.seq_lens.detach().cpu().to(torch.int32) + 1,
-        )
-
     def _require_mtp_request_state(self, request_id: str) -> _DeepSeekV4MtpRequestState:
         state = self._mtp_request_states.get(request_id)
         if state is None:
@@ -2585,6 +2768,201 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 raise RuntimeError(f"DeepSeekV4 MTP draft is not initialized for {request_id!r}")
             draft_ids.append(draft_token_id)
         return torch.tensor(draft_ids, dtype=torch.long)
+
+    @staticmethod
+    def _select_decode_batch_rows(batch: DecodeBatch, indices: Sequence[int]) -> DecodeBatch:
+        """Return a request-aligned subset without changing cache ownership."""
+        rows = tuple(int(index) for index in indices)
+
+        def select_tensor(value: torch.Tensor | None) -> torch.Tensor | None:
+            if value is None:
+                return None
+            index = torch.tensor(rows, dtype=torch.long, device=value.device)
+            return value.index_select(0, index)
+
+        def select_list(values):
+            return [values[index] for index in rows] if values else []
+
+        return replace(
+            batch,
+            request_ids=select_list(batch.request_ids),
+            token_ids=select_tensor(batch.token_ids),
+            hidden_states=select_tensor(batch.hidden_states),
+            seq_lens=select_tensor(batch.seq_lens),
+            kv_allocations=select_list(batch.kv_allocations),
+            block_ids=select_list(batch.block_ids),
+            block_ids_by_group=select_list(batch.block_ids_by_group),
+            cache_partitions=select_list(batch.cache_partitions),
+        )
+
+    def _propose_mtp_tokens(
+        self,
+        batch: DecodeBatch,
+        *,
+        num_drafts: int | None = None,
+    ) -> torch.Tensor:
+        """Generate the configured number of drafts by recurrently reusing the MTP layer."""
+        if num_drafts is None:
+            num_drafts = self._compiled.num_speculative_tokens
+        num_drafts = int(num_drafts)
+        if not 0 <= num_drafts <= self._compiled.num_speculative_tokens:
+            raise ValueError("MTP draft count must fit the compiled speculative depth")
+        if num_drafts == 0:
+            return torch.empty((len(batch.request_ids), 0), dtype=torch.long)
+        self._initialize_mtp_drafts(batch)
+        draft_columns = [self._mtp_drafts_for_requests(batch.request_ids)]
+        if num_drafts == 1:
+            return draft_columns[0].reshape(-1, 1)
+
+        recurrent_hidden = []
+        positions = []
+        for request_id in batch.request_ids:
+            state = self._require_mtp_request_state(request_id)
+            if state.draft_pre_hc_hidden is None or state.draft_position is None:
+                raise RuntimeError(f"DeepSeekV4 recurrent MTP state is missing for {request_id!r}")
+            recurrent_hidden.append(state.draft_pre_hc_hidden)
+            positions.append(state.draft_position)
+        hidden = torch.stack(recurrent_hidden)
+        position_ids = torch.tensor(positions, dtype=torch.int32)
+
+        while len(draft_columns) < num_drafts:
+            next_tokens, hidden = self._run_mtp_token_step(
+                batch,
+                draft_columns[-1],
+                hidden,
+                position_ids,
+            )
+            draft_columns.append(next_tokens)
+            position_ids = position_ids + 1
+        return torch.stack(draft_columns, dim=1)
+
+    def _run_mtp_token_step(
+        self,
+        batch: DecodeBatch,
+        token_ids: torch.Tensor,
+        previous_hidden: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one recurrent MTP token per request inside the fixed decode tile."""
+        actual_batch = len(batch.request_ids)
+        if token_ids.numel() != actual_batch or positions.numel() != actual_batch:
+            raise ValueError("MTP token IDs and positions must align with active requests")
+        if previous_hidden.shape[0] != actual_batch:
+            raise ValueError("MTP recurrent hidden rows must align with active requests")
+
+        buffers = self._require_mtp_buffers()
+        layout = self._compiled.layout
+        assignment = self._decode_assignment(batch)
+        token_ids = token_ids.detach().cpu().to(torch.long).reshape(actual_batch)
+        positions = positions.detach().cpu().to(torch.int32).reshape(actual_batch)
+        previous_hidden = previous_hidden.detach().cpu()
+        active_group_ids = self._normalize_group_block_ids(
+            batch.block_ids_by_group,
+            actual_batch,
+        )
+
+        fallback_token = token_ids[0]
+        fallback_position = positions[0]
+        fallback_hidden = previous_hidden[0]
+        kernel_ids = fallback_token.repeat(layout.ranks, layout.decode_tokens)
+        kernel_positions = fallback_position.repeat(layout.ranks, layout.decode_tokens)
+        kernel_previous_hidden = fallback_hidden.repeat(
+            layout.ranks,
+            layout.decode_tokens,
+            1,
+            1,
+        )
+        slot_mappings = []
+        swa_indices_by_rank = []
+        swa_lens_by_rank = []
+        for rank, request_indices in enumerate(assignment.indices_by_rank):
+            for request_index in request_indices:
+                row_start = assignment.local_rows[request_index] * layout.decode_seq
+                row_slice = slice(row_start, row_start + layout.decode_seq)
+                kernel_ids[rank, row_slice].fill_(int(token_ids[request_index]))
+                kernel_positions[rank, row_slice].fill_(int(positions[request_index]))
+                kernel_previous_hidden[rank, row_slice].copy_(
+                    previous_hidden[request_index].expand(layout.decode_seq, -1, -1)
+                )
+
+            if request_indices:
+                padded_blocks = self._pad_group_block_ids(
+                    [active_group_ids[index]["ori"] for index in request_indices],
+                    max_blocks=layout.prefill_ori_max_blocks,
+                    kernel_rows=layout.decode_batch,
+                )
+                padded_positions = [
+                    (int(positions[index]),) * layout.decode_seq for index in request_indices
+                ]
+                while len(padded_positions) < layout.decode_batch:
+                    padded_positions.append((int(fallback_position),) * layout.decode_seq)
+            else:
+                padded_blocks = self._scratch_group_block_ids(
+                    max_blocks=layout.prefill_ori_max_blocks,
+                    kernel_rows=layout.decode_batch,
+                )
+                padded_positions = [
+                    (int(fallback_position),) * layout.decode_seq
+                    for _ in range(layout.decode_batch)
+                ]
+            slot_mappings.append(
+                self.cache_metadata.paged_decode_slot_mapping_from_ids(
+                    padded_blocks,
+                    padded_positions,
+                ).reshape(-1)
+            )
+            rank_swa_indices, rank_swa_lens = (
+                self.cache_metadata.swa_window_indices_and_lens_from_ids(
+                    padded_blocks,
+                    padded_positions,
+                )
+            )
+            swa_indices_by_rank.append(rank_swa_indices)
+            swa_lens_by_rank.append(rank_swa_lens)
+
+        buffers.decode_input_ids.copy_(kernel_ids)
+        buffers.decode_hidden_in.copy_(
+            self._embedding_rows(kernel_ids.reshape(-1), torch.bfloat16).reshape(
+                layout.ranks,
+                layout.decode_tokens,
+                -1,
+            )
+        )
+        buffers.decode_prev_hidden_in.copy_(kernel_previous_hidden)
+        buffers.decode_position_ids.copy_(kernel_positions)
+        decode_slot_mapping = torch.stack(slot_mappings)
+        for rank, local_row in zip(assignment.ranks, assignment.local_rows, strict=True):
+            row_start = local_row * layout.decode_seq
+            decode_slot_mapping[rank, row_start + 1 : row_start + layout.decode_seq].fill_(-1)
+        buffers.decode_slot_mapping.copy_(decode_slot_mapping)
+        buffers.decode_swa_indices.copy_(torch.stack(swa_indices_by_rank))
+        buffers.decode_swa_lens.copy_(torch.stack(swa_lens_by_rank))
+        buffers.decode_hidden_out.zero_()
+        buffers.decode_pre_hc_out.zero_()
+        buffers.decode_logits.zero_()
+        buffers.decode_logit_row_indices.fill_(-1)
+        for rank, local_row in zip(assignment.ranks, assignment.local_rows, strict=True):
+            buffers.decode_logit_row_indices[rank, local_row] = local_row * layout.decode_seq
+
+        active_tokens = max(assignment.per_rank_counts) * layout.decode_seq
+        with profile_span(
+            "DeepSeekV4ModelRunner.mtp.decode.l3_dispatch",
+            cat="executor",
+            args={"actual_tokens": active_tokens},
+        ):
+            self._run_l3(
+                self._require_mtp_decode_callable(),
+                *self._mtp_decode_args(),
+                self._int32_scalar(active_tokens),
+            )
+
+        next_tokens = []
+        next_hidden = []
+        for rank, local_row in zip(assignment.ranks, assignment.local_rows, strict=True):
+            row_start = local_row * layout.decode_seq
+            next_tokens.append(int(buffers.decode_logits[rank, local_row].argmax().item()))
+            next_hidden.append(buffers.decode_pre_hc_out[rank, row_start].detach().cpu().clone())
+        return torch.tensor(next_tokens, dtype=torch.long), torch.stack(next_hidden)
 
     def _initialize_mtp_drafts(self, batch: DecodeBatch) -> None:
         """Initialize every request's first draft without sharing mutable state."""
@@ -2648,190 +3026,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 self._int32_scalar(n),
             )
         state.draft_token_id = int(buffers.prefill_logits[owner_rank, 0].argmax().item())
-        state.tail_token_id = int(first_token[0].item())
-        state.tail_pre_hc_hidden = context.prev_hidden_states[n - 1].clone()
-        state.tail_position = int(context.position_ids[n - 1].item())
+        state.draft_pre_hc_hidden = buffers.prefill_pre_hc_out[owner_rank, n - 1].detach().cpu().clone()
+        state.draft_position = int(context.position_ids[n - 1].item()) + 1
         state.prefill_context = None
-
-    def _mtp_committed_window(
-        self,
-        inputs: DeepSeekV4PreparedDecodeInputs,
-        main_ids: torch.Tensor,
-        main_pre_hc: torch.Tensor,
-        *,
-        request_index: int,
-        accepted_count: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build one request's fixed MTP window from committed outputs only."""
-        layout = self._compiled.layout
-        request_id = inputs.request_ids[request_index]
-        state = self._require_mtp_request_state(request_id)
-        owner_rank = inputs.ranks[request_index]
-        row_start = inputs.local_rows[request_index] * layout.decode_seq
-        row_slice = slice(row_start, row_start + layout.decode_seq)
-        if accepted_count == layout.decode_seq:
-            return (
-                main_ids[request_index, :layout.decode_seq].detach().cpu().to(torch.long),
-                main_pre_hc[owner_rank, row_slice].detach().cpu(),
-                inputs.position_ids[owner_rank, row_slice].detach().cpu().to(torch.int32),
-            )
-        if accepted_count != 1 or layout.decode_seq != 2:
-            raise ValueError(
-                "DeepSeekV4 MTP currently supports next_n=1 acceptance only; "
-                f"got accepted_count={accepted_count}, decode_seq={layout.decode_seq}"
-            )
-        if (
-            state.tail_token_id is None
-            or state.tail_pre_hc_hidden is None
-            or state.tail_position is None
-        ):
-            raise RuntimeError(f"DeepSeekV4 MTP committed tail is not initialized for {request_id!r}")
-        return (
-            torch.tensor(
-                (state.tail_token_id, int(main_ids[request_index, 0].item())),
-                dtype=torch.long,
-            ),
-            torch.stack(
-                (
-                    state.tail_pre_hc_hidden,
-                    main_pre_hc[owner_rank, row_start].detach().cpu(),
-                )
-            ),
-            torch.tensor(
-                (state.tail_position, int(inputs.position_ids[owner_rank, row_start].item())),
-                dtype=torch.int32,
-            ),
-        )
-
-    def _advance_mtp_drafts(
-        self,
-        inputs: DeepSeekV4PreparedDecodeInputs,
-        main_ids: torch.Tensor,
-        main_pre_hc: torch.Tensor,
-        *,
-        accepted_counts: Sequence[int],
-    ) -> None:
-        """Run one packed MTP decode and scatter new draft state by request ID."""
-        if len(accepted_counts) != inputs.actual_batch:
-            raise ValueError("MTP accepted counts must align with active requests")
-        buffers = self._require_mtp_buffers()
-        layout = self._compiled.layout
-        committed = [
-            self._mtp_committed_window(
-                inputs,
-                main_ids,
-                main_pre_hc,
-                request_index=index,
-                accepted_count=int(accepted_counts[index]),
-            )
-            for index in range(inputs.actual_batch)
-        ]
-
-        fallback_ids, fallback_hidden, fallback_positions = committed[0]
-        kernel_ids = fallback_ids.repeat(layout.ranks, layout.decode_batch)
-        kernel_positions = fallback_positions.repeat(layout.ranks, layout.decode_batch)
-        kernel_prev_hidden = fallback_hidden.repeat(
-            layout.ranks,
-            layout.decode_batch,
-            1,
-            1,
-        )
-        slot_mappings = []
-        swa_indices_by_rank = []
-        swa_lens_by_rank = []
-        for rank in range(layout.ranks):
-            request_indices = [
-                index for index, owner_rank in enumerate(inputs.ranks) if owner_rank == rank
-            ]
-            for request_index in request_indices:
-                local_row = inputs.local_rows[request_index]
-                row_start = local_row * layout.decode_seq
-                row_slice = slice(row_start, row_start + layout.decode_seq)
-                ids, hidden, positions = committed[request_index]
-                kernel_ids[rank, row_slice].copy_(ids)
-                kernel_positions[rank, row_slice].copy_(positions)
-                kernel_prev_hidden[rank, row_slice].copy_(hidden)
-
-            if request_indices:
-                active_blocks = [
-                    inputs.block_ids_by_group[index]["ori"] for index in request_indices
-                ]
-                padded_blocks = self._pad_group_block_ids(
-                    active_blocks,
-                    max_blocks=layout.prefill_ori_max_blocks,
-                    kernel_rows=layout.decode_batch,
-                )
-                padded_positions = [
-                    tuple(int(value) for value in committed[index][2].tolist())
-                    for index in request_indices
-                ]
-                while len(padded_positions) < layout.decode_batch:
-                    padded_positions.append(tuple(int(value) for value in fallback_positions.tolist()))
-            else:
-                padded_blocks = self._scratch_group_block_ids(
-                    max_blocks=layout.prefill_ori_max_blocks,
-                    kernel_rows=layout.decode_batch,
-                )
-                padded_positions = [
-                    tuple(int(value) for value in fallback_positions.tolist())
-                    for _ in range(layout.decode_batch)
-                ]
-            slot_mappings.append(
-                self.cache_metadata.paged_decode_slot_mapping_from_ids(
-                    padded_blocks,
-                    padded_positions,
-                ).reshape(-1)
-            )
-            rank_swa_indices, rank_swa_lens = (
-                self.cache_metadata.swa_window_indices_and_lens_from_ids(
-                    padded_blocks,
-                    padded_positions,
-                )
-            )
-            swa_indices_by_rank.append(rank_swa_indices)
-            swa_lens_by_rank.append(rank_swa_lens)
-
-        buffers.decode_input_ids.copy_(kernel_ids)
-        buffers.decode_hidden_in.copy_(
-            self._embedding_rows(kernel_ids.reshape(-1), torch.bfloat16).reshape(
-                layout.ranks,
-                layout.decode_tokens,
-                -1,
-            )
-        )
-        buffers.decode_prev_hidden_in.copy_(kernel_prev_hidden)
-        buffers.decode_position_ids.copy_(kernel_positions)
-        buffers.decode_slot_mapping.copy_(torch.stack(slot_mappings))
-        buffers.decode_swa_indices.copy_(torch.stack(swa_indices_by_rank))
-        buffers.decode_swa_lens.copy_(torch.stack(swa_lens_by_rank))
-        buffers.decode_hidden_out.zero_()
-        buffers.decode_pre_hc_out.zero_()
-        buffers.decode_logits.zero_()
-        buffers.decode_logit_row_indices.fill_(-1)
-        for rank, local_row in zip(inputs.ranks, inputs.local_rows, strict=True):
-            buffers.decode_logit_row_indices[rank, local_row] = (
-                local_row * layout.decode_seq + layout.decode_seq - 1
-            )
-        active_tokens = max(inputs.per_rank_counts) * layout.decode_seq
-        with profile_span(
-            "DeepSeekV4ModelRunner.mtp.decode.l3_dispatch",
-            cat="executor",
-            args={"actual_tokens": active_tokens},
-        ):
-            self._run_l3(
-                self._require_mtp_decode_callable(),
-                *self._mtp_decode_args(),
-                self._int32_scalar(active_tokens),
-            )
-        for request_index, request_id in enumerate(inputs.request_ids):
-            state = self._require_mtp_request_state(request_id)
-            _, committed_hidden, committed_positions = committed[request_index]
-            state.draft_token_id = int(
-                buffers.decode_logits[inputs.ranks[request_index], inputs.local_rows[request_index]].argmax().item()
-            )
-            state.tail_token_id = int(committed[request_index][0][-1].item())
-            state.tail_pre_hc_hidden = committed_hidden[-1].clone()
-            state.tail_position = int(committed_positions[-1].item())
 
     def _require_stacked_weights(self) -> DeepSeekV4StackedLayerWeights:
         tensors = self._stacked_device_weights or self._stacked_host_weights
@@ -4401,24 +4598,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             positions.append((seq_len - 1,) * decode_seq)
         return tuple(positions)
 
-    def _mtp_decode_positions(
-        self,
-        batch: DecodeBatch,
-        actual_batch: int,
-    ) -> tuple[tuple[int, ...], ...]:
-        """Return the two real trailing positions used for MTP verification."""
-        decode_seq = self._compiled.layout.decode_seq
-        positions = []
-        for row in range(actual_batch):
-            seq_len = int(batch.seq_lens[row].item())
-            if seq_len < decode_seq:
-                raise ValueError(
-                    f"decode seq_lens must be >= MTP sequence width ({decode_seq}), got {seq_len}"
-                )
-            first_position = seq_len - decode_seq
-            positions.append(tuple(first_position + offset for offset in range(decode_seq)))
-        return tuple(positions)
-
     def _autoregressive_decode_token_rows(
         self,
         token_ids: torch.Tensor,
@@ -4432,20 +4611,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         else:
             active = token_ids[:actual_batch, :1]
         return active.expand(actual_batch, layout.decode_seq).clone()
-
-    def _mtp_decode_token_rows(
-        self,
-        token_ids: torch.Tensor,
-        prev_token_ids: torch.Tensor,
-        actual_batch: int,
-    ) -> torch.Tensor:
-        """Build explicit [committed token, draft token] verification rows."""
-        layout = self._compiled.layout
-        if layout.decode_seq != 2:
-            raise ValueError("DeepSeekV4 MTP verification requires decode_seq=2")
-        current = token_ids.detach().cpu().to(torch.long)[:actual_batch].reshape(actual_batch, -1)[:, 0]
-        previous = prev_token_ids.detach().cpu().to(torch.long)[:actual_batch].reshape(actual_batch, -1)[:, 0]
-        return torch.stack((previous, current), dim=1)
 
     def _pad_decode_token_rows(
         self,
