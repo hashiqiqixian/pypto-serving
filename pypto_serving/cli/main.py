@@ -113,7 +113,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--enable-mtp",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Enable DeepSeek V4 MTP speculative decoding (default: False).",
+        help="Enable DeepSeek V4 MTP with one draft token (deprecated alias).",
+    )
+    parser.add_argument(
+        "--num-speculative-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Maximum DeepSeek V4 MTP draft tokens per iteration. "
+            "Any positive value enables MTP; 0 disables it (default: 0)."
+        ),
     )
 
     # Serving
@@ -160,11 +169,12 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = _read_model_config(Path(model_dir))
     model_family = _detect_model_family(Path(model_dir), config_data=model_config_data)
+    num_speculative_tokens = _resolve_num_speculative_tokens(args)
     if model_family == "deepseek_v4":
         executor_kwargs["compile_kernels"] = True
-        executor_kwargs["enable_mtp"] = args.enable_mtp
-    elif args.enable_mtp:
-        raise ValueError("--enable-mtp is only supported for DeepSeek V4")
+        executor_kwargs["num_speculative_tokens"] = num_speculative_tokens
+    elif num_speculative_tokens:
+        raise ValueError("--num-speculative-tokens is only supported for DeepSeek V4")
     if model_family == "qwen" and args.kernel_cache_dir:
         cache_dir = Path(args.kernel_cache_dir).resolve()
         if cache_dir.exists() and not cache_dir.is_dir():
@@ -225,23 +235,28 @@ def _build_runtime_config(
     model_family: str = "qwen",
     config_data: dict[str, object] | None = None,
 ):
+    num_speculative_tokens = _resolve_num_speculative_tokens(args)
     kv_dtype = args.kv_cache_dtype
     if kv_dtype == "auto":
         kv_dtype = args.dtype
 
     kv_cache_groups = ()
     if model_family == "deepseek_v4":
-        from pypto_serving.model.deepseek.npu_runner import build_deepseek_v4_cache_group_specs
+        from pypto_serving.model.deepseek.npu_runner import (
+            build_deepseek_v4_cache_group_specs,
+            deepseek_v4_decode_layout,
+        )
 
         config_data = config_data or {}
         compress_ratios = config_data.get("compress_ratios")
         if not isinstance(compress_ratios, list):
             compress_ratios = None
         num_hidden_layers = int(config_data.get("num_hidden_layers", 43))
+        layout = deepseek_v4_decode_layout(num_speculative_tokens)
         kv_cache_groups = build_deepseek_v4_cache_group_specs(
             num_hidden_layers,
             compress_ratios,
-            decode_batch=4 if args.enable_mtp else 8,
+            decode_batch=layout.decode_batch,
         )
 
     return RuntimeConfig(
@@ -253,9 +268,23 @@ def _build_runtime_config(
         weight_dtype=args.dtype,
         npu_memory_utilization=args.npu_memory_utilization,
         max_num_batched_tokens=args.max_num_batched_tokens,
-        num_speculative_tokens=1 if args.enable_mtp else 0,
+        num_speculative_tokens=num_speculative_tokens,
         kv_cache_groups=kv_cache_groups,
     )
+
+
+def _resolve_num_speculative_tokens(args: argparse.Namespace) -> int:
+    """Resolve the vLLM-style MTP depth and the legacy boolean alias."""
+    configured = getattr(args, "num_speculative_tokens", None)
+    legacy_enabled = bool(getattr(args, "enable_mtp", False))
+    if configured is None:
+        return 1 if legacy_enabled else 0
+    configured = int(configured)
+    if configured < 0:
+        raise ValueError("--num-speculative-tokens must be non-negative")
+    if legacy_enabled and configured == 0:
+        raise ValueError("--enable-mtp conflicts with --num-speculative-tokens 0")
+    return configured
 
 
 def _build_executor_kwargs() -> dict[str, object]:
@@ -331,9 +360,9 @@ def _validate_model_topology(
         raise ValueError("DeepSeekV4 serving requires exactly 8 NPU device ids")
     if args.block_size != 128:
         raise ValueError("DeepSeekV4 kernels require --block-size 128")
-    from pypto_serving.model.deepseek.npu_runner import DeepSeekV4CacheLayout
+    from pypto_serving.model.deepseek.npu_runner import deepseek_v4_decode_layout
 
-    layout = DeepSeekV4CacheLayout()
+    layout = deepseek_v4_decode_layout(_resolve_num_speculative_tokens(args))
     max_global_batch = layout.ranks * layout.decode_batch
     if args.max_num_seqs > max_global_batch:
         raise ValueError(
