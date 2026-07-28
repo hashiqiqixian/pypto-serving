@@ -120,6 +120,56 @@ def test_deepseek_mtp_proposer_reuses_recurrent_hidden_for_configured_depth(monk
     torch.testing.assert_close(calls[1][2], torch.ones((1, 4, 1)))
 
 
+@pytest.mark.parametrize(
+    ("active_rank", "helper_name"),
+    [(0, "_pad_group_block_ids"), (1, "_scratch_group_block_ids")],
+)
+def test_deepseek_mtp_token_step_uses_grouped_cache_helper_contract(
+    monkeypatch,
+    active_rank,
+    helper_name,
+):
+    runner, _model = _runner_for_prepared_inputs()
+    runner._mtp_buffers = SimpleNamespace()
+    indices_by_rank = [() for _ in range(runner._compiled.layout.ranks)]
+    indices_by_rank[active_rank] = (0,)
+    assignment = SimpleNamespace(
+        ranks=(active_rank,),
+        local_rows=(0,),
+        per_rank_counts=tuple(len(indices) for indices in indices_by_rank),
+        indices_by_rank=tuple(indices_by_rank),
+    )
+    monkeypatch.setattr(runner, "_decode_assignment", lambda batch: assignment)
+    monkeypatch.setattr(
+        runner,
+        "_normalize_group_block_ids",
+        lambda block_ids_by_group, actual_batch: [{"ori": [7]}],
+    )
+
+    class CacheHelperCalled(Exception):
+        pass
+
+    def capture_helper(*args, group_name, kernel_rows):
+        assert group_name == "ori"
+        assert kernel_rows == runner._compiled.layout.decode_batch
+        raise CacheHelperCalled
+
+    monkeypatch.setattr(runner, helper_name, capture_helper)
+    with pytest.raises(CacheHelperCalled):
+        runner._run_mtp_token_step(
+            DecodeBatch(
+                request_ids=["req-a"],
+                token_ids=torch.tensor([[9]], dtype=torch.long),
+                hidden_states=torch.zeros((1, 4), dtype=torch.bfloat16),
+                seq_lens=torch.tensor([129], dtype=torch.int32),
+                block_ids_by_group=[{"ori": [7]}],
+            ),
+            torch.tensor([10], dtype=torch.long),
+            torch.zeros((1, 4, 1), dtype=torch.bfloat16),
+            torch.tensor([129], dtype=torch.int32),
+        )
+
+
 def test_deepseek_mtp_target_verification_chunks_arbitrary_depth(monkeypatch):
     runner, _model = _runner_for_prepared_inputs()
     runner._compiled.layout = deepseek_v4_decode_layout(9)
