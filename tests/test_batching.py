@@ -77,6 +77,11 @@ QWEN3_DISPATCH = ROOT / "pypto_serving" / "model" / "qwen" / "qwen3_l3_dispatch.
 QWEN3_KERNEL_DIR = ROOT / "pypto-lib" / "models" / "qwen3" / "14b"
 
 
+def test_scheduler_rejects_speculative_depth_larger_than_token_budget():
+    with pytest.raises(ValueError, match="one decode token"):
+        SchedulerConfig(max_num_scheduled_tokens=4, num_speculative_tokens=4)
+
+
 class _Tokenizer:
     def encode(self, text: str) -> list[int]:
         return [max(1, len(text))]
@@ -1049,11 +1054,10 @@ def test_serving_worker_skips_decode_host_embedding_when_executor_embeds_on_devi
         )
     }
 
-    # last_token=3 (the one output token), prev_token=prompt_ids[-1]=1, seq_len=2.
+    # last_token=3 (the one output token), seq_len=2.
     decode_req = DecodeRequest(
         request_id="decode",
         last_token=3,
-        prev_token=1,
         seq_len=2,
         block_ids=[0],
     )
@@ -1075,34 +1079,30 @@ def test_worker_resolves_placeholder_decode_token_from_cache():
     # Record two sampled tokens (simulating two prior decode steps).
     worker._record_last_tokens("r", [11])
     worker._record_last_tokens("r", [22])
-    assert worker._last_tokens["r"] == [11, 22]
+    assert worker._last_tokens["r"] == [22]
 
     placeholder = DecodeRequest(
         request_id="r",
         last_token=PLACEHOLDER_TOKEN,
-        prev_token=PLACEHOLDER_TOKEN,
         seq_len=5,
         block_ids=[0],
     )
-    # last -> most recent (22); prev -> second-most-recent (11).
     assert worker._resolve_decode_token(placeholder) == 22
-    assert worker._resolve_prev_token(placeholder) == 11
 
     # A real (non-placeholder) token is passed through untouched.
-    explicit = DecodeRequest(
-        request_id="r", last_token=99, prev_token=88, seq_len=5, block_ids=[0]
-    )
+    explicit = DecodeRequest(request_id="r", last_token=99, seq_len=5, block_ids=[0])
     assert worker._resolve_decode_token(explicit) == 99
-    assert worker._resolve_prev_token(explicit) == 88
 
-    # Cache keeps only the last 2 tokens (MTP prev context bound).
+    # Cache keeps only the token needed to resolve the next placeholder.
     worker._record_last_tokens("r", [33])
-    assert worker._last_tokens["r"] == [22, 33]
+    assert worker._last_tokens["r"] == [33]
 
     # Missing cache entry on placeholder is a hard error (never silently wrong).
     orphan = DecodeRequest(
-        request_id="missing", last_token=PLACEHOLDER_TOKEN, prev_token=PLACEHOLDER_TOKEN,
-        seq_len=1, block_ids=[0],
+        request_id="missing",
+        last_token=PLACEHOLDER_TOKEN,
+        seq_len=1,
+        block_ids=[0],
     )
     with pytest.raises(RuntimeError):
         worker._resolve_decode_token(orphan)
