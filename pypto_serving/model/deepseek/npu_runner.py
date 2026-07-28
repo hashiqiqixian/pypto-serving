@@ -3097,13 +3097,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
         swa_lens_by_rank = []
         for rank, request_indices in enumerate(assignment.indices_by_rank):
             for request_index in request_indices:
-                row_start = assignment.local_rows[request_index] * layout.decode_seq
-                row_slice = slice(row_start, row_start + layout.decode_seq)
-                kernel_ids[rank, row_slice].fill_(int(token_ids[request_index]))
-                kernel_positions[rank, row_slice].fill_(int(positions[request_index]))
-                kernel_previous_hidden[rank, row_slice].copy_(
-                    previous_hidden[request_index].expand(layout.decode_seq, -1, -1)
-                )
+                token_row = assignment.local_rows[request_index]
+                kernel_ids[rank, token_row] = int(token_ids[request_index])
+                kernel_positions[rank, token_row] = int(positions[request_index])
+                kernel_previous_hidden[rank, token_row].copy_(previous_hidden[request_index])
 
             if request_indices:
                 padded_blocks = self._pad_group_block_ids(
@@ -3112,31 +3109,45 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     kernel_rows=layout.decode_batch,
                 )
                 padded_positions = [
-                    (int(positions[index]),) * layout.decode_seq for index in request_indices
+                    (int(positions[index]),) for index in request_indices
                 ]
                 while len(padded_positions) < layout.decode_batch:
-                    padded_positions.append((int(fallback_position),) * layout.decode_seq)
+                    padded_positions.append((int(fallback_position),))
             else:
                 padded_blocks = self._scratch_group_block_ids(
                     group_name="ori",
                     kernel_rows=layout.decode_batch,
                 )
                 padded_positions = [
-                    (int(fallback_position),) * layout.decode_seq
+                    (int(fallback_position),)
                     for _ in range(layout.decode_batch)
                 ]
-            slot_mappings.append(
+            packed_slot_mapping = torch.full(
+                (layout.decode_tokens,),
+                -1,
+                dtype=torch.long,
+            )
+            packed_slot_mapping[: layout.decode_batch].copy_(
                 self.cache_metadata.paged_decode_slot_mapping_from_ids(
                     padded_blocks,
                     padded_positions,
                 ).reshape(-1)
             )
-            rank_swa_indices, rank_swa_lens = (
+            slot_mappings.append(packed_slot_mapping)
+            active_swa_indices, active_swa_lens = (
                 self.cache_metadata.swa_window_indices_and_lens_from_ids(
                     padded_blocks,
                     padded_positions,
                 )
             )
+            rank_swa_indices = torch.full(
+                (layout.decode_tokens, layout.sliding_window),
+                -1,
+                dtype=torch.int32,
+            )
+            rank_swa_lens = torch.zeros((layout.decode_tokens,), dtype=torch.int32)
+            rank_swa_indices[: layout.decode_batch].copy_(active_swa_indices)
+            rank_swa_lens[: layout.decode_batch].copy_(active_swa_lens)
             swa_indices_by_rank.append(rank_swa_indices)
             swa_lens_by_rank.append(rank_swa_lens)
 
@@ -3150,11 +3161,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         )
         buffers.decode_prev_hidden_in.copy_(kernel_previous_hidden)
         buffers.decode_position_ids.copy_(kernel_positions)
-        decode_slot_mapping = torch.stack(slot_mappings)
-        for rank, local_row in zip(assignment.ranks, assignment.local_rows, strict=True):
-            row_start = local_row * layout.decode_seq
-            decode_slot_mapping[rank, row_start + 1 : row_start + layout.decode_seq].fill_(-1)
-        buffers.decode_slot_mapping.copy_(decode_slot_mapping)
+        buffers.decode_slot_mapping.copy_(torch.stack(slot_mappings))
         buffers.decode_swa_indices.copy_(torch.stack(swa_indices_by_rank))
         buffers.decode_swa_lens.copy_(torch.stack(swa_lens_by_rank))
         buffers.decode_hidden_out.zero_()
@@ -3162,9 +3169,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
         buffers.decode_logits.zero_()
         buffers.decode_logit_row_indices.fill_(-1)
         for rank, local_row in zip(assignment.ranks, assignment.local_rows, strict=True):
-            buffers.decode_logit_row_indices[rank, local_row] = local_row * layout.decode_seq
+            buffers.decode_logit_row_indices[rank, local_row] = local_row
 
-        active_tokens = max(assignment.per_rank_counts) * layout.decode_seq
+        active_tokens = max(assignment.per_rank_counts)
         with profile_span(
             "DeepSeekV4ModelRunner.mtp.decode.l3_dispatch",
             cat="executor",
@@ -3179,9 +3186,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
         next_tokens = []
         next_hidden = []
         for rank, local_row in zip(assignment.ranks, assignment.local_rows, strict=True):
-            row_start = local_row * layout.decode_seq
             next_tokens.append(int(buffers.decode_logits[rank, local_row].argmax().item()))
-            next_hidden.append(buffers.decode_pre_hc_out[rank, row_start].detach().cpu().clone())
+            next_hidden.append(buffers.decode_pre_hc_out[rank, local_row].detach().cpu().clone())
         return torch.tensor(next_tokens, dtype=torch.long), torch.stack(next_hidden)
 
     def _initialize_mtp_drafts(self, batch: DecodeBatch) -> None:
