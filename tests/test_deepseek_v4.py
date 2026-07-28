@@ -268,7 +268,7 @@ def test_deepseek_mtp_token_step_packs_one_active_row_per_request(monkeypatch):
     captured = {}
 
     def fake_run_l3(callable_spec, *args):
-        captured["num_tokens"] = int(args[-1].item())
+        captured["num_tokens"] = int(args[-1])
         buffers.decode_logits[0, 0, 11] = 1
         buffers.decode_logits[0, 1, 21] = 1
         buffers.decode_pre_hc_out[0, 0].fill_(1)
