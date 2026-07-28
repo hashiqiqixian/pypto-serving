@@ -3108,7 +3108,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             if request_indices:
                 padded_blocks = self._pad_group_block_ids(
                     [active_group_ids[index]["ori"] for index in request_indices],
-                    max_blocks=layout.prefill_ori_max_blocks,
+                    group_name="ori",
                     kernel_rows=layout.decode_batch,
                 )
                 padded_positions = [
@@ -3118,7 +3118,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     padded_positions.append((int(fallback_position),) * layout.decode_seq)
             else:
                 padded_blocks = self._scratch_group_block_ids(
-                    max_blocks=layout.prefill_ori_max_blocks,
+                    group_name="ori",
                     kernel_rows=layout.decode_batch,
                 )
                 padded_positions = [
