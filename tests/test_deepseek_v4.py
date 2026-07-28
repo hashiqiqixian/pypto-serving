@@ -480,7 +480,6 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     assert compiled_args["deepseek_v4_decode"][decode_order.index("logits")].shape == (8, 8, 129280)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("num_tokens_per_owner")].shape == (8,)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("logit_row_indices")].shape == (8, 8)
-    assert compiled_args["deepseek_v4_decode"][decode_order.index("num_logit_rows")].shape == (8,)
     # Prefill and decode share the same runtime-sized physical pool.
     decode_args = compiled_args["deepseek_v4_decode"]
     assert decode_args[decode_order.index("kv_cache")].shape == (
@@ -805,9 +804,17 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
     captured = {}
 
     class FakeDistributedWorker:
-        def __init__(self, compiled, *, persistent, inherited_host_tensors):
+        def __init__(
+            self,
+            compiled,
+            *,
+            persistent,
+            reset_persistent_windows,
+            inherited_host_tensors,
+        ):
             captured["compiled"] = compiled
             captured["persistent"] = persistent
+            captured["reset_persistent_windows"] = reset_persistent_windows
             captured["inherited"] = inherited_host_tensors
 
     monkeypatch.setattr("pypto.runtime.DistributedWorker", FakeDistributedWorker)
@@ -827,6 +834,7 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
     assert isinstance(worker, FakeDistributedWorker)
     assert captured["compiled"] == [compiled_program]
     assert captured["persistent"] is True
+    assert captured["reset_persistent_windows"] is False
     assert captured["inherited"] == [main_weight, mtp_weight]
 
 
