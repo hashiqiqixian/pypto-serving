@@ -71,18 +71,14 @@ class PrefillRequest(msgspec.Struct):
 class DecodeRequest(msgspec.Struct):
     """Per-request payload for a decode step — delta only, no prompt tokens.
 
-    Under async scheduling ``last_token``/``prev_token`` may be
-    ``PLACEHOLDER_TOKEN`` (-1): the engine scheduled this step before the prior
-    step's token was sampled, so the worker substitutes the token(s) it last
-    sampled for this request from its own cache.
+    Under async scheduling ``last_token`` may be ``PLACEHOLDER_TOKEN`` (-1):
+    the engine scheduled this step before the prior step's token was sampled,
+    so the worker substitutes the token it last sampled from its own cache.
     """
 
     request_id: str
     # output_token_ids[-1] (the token to decode from), or PLACEHOLDER_TOKEN.
     last_token: int
-    # output_token_ids[-2] if available, else prompt_token_ids[-1]  (for MTP prev
-    # context), or PLACEHOLDER_TOKEN.
-    prev_token: int
     # Total tokens computed so far: num_prompt_tokens + len(output_token_ids).
     seq_len: int
     # Full KV block table for this request.

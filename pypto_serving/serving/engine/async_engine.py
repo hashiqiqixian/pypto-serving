@@ -641,23 +641,15 @@ class ReplicaEngineCore:
                 # In async mode a request scheduled while a prior token is still
                 # in flight (num_output_placeholders > 0) has a stale
                 # output_token_ids tail. Send placeholders so the worker uses the
-                # token(s) it just sampled (FIFO guarantees they are cached by the
+                # token it just sampled (FIFO guarantees it is cached by the
                 # time it runs this step).
                 if req.num_output_placeholders > 0:
                     last_token = PLACEHOLDER_TOKEN
-                    prev_token = PLACEHOLDER_TOKEN
                 else:
                     last_token = output_ids[-1] if output_ids else prompt_ids[-1]
-                    if len(output_ids) >= 2:
-                        prev_token = output_ids[-2]
-                    elif output_ids and prompt_ids:
-                        prev_token = prompt_ids[-1]
-                    else:
-                        prev_token = last_token
                 decode_requests.append(DecodeRequest(
                     request_id=req_id,
                     last_token=last_token,
-                    prev_token=prev_token,
                     seq_len=req.num_tokens,
                     block_ids=list(sr.block_ids),
                     block_ids_by_group={

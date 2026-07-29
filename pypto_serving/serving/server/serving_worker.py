@@ -72,8 +72,7 @@ class WorkerProcess:
         # Request cache: prompt tokens + sampling params registered once per request.
         # Populated by StepCommand.new_requests; entries removed when the request finishes.
         self._req_cache: dict[str, NewRequestData] = {}
-        # Last-sampled tokens per request (most-recent-last, up to 2 kept for MTP
-        # prev-token context). Under async scheduling the engine sends
+        # Latest sampled token per request. Under async scheduling the engine sends
         # PLACEHOLDER_TOKEN for a decode input it hasn't sampled yet; the worker
         # substitutes from here. Entries cleared when a request is released.
         self._last_tokens: dict[str, list[int]] = {}
@@ -278,12 +277,10 @@ class WorkerProcess:
         return StepResult(new_tokens=new_tokens, step_id=cmd.step_id)
 
     def _record_last_tokens(self, request_id: str, tokens: list[int]) -> None:
-        """Append newly sampled tokens, keeping at most the last 2 (MTP prev ctx)."""
+        """Remember the latest sampled token for async placeholder resolution."""
         recent = self._last_tokens.get(request_id, [])
         recent.extend(int(t) for t in tokens)
-        if len(recent) > 2:
-            recent = recent[-2:]
-        self._last_tokens[request_id] = recent
+        self._last_tokens[request_id] = recent[-1:]
 
     @staticmethod
     def _partitioned_prefill_chunks(scheduled: list, max_batch: int) -> list[list]:
@@ -397,19 +394,6 @@ class WorkerProcess:
             )
         return recent[-1]
 
-    def _resolve_prev_token(self, dr: DecodeRequest) -> int:
-        """Return the MTP prev-context token, substituting from cache on placeholder."""
-        if dr.prev_token != PLACEHOLDER_TOKEN:
-            return dr.prev_token
-        recent = self._last_tokens.get(dr.request_id)
-        if not recent:
-            raise RuntimeError(
-                f"No cached token to resolve placeholder prev token for {dr.request_id!r}"
-            )
-        # Token at absolute position seq_len-2: the second-most-recent sampled
-        # token when available, else the only one we have.
-        return recent[-2] if len(recent) >= 2 else recent[-1]
-
     def _batch_decode(
         self,
         scheduled: list[DecodeRequest],
@@ -430,7 +414,6 @@ class WorkerProcess:
             allow_device_topk_sampling = self._allow_device_topk_sampling(scheduled)
 
             decode_tokens = [self._resolve_decode_token(dr) for dr in scheduled]
-            prev_tokens = [self._resolve_prev_token(dr) for dr in scheduled]
             block_ids_list = [dr.block_ids for dr in scheduled]
             seq_lens = [dr.seq_len for dr in scheduled]
 
@@ -439,15 +422,8 @@ class WorkerProcess:
                 # Device kernel embeds directly from token ids — do not build
                 # host-side embedding tensors.
                 decode_embeddings = None
-                prev_embeddings = None
             else:
                 decode_embeddings = self.executor.lookup_embeddings(runtime_model, decode_token_tensor)
-                prev_token_tensor = torch.tensor(prev_tokens, dtype=torch.long, device=device)
-                prev_embeddings = self.executor.lookup_embeddings(runtime_model, prev_token_tensor)
-
-            if self.executor.supports_device_decode_embedding:
-                prev_token_tensor = torch.tensor(prev_tokens, dtype=torch.long, device=device)
-
             decode_result = self.executor.run_decode(
                 runtime_model,
                 DecodeBatch(
@@ -460,8 +436,6 @@ class WorkerProcess:
                     block_ids=block_ids_list,
                     block_ids_by_group=[dr.block_ids_by_group for dr in scheduled],
                     cache_partitions=[dr.cache_partition for dr in scheduled],
-                    prev_token_ids=prev_token_tensor,
-                    prev_hidden_states=prev_embeddings,
                 ),
             )
 

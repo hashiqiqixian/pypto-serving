@@ -288,12 +288,6 @@ class DecodeBatch:
     block_ids: list[list[int]] = field(default_factory=list)
     block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
     cache_partitions: list[int | None] = field(default_factory=list)
-    # Optional MTP context for models (e.g. DeepSeek V4) that decode two real
-    # trailing tokens per step. ``prev_token_ids`` holds the token id at absolute
-    # position ``seq_len-2`` per request (shape ``[B]``) and ``prev_hidden_states``
-    # its embedding (shape ``[B, hidden]``). Left ``None`` for single-token decoders.
-    prev_token_ids: torch.Tensor | None = None
-    prev_hidden_states: torch.Tensor | None = None
 
 
 @dataclass

@@ -56,6 +56,11 @@ class SchedulerConfig:
     def __post_init__(self) -> None:
         if self.num_speculative_tokens < 0:
             raise ValueError("num_speculative_tokens must be non-negative")
+        if self.num_speculative_tokens + 1 > self.max_num_scheduled_tokens:
+            raise ValueError(
+                "max_num_scheduled_tokens must fit one decode token plus "
+                "num_speculative_tokens"
+            )
 
 
 @dataclass
