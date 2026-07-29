@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import stat
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -35,6 +36,7 @@ from pypto_serving.model.deepseek.npu_runner import (
     build_deepseek_v4_cache_group_specs,
     build_deepseek_v4_layer_plan,
     deepseek_v4_cache_blocks_for_slots,
+    deepseek_v4_decode_layout,
 )
 from pypto_serving.model.deepseek.weight_loader import (
     DEEPSEEK_V4_PACKED_FORMAT,
@@ -63,99 +65,416 @@ def test_deepseek_kernel_dir_uses_v4_flash_variant(tmp_path):
 def test_accept_mtp_tokens_commits_second_main_token_only_on_draft_match():
     accepted = accept_mtp_tokens(
         torch.tensor([[11, 12], [21, 22]], dtype=torch.long),
-        torch.tensor([11, 99], dtype=torch.long),
+        torch.tensor([[11], [99]], dtype=torch.long),
     )
 
     assert accepted == [[11, 12], [21]]
 
 
-def test_deepseek_mtp_speculative_batch_feeds_current_then_draft():
-    runner, model = _runner_for_prepared_inputs()
-    embed = torch.arange(model.config.vocab_size * model.config.hidden_size, dtype=torch.float32).reshape(
-        model.config.vocab_size, model.config.hidden_size
+def test_accept_mtp_tokens_commits_matching_prefix_and_one_target_token():
+    accepted = accept_mtp_tokens(
+        torch.tensor(
+            [
+                [11, 12, 13, 14],
+                [21, 22, 23, 24],
+                [31, 32, 33, 34],
+            ],
+            dtype=torch.long,
+        ),
+        torch.tensor(
+            [
+                [11, 12, 13],
+                [21, 99, 23],
+                [99, 32, 33],
+            ],
+            dtype=torch.long,
+        ),
     )
-    runner._compiled.weight_store = type(
-        "Store",
-        (),
-        {"load_tensor": staticmethod(lambda name: embed if name == "embed.weight" else None)},
-    )()
-    batch = DecodeBatch(
-        request_ids=["req-a"],
-        token_ids=torch.tensor([[2]], dtype=torch.long),
-        hidden_states=embed[2:3].to(torch.bfloat16),
-        seq_lens=torch.tensor([129], dtype=torch.int32),
-        allow_device_greedy_sampling=True,
-    )
 
-    speculative = runner._main_speculative_batch(model, batch, torch.tensor([5]))
-
-    assert speculative.prev_token_ids.tolist() == [2]
-    assert speculative.token_ids.tolist() == [[5]]
-    assert speculative.seq_lens.tolist() == [130]
-    assert speculative.prev_hidden_states is None
-    assert speculative.hidden_states is None
+    assert accepted == [[11, 12, 13, 14], [21, 22], [31]]
 
 
-def test_deepseek_mtp_committed_window_handles_rejection_and_acceptance():
+def test_deepseek_mtp_proposer_reuses_recurrent_hidden_for_configured_depth(monkeypatch):
     runner, _model = _runner_for_prepared_inputs()
-    inputs = SimpleNamespace(
-        request_ids=("req-a",),
-        ranks=(0,),
-        local_rows=(0,),
-        position_ids=torch.tensor(
-            [[7, 8, 0, 0, 0, 0, 0, 0]] * runner._compiled.layout.ranks,
+    runner._compiled.num_speculative_tokens = 3
+    runner._mtp_request_states["req-a"] = SimpleNamespace(
+        draft_token_id=10,
+        draft_pre_hc_hidden=torch.zeros((4, 1)),
+        draft_position=129,
+    )
+    calls = []
+
+    monkeypatch.setattr(runner, "_initialize_mtp_drafts", lambda batch: None)
+
+    def fake_step(model, batch, token_ids, previous_hidden, positions):
+        calls.append((token_ids.tolist(), positions.tolist(), previous_hidden.clone()))
+        return token_ids + 1, previous_hidden + 1
+
+    monkeypatch.setattr(runner, "_run_mtp_token_step", fake_step)
+    drafts = runner._propose_mtp_tokens(
+        _model,
+        DecodeBatch(
+            request_ids=["req-a"],
+            token_ids=torch.tensor([[9]], dtype=torch.long),
+            hidden_states=torch.zeros((1, 4), dtype=torch.bfloat16),
+            seq_lens=torch.tensor([129], dtype=torch.int32),
+        )
+    )
+
+    assert drafts.tolist() == [[10, 11, 12]]
+    assert [positions for _, positions, _ in calls] == [[129], [130]]
+    torch.testing.assert_close(calls[1][2], torch.ones((1, 4, 1)))
+
+
+def test_deepseek_mtp_token_step_runs_one_request_per_rank_wave(monkeypatch):
+    runner, model = _runner_for_prepared_inputs()
+    layout = deepseek_v4_decode_layout(3)
+    runner._compiled.layout = layout
+    buffers = SimpleNamespace(
+        decode_input_ids=torch.empty((layout.ranks, layout.decode_tokens), dtype=torch.long),
+        decode_position_ids=torch.empty(
+            (layout.ranks, layout.decode_tokens),
+            dtype=torch.int32,
+        ),
+        decode_accepted_counts=torch.empty(
+            (layout.ranks, layout.decode_batch),
+            dtype=torch.int32,
+        ),
+        decode_tail_slot_ids=torch.empty(
+            (layout.ranks, layout.decode_batch),
+            dtype=torch.int32,
+        ),
+        decode_pre_hc_out=torch.empty(
+            (layout.ranks, layout.decode_tokens, 4, 1),
+            dtype=torch.float32,
+        ),
+        decode_sampled_ids=torch.empty(
+            (layout.ranks, layout.decode_tokens, 8),
+            dtype=torch.int32,
+        ),
+        decode_logit_row_indices=torch.empty(
+            (layout.ranks, layout.decode_tokens),
             dtype=torch.int32,
         ),
     )
-    main_ids = torch.tensor([[11, 12]], dtype=torch.long)
-    runner._mtp_request_states["req-a"] = SimpleNamespace(
-        tail_token_id=9,
-        tail_slot_id=0,
-        tail_position=6,
+    runner._mtp_buffers = buffers
+    indices_by_rank = ((0, 1),) + ((),) * (layout.ranks - 1)
+    assignment = SimpleNamespace(
+        ranks=(0, 0),
+        local_rows=(0, 1),
+        per_rank_counts=(2,) + (0,) * (layout.ranks - 1),
+        indices_by_rank=indices_by_rank,
+    )
+    monkeypatch.setattr(runner, "_decode_assignment", lambda batch: assignment)
+    prepared_request_ids = []
+
+    def fake_prepare(model, batch, **kwargs):
+        prepared_request_ids.append(tuple(batch.request_ids))
+        return SimpleNamespace(ranks=(0,), local_rows=(0,))
+
+    monkeypatch.setattr(runner, "prepare_mtp_target_inputs", fake_prepare)
+    monkeypatch.setattr(runner, "_stage_decode_inputs", lambda prepared: prepared)
+    monkeypatch.setattr(runner, "_mtp_decode_args", lambda: ())
+    monkeypatch.setattr(runner, "_require_mtp_decode_callable", lambda: object())
+    runner._mtp_request_states = {
+        "req-a": SimpleNamespace(tail_rank=0, tail_slot_id=0),
+        "req-b": SimpleNamespace(tail_rank=0, tail_slot_id=1),
+    }
+    uploaded = []
+    monkeypatch.setattr(
+        runner,
+        "_write_mtp_tail_hidden",
+        lambda state, rank, hidden: uploaded.append((state.tail_slot_id, hidden.clone())),
+    )
+    active_tokens = []
+
+    def fake_run_l3(callable_spec, *args):
+        active_tokens.append(int(args[-1]))
+        call_index = len(active_tokens)
+        buffers.decode_sampled_ids[0, 0, 0] = 10 + 10 * (call_index - 1)
+        buffers.decode_pre_hc_out[0, 0].fill_(call_index)
+
+    monkeypatch.setattr(runner, "_run_l3", fake_run_l3)
+    batch = DecodeBatch(
+        request_ids=["req-a", "req-b"],
+        token_ids=torch.tensor([[9], [19]], dtype=torch.long),
+        hidden_states=torch.zeros((2, 4), dtype=torch.bfloat16),
+        seq_lens=torch.tensor([129, 130], dtype=torch.int32),
+        block_ids_by_group=[{"ori": [7]}, {"ori": [8]}],
+    )
+    token_ids = torch.tensor([10, 20], dtype=torch.long)
+    previous_hidden = torch.stack(
+        (torch.full((4, 1), 3.0), torch.full((4, 1), 4.0))
+    )
+    positions = torch.tensor([129, 130], dtype=torch.int32)
+    next_tokens, next_hidden = runner._run_mtp_token_step(
+        model,
+        batch,
+        token_ids,
+        previous_hidden,
+        positions,
     )
 
-    committed_ids, committed_positions = runner._mtp_committed_window(
-        inputs,
-        main_ids,
-        request_index=0,
-        accepted_count=1,
+    assert active_tokens == [1, 1]
+    assert prepared_request_ids == [("req-a",), ("req-b",)]
+    assert [slot for slot, _hidden in uploaded] == [0, 1]
+    assert next_tokens.tolist() == [10, 20]
+    torch.testing.assert_close(next_hidden[:, 0, 0], torch.tensor([1.0, 2.0]))
+
+
+def test_deepseek_mtp_target_verification_chunks_arbitrary_depth(monkeypatch):
+    runner, model = _runner_for_prepared_inputs()
+    runner._compiled.layout = deepseek_v4_decode_layout(9)
+    runner._compiled.num_speculative_tokens = 9
+    prepared_chunks = []
+
+    def fake_prepare(model, batch, *, token_rows, positions, active_width):
+        chunk = SimpleNamespace(
+            request_ids=tuple(batch.request_ids),
+            token_rows=token_rows,
+            positions=positions,
+            active_width=active_width,
+        )
+        prepared_chunks.append(chunk)
+        return chunk
+
+    def fake_execute(model, prepared, *, active_seq):
+        ranks = tuple(range(len(prepared.request_ids)))
+        logits = torch.zeros((8, active_seq, 128), dtype=torch.float32)
+        sampled_ids = torch.zeros((8, active_seq, 8), dtype=torch.int32)
+        pre_hc = torch.zeros((8, active_seq, 4, 1), dtype=torch.float32)
+        for row, token_row in enumerate(prepared.token_rows):
+            predictions = token_row[:active_seq] + 1
+            logits[row, torch.arange(active_seq), predictions] = 1
+            sampled_ids[row, :, 0] = predictions
+            pre_hc[row, :, 0, 0] = torch.arange(active_seq)
+        return SimpleNamespace(
+            inputs=SimpleNamespace(ranks=ranks, local_rows=(0,) * len(ranks)),
+            logits=logits,
+            sampled_ids=sampled_ids,
+            pre_hc_hidden=pre_hc,
+        )
+
+    monkeypatch.setattr(runner, "prepare_mtp_target_inputs", fake_prepare)
+    monkeypatch.setattr(runner, "_execute_main_decode", fake_execute)
+    monkeypatch.setattr(
+        runner,
+        "_copy_main_pre_hc_row",
+        lambda source, *, rank, row, hidden_size: source[rank, row].clone(),
+    )
+    verification = runner._verify_mtp_drafts(
+        model,
+        DecodeBatch(
+            request_ids=["req-a", "req-b"],
+            token_ids=torch.tensor([[9], [19]], dtype=torch.long),
+            hidden_states=torch.zeros((2, 4), dtype=torch.bfloat16),
+            seq_lens=torch.tensor([100, 100], dtype=torch.int32),
+            cache_partitions=[0, 1],
+        ),
+        torch.tensor(
+            [
+                [10, 11, 12, 13, 14, 15, 16, 17, 18],
+                [20, 21, 99, 23, 24, 25, 26, 27, 28],
+            ],
+            dtype=torch.long,
+        ),
     )
 
-    assert committed_ids.tolist() == [9, 11]
-    assert committed_positions.tolist() == [6, 7]
+    assert verification.accepted_token_ids == [
+        [10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+        [20, 21, 22],
+    ]
+    assert verification.tail_token_ids.tolist() == [19, 22]
+    assert verification.tail_positions.tolist() == [109, 102]
+    assert [chunk.active_width for chunk in prepared_chunks] == [8, 2]
+    assert prepared_chunks[1].request_ids == ("req-a",)
 
-    committed_ids, committed_positions = runner._mtp_committed_window(
-        inputs,
-        main_ids,
-        request_index=0,
-        accepted_count=2,
+
+def test_deepseek_mtp_partial_target_chunk_waves_requests_on_same_rank(monkeypatch):
+    runner, model = _runner_for_prepared_inputs()
+    runner._compiled.layout = deepseek_v4_decode_layout(2)
+    runner._compiled.num_speculative_tokens = 2
+    prepared_request_ids = []
+
+    def fake_assignment(batch):
+        count = len(batch.request_ids)
+        return SimpleNamespace(
+            ranks=(0,) * count,
+            local_rows=tuple(range(count)),
+            per_rank_counts=(count,) + (0,) * 7,
+            indices_by_rank=(tuple(range(count)),) + ((),) * 7,
+        )
+
+    def fake_prepare(model, batch, *, token_rows, positions, active_width):
+        prepared_request_ids.append(tuple(batch.request_ids))
+        return SimpleNamespace(
+            request_ids=tuple(batch.request_ids),
+            token_rows=token_rows,
+        )
+
+    def fake_execute(model, prepared, *, active_seq):
+        predictions = prepared.token_rows + 1
+        logits = torch.zeros((8, 4, 128), dtype=torch.float32)
+        sampled_ids = torch.zeros((8, 4, 8), dtype=torch.int32)
+        logits[0, torch.arange(active_seq), predictions[0, :active_seq]] = 1
+        sampled_ids[0, :active_seq, 0] = predictions[0, :active_seq]
+        return SimpleNamespace(
+            inputs=SimpleNamespace(ranks=(0,), local_rows=(0,)),
+            logits=logits,
+            sampled_ids=sampled_ids,
+            pre_hc_hidden=torch.zeros((8, 4, 4, 1), dtype=torch.float32),
+        )
+
+    monkeypatch.setattr(runner, "_decode_assignment", fake_assignment)
+    monkeypatch.setattr(runner, "prepare_mtp_target_inputs", fake_prepare)
+    monkeypatch.setattr(runner, "_execute_main_decode", fake_execute)
+    monkeypatch.setattr(
+        runner,
+        "_copy_main_pre_hc_row",
+        lambda source, *, rank, row, hidden_size: source[rank, row].clone(),
     )
 
-    assert committed_ids.tolist() == [11, 12]
-    assert committed_positions.tolist() == [7, 8]
+    verification = runner._verify_mtp_drafts(
+        model,
+        DecodeBatch(
+            request_ids=["req-a", "req-b"],
+            token_ids=torch.tensor([[9], [19]], dtype=torch.long),
+            hidden_states=torch.zeros((2, 4), dtype=torch.bfloat16),
+            seq_lens=torch.tensor([100, 100], dtype=torch.int32),
+        ),
+        torch.tensor([[10, 11], [20, 21]], dtype=torch.long),
+    )
+
+    assert prepared_request_ids == [("req-a",), ("req-b",)]
+    assert verification.accepted_token_ids == [[10, 11, 12], [20, 21, 22]]
 
 
-def test_cli_selects_deepseek_executor_and_forces_prefix_cache_off(tmp_path):
+@pytest.mark.parametrize(
+    ("num_speculative_tokens", "decode_seq", "decode_batch"),
+    [(0, 1, 8), (1, 2, 4), (2, 4, 2), (3, 4, 2), (4, 8, 1), (32, 8, 1)],
+)
+def test_deepseek_mtp_depth_selects_fixed_eight_row_layout(
+    num_speculative_tokens,
+    decode_seq,
+    decode_batch,
+):
+    layout = deepseek_v4_decode_layout(num_speculative_tokens)
+
+    assert layout.decode_seq == decode_seq
+    assert layout.decode_batch == decode_batch
+    assert layout.decode_tokens == 8
+
+
+def test_deepseek_mtp_draft_depth_is_capped_by_remaining_context():
+    runner, model = _runner_for_prepared_inputs()
+    runner._compiled.num_speculative_tokens = 9
+    model.runtime = replace(model.runtime, max_seq_len=130)
+    batch = DecodeBatch(
+        request_ids=["req-a", "req-b"],
+        token_ids=torch.tensor([[9], [19]], dtype=torch.long),
+        hidden_states=torch.zeros((2, 4), dtype=torch.bfloat16),
+        seq_lens=torch.tensor([128, 125], dtype=torch.int32),
+    )
+
+    assert runner._mtp_draft_count(model, batch) == 2
+
+
+def test_deepseek_mtp_corrects_async_lengths_from_committed_tokens():
+    runner, _model = _runner_for_prepared_inputs()
+    runner._mtp_request_states = {
+        "continued": SimpleNamespace(
+            proposed_tokens=3,
+            prompt_len=100,
+            committed_count=5,
+        ),
+        "first-step": SimpleNamespace(
+            proposed_tokens=0,
+            prompt_len=40,
+            committed_count=0,
+        ),
+    }
+    batch = DecodeBatch(
+        request_ids=["continued", "first-step"],
+        token_ids=torch.tensor([[9], [19]], dtype=torch.long),
+        hidden_states=None,
+        seq_lens=torch.tensor([999, 41], dtype=torch.int32),
+    )
+
+    assert runner._correct_mtp_seq_lens(batch).tolist() == [106, 41]
+
+
+def test_deepseek_mtp_exhausted_context_verifies_single_target_column(monkeypatch):
+    runner, model = _runner_for_prepared_inputs()
+    runner._compiled.layout = deepseek_v4_decode_layout(9)
+    runner._compiled.num_speculative_tokens = 9
+    model.runtime = replace(model.runtime, max_seq_len=130)
+    batch = DecodeBatch(
+        request_ids=["req-a"],
+        token_ids=torch.tensor([[9]], dtype=torch.long),
+        hidden_states=torch.zeros((1, 4), dtype=torch.bfloat16),
+        seq_lens=torch.tensor([130], dtype=torch.int32),
+        cache_partitions=[0],
+    )
+    prepared_chunks = []
+
+    def fake_prepare(model, batch, *, token_rows, positions, active_width):
+        chunk = SimpleNamespace(
+            request_ids=tuple(batch.request_ids),
+            token_rows=token_rows,
+            positions=positions,
+            active_width=active_width,
+        )
+        prepared_chunks.append(chunk)
+        return chunk
+
+    def fake_execute(model, prepared, *, active_seq):
+        logits = torch.zeros((8, active_seq, 128), dtype=torch.float32)
+        logits[0, 0, 10] = 1
+        sampled_ids = torch.zeros((8, active_seq, 8), dtype=torch.int32)
+        sampled_ids[0, 0, 0] = 10
+        return SimpleNamespace(
+            inputs=SimpleNamespace(ranks=(0,), local_rows=(0,)),
+            logits=logits,
+            sampled_ids=sampled_ids,
+            pre_hc_hidden=torch.zeros((8, active_seq, 4, 1), dtype=torch.float32),
+        )
+
+    monkeypatch.setattr(runner, "prepare_mtp_target_inputs", fake_prepare)
+    monkeypatch.setattr(runner, "_execute_main_decode", fake_execute)
+    monkeypatch.setattr(
+        runner,
+        "_copy_main_pre_hc_row",
+        lambda source, *, rank, row, hidden_size: source[rank, row].clone(),
+    )
+
+    num_drafts = runner._mtp_draft_count(model, batch)
+    drafts = runner._propose_mtp_tokens(model, batch, num_drafts=num_drafts)
+    verification = runner._verify_mtp_drafts(model, batch, drafts)
+
+    assert num_drafts == 0
+    assert drafts.shape == (1, 0)
+    assert verification.accepted_token_ids == [[10]]
+    assert verification.tail_token_ids.tolist() == [10]
+    assert verification.tail_positions.tolist() == [130]
+    assert len(prepared_chunks) == 1
+    assert prepared_chunks[0].active_width == 1
+    assert prepared_chunks[0].token_rows.tolist() == [[9] * 8]
+
+
+def test_cli_selects_deepseek_executor_and_configures_mtp_depth(tmp_path):
     model_dir = _write_deepseek_model_dir(tmp_path)
     args = cli.build_parser().parse_args(
         [
-            "--model",
-            str(model_dir),
-            "--devices",
-            "0,1,2,3,4,5,6,7",
-            "--dp",
-            "8",
-            "--ep",
-            "8",
-            "--tp",
-            "1",
-            "--block-size",
-            "128",
-            "--max-model-len",
-            "260",
-            "--dtype",
-            "int8",
-            "--enable-mtp",
+            "--model", str(model_dir),
+            "--devices", "0,1,2,3,4,5,6,7",
+            "--dp", "8",
+            "--ep", "8",
+            "--tp", "1",
+            "--block-size", "128",
+            "--max-model-len", "260",
+            "--dtype", "int8",
+            "--speculative-config", '{"method":"mtp","num_speculative_tokens":4}',
+            "--max-num-seqs", "8",
             "--use-compile-cache",
         ]
     )
@@ -168,8 +487,60 @@ def test_cli_selects_deepseek_executor_and_forces_prefix_cache_off(tmp_path):
     assert config.runtime_config.page_size == 128
     assert config.runtime_config.weight_dtype == "int8"
     assert config.enable_prefix_cache is False
-    assert config.executor_kwargs["enable_mtp"] is True
+    assert config.executor_kwargs["num_speculative_tokens"] == 4
+    assert config.runtime_config.num_speculative_tokens == 4
+    assert config.max_num_running_reqs == 8
     assert config.executor_kwargs["use_compile_cache"] is True
+
+
+def test_cli_keeps_deepseek_autoregressive_decode_when_mtp_is_disabled(tmp_path):
+    model_dir = _write_deepseek_model_dir(tmp_path)
+    args = cli.build_parser().parse_args(
+        [
+            "--model",
+            str(model_dir),
+            "--devices",
+            "0,1,2,3,4,5,6,7",
+            "--dp",
+            "8",
+            "--ep",
+            "8",
+        ]
+    )
+
+    config = cli.build_serving_engine_config(args)
+
+    assert config.executor_kwargs["num_speculative_tokens"] == 0
+
+
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [
+        ({"method": "draft_model", "num_speculative_tokens": 3}, "method='mtp'"),
+        ({"method": "mtp"}, "requires num_speculative_tokens"),
+        ({"method": "mtp", "num_speculative_tokens": 0}, "must be positive"),
+    ],
+)
+def test_cli_rejects_invalid_deepseek_speculative_config(config, message):
+    args = SimpleNamespace(
+        speculative_config=config,
+        num_speculative_tokens=None,
+        enable_mtp=None,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        cli._resolve_num_speculative_tokens(args)
+
+
+def test_cli_rejects_speculative_config_with_deprecated_alias():
+    args = SimpleNamespace(
+        speculative_config={"method": "mtp", "num_speculative_tokens": 3},
+        num_speculative_tokens=2,
+        enable_mtp=None,
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        cli._resolve_num_speculative_tokens(args)
 
 
 def test_tokenizer_falls_back_when_deepseek_config_fails_strict_validation(tmp_path, monkeypatch):
@@ -218,7 +589,12 @@ def test_deepseek_compile_attaches_lazy_weight_store_without_opening_shards(tmp_
     loaded = ModelLoader().load(
         model_id="dsv4",
         model_dir=str(model_dir),
-        runtime_config=RuntimeConfig(page_size=128, max_batch_size=4, max_seq_len=256, weight_dtype="int8"),
+        runtime_config=RuntimeConfig(
+            page_size=128,
+            max_batch_size=4,
+            max_seq_len=256,
+            weight_dtype="int8",
+        ),
     )
     executor = npu_executor.DeepSeekV4PyptoExecutor(platform="a2a3sim", device_ids=tuple(range(8)))
 
@@ -235,7 +611,12 @@ def test_deepseek_compile_attaches_lazy_weight_store_without_opening_shards(tmp_
     assert compiled.layer_plan[3].include_gate_bias is True
 
 
-def test_deepseek_compile_uses_signature_metadata_and_mtp_scalars(tmp_path, monkeypatch):
+@pytest.mark.parametrize("num_speculative_tokens", [1, 3])
+def test_deepseek_compile_selects_mtp_programs(
+    tmp_path,
+    monkeypatch,
+    num_speculative_tokens,
+):
     model_dir = _write_deepseek_model_dir(tmp_path)
     kernel_dir = _write_deepseek_kernel_dir(tmp_path, lm_head_tp_size=8)
     monkeypatch.setattr(model_loader, "load_tokenizer", lambda *args, **kwargs: _Tokenizer())
@@ -244,17 +625,24 @@ def test_deepseek_compile_uses_signature_metadata_and_mtp_scalars(tmp_path, monk
     loaded = ModelLoader().load(
         model_id="dsv4",
         model_dir=str(model_dir),
-        runtime_config=RuntimeConfig(page_size=128, max_batch_size=4, max_seq_len=256, weight_dtype="int8"),
+        runtime_config=RuntimeConfig(
+            page_size=128,
+            max_batch_size=4,
+            max_seq_len=256,
+            weight_dtype="int8",
+            num_speculative_tokens=num_speculative_tokens,
+        ),
     )
 
     prefill_fwd = SimpleNamespace(l3_prefill_fwd=object())
     decode_fwd = SimpleNamespace(l3_decode_fwd=object())
     decode_fwd_mtp = SimpleNamespace(l3_decode_fwd_mtp=object())
+    decode_mtp = SimpleNamespace(l3_mtp_decode_layer=object())
     prefill_mtp = SimpleNamespace(l3_mtp_prefill_fwd=object())
     compile_calls: list[tuple[str, object, frozenset[str] | None]] = []
 
     def _fake_compile(self, name, jit_fn, *, layout, runtime_scalar_names=None):
-        assert layout == DeepSeekV4CacheLayout(decode_batch=4, decode_seq=2, decode_tokens=8)
+        assert layout == deepseek_v4_decode_layout(num_speculative_tokens)
         compile_calls.append((name, jit_fn, runtime_scalar_names))
         return DeepSeekV4L3Callable(compiled=object(), name=name)
 
@@ -266,6 +654,7 @@ def test_deepseek_compile_uses_signature_metadata_and_mtp_scalars(tmp_path, monk
             "prefill_fwd": prefill_fwd,
             "decode_fwd": decode_fwd,
             "decode_fwd_mtp": decode_fwd_mtp,
+            "decode_mtp": decode_mtp,
             "prefill_mtp": prefill_mtp,
             "utils": object(),
         },
@@ -280,24 +669,34 @@ def test_deepseek_compile_uses_signature_metadata_and_mtp_scalars(tmp_path, monk
         platform="a2a3sim",
         device_ids=tuple(range(8)),
         compile_kernels=True,
-        enable_mtp=True,
+        num_speculative_tokens=num_speculative_tokens,
     )
 
     compiled = executor._compile_model(loaded.runtime_model)
 
-    assert compile_calls == [
+    expected_calls = [
         ("deepseek_v4_prefill", prefill_fwd.l3_prefill_fwd, None),
-        (
+    ]
+    if num_speculative_tokens == 1:
+        expected_calls.append((
             "deepseek_v4_decode_mtp_fused",
             decode_fwd_mtp.l3_decode_fwd_mtp,
             frozenset({"mtp_num_tokens"}),
-        ),
+        ))
+    else:
+        expected_calls.append(("deepseek_v4_decode", decode_fwd.l3_decode_fwd, None))
+    expected_calls.extend([
         ("deepseek_v4_mtp_prefill", prefill_mtp.l3_mtp_prefill_fwd, frozenset({"num_tokens"})),
-    ]
+    ])
+    if num_speculative_tokens > 1:
+        expected_calls.append(
+            ("deepseek_v4_mtp_decode", decode_mtp.l3_mtp_decode_layer, frozenset({"num_tokens"}))
+        )
+    assert compile_calls == expected_calls
     assert compiled.prefill is not None
     assert compiled.decode is not None
     assert compiled.mtp_prefill is not None
-    assert compiled.mtp_decode is None
+    assert (compiled.mtp_decode is None) == (num_speculative_tokens == 1)
 
 
 def test_deepseek_l3_compile_passes_runtime_scalars_unspecialized():
@@ -1137,61 +1536,46 @@ def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
     assert prepared.logit_row_indices[0].tolist() == [2, -1, -1, -1, -1, -1, -1, -1]
 
 
-def test_deepseek_prepare_mtp_decode_inputs_stages_device_metadata_sources():
+def test_deepseek_prepare_decode_inputs_accepts_device_embedding_batch():
     runner, model = _runner_for_prepared_inputs()
 
-    prepared = runner.prepare_mtp_decode_inputs(
+    prepared = runner.prepare_decode_inputs(
         model,
         DecodeBatch(
-            request_ids=["req-a", "req-b"],
-            token_ids=torch.tensor([[5], [9]], dtype=torch.long),
-            hidden_states=torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
-            seq_lens=torch.tensor([128, 5], dtype=torch.int32),
-            block_ids_by_group=_grouped_cache_rows(2),
-            cache_partitions=[0, 1],
-            prev_token_ids=torch.tensor([3, 7], dtype=torch.long),
-            prev_hidden_states=torch.arange(8, 16, dtype=torch.bfloat16).reshape(2, 4),
+            request_ids=["req-a"],
+            token_ids=torch.tensor([[5]], dtype=torch.long),
+            hidden_states=None,
+            seq_lens=torch.tensor([128], dtype=torch.int32),
+            block_ids_by_group=_grouped_cache_rows(1),
+            cache_partitions=[0],
         ),
     )
-
-    # Each request owns one DP rank and its scheduler-provided physical pages.
-    assert prepared.block_table.shape == (8, 4, 128)
-    assert prepared.block_table[0, 0, :4].tolist() == [0, 0, 0, 0]
-    assert prepared.block_table[1, 0, :4].tolist() == [6, 6, 6, 6]
-    assert prepared.position_ids[0, :2].tolist() == [126, 127]
-    assert prepared.position_ids[1, :2].tolist() == [3, 4]
-    assert prepared.block_counts.shape == (8, 4, 6)
-    assert prepared.block_counts[0, 0].tolist() == [1, 1, 1, 1, 1, 1]
-    assert prepared.block_counts[1, 0].tolist() == [1, 1, 1, 1, 1, 1]
-    assert prepared.num_tokens_per_owner.tolist() == [2, 2, 0, 0, 0, 0, 0, 0]
-    assert prepared.logit_row_indices[0].tolist() == [0, 1, -1, -1, -1, -1, -1, -1]
-
-
-def test_deepseek_prepare_mtp_decode_inputs_feeds_two_real_tokens():
-    runner, model = _runner_for_prepared_inputs()
-
-    prepared = runner.prepare_mtp_decode_inputs(
-        model,
-        DecodeBatch(
-            request_ids=["req-a", "req-b"],
-            token_ids=torch.tensor([[5], [9]], dtype=torch.long),
-            hidden_states=torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
-            seq_lens=torch.tensor([128, 5], dtype=torch.int32),
-            block_ids_by_group=_grouped_cache_rows(2),
-            cache_partitions=[0, 1],
-            prev_token_ids=torch.tensor([3, 7], dtype=torch.long),
-            prev_hidden_states=torch.arange(8, 16, dtype=torch.bfloat16).reshape(2, 4),
-        ),
-    )
-
-    # Active rows get [prev_token, last_token]; positions are (seq_len-2, seq_len-1).
-    assert prepared.input_ids[0, :6].tolist() == [3, 5, 3, 5, 3, 5]
-    assert prepared.input_ids[1, :2].tolist() == [7, 9]
-    assert prepared.position_ids[0, :6].tolist() == [126, 127, 126, 127, 126, 127]
-    assert prepared.position_ids[1, :2].tolist() == [3, 4]
-    assert prepared.kv_seq_lens[0, :4].tolist() == [128, 128, 128, 128]
-    assert prepared.kv_seq_lens[1, :4].tolist() == [5, 5, 5, 5]
     assert prepared.x_hc is None
+    assert prepared.input_ids[0, :2].tolist() == [5, 5]
+
+
+def test_deepseek_prepare_mtp_target_inputs_limits_partial_chunk_rows():
+    runner, model = _runner_for_prepared_inputs()
+
+    prepared = runner.prepare_mtp_target_inputs(
+        model,
+        DecodeBatch(
+            request_ids=["req-a"],
+            token_ids=torch.tensor([[5]], dtype=torch.long),
+            hidden_states=torch.arange(4, dtype=torch.bfloat16).reshape(1, 4),
+            seq_lens=torch.tensor([129], dtype=torch.int32),
+            block_ids_by_group=_grouped_cache_rows(1),
+            cache_partitions=[0],
+        ),
+        token_rows=torch.tensor([[5, 5]], dtype=torch.long),
+        positions=((128, 128),),
+        active_width=1,
+    )
+
+    assert prepared.input_ids[0, :2].tolist() == [5, 5]
+    assert prepared.position_ids[0, :2].tolist() == [128, 128]
+    assert prepared.num_tokens_per_owner.tolist() == [1, 0, 0, 0, 0, 0, 0, 0]
+    assert prepared.logit_row_indices[0].tolist() == [0, -1, -1, -1, -1, -1, -1, -1]
 
 
 def test_deepseek_stage_decode_inputs_uses_shared_buffers():
@@ -1274,65 +1658,6 @@ def test_deepseek_prepare_decode_inputs_reuses_static_metadata():
     assert counting_metadata.ring_table_calls == first_ring_table_calls + 3
 
 
-def test_deepseek_stage_mtp_decode_inputs_updates_only_active_prefix_after_first_step():
-    runner, model = _runner_for_prepared_inputs()
-    layout = runner._compiled.layout
-    runner._mtp_buffers = SimpleNamespace(
-        decode_input_ids=torch.empty(
-            layout.ranks,
-            layout.decode_tokens,
-            dtype=torch.long,
-        ),
-        decode_position_ids=torch.empty(
-            layout.ranks,
-            layout.decode_tokens,
-            dtype=torch.int32,
-        ),
-        decode_accepted_counts=torch.empty(
-            layout.ranks,
-            layout.decode_batch,
-            dtype=torch.int32,
-        ),
-        decode_tail_slot_ids=torch.empty(
-            layout.ranks,
-            layout.decode_batch,
-            dtype=torch.int32,
-        ),
-        decode_logit_row_indices=torch.empty(
-            layout.ranks,
-            layout.decode_tokens,
-            dtype=torch.int32,
-        ),
-    )
-    inputs = runner.prepare_mtp_decode_inputs(
-        model,
-        DecodeBatch(
-            request_ids=["req-a"],
-            token_ids=torch.tensor([[5]], dtype=torch.long),
-            hidden_states=torch.arange(4, dtype=torch.bfloat16).reshape(1, 4),
-            seq_lens=torch.tensor([128], dtype=torch.int32),
-            block_ids_by_group=_grouped_cache_rows(1),
-            cache_partitions=[0],
-            prev_token_ids=torch.tensor([3], dtype=torch.long),
-            prev_hidden_states=torch.arange(4, 8, dtype=torch.bfloat16).reshape(1, 4),
-        ),
-    )
-    committed = [
-        (
-            torch.tensor([3, 5], dtype=torch.long),
-            torch.tensor([126, 127], dtype=torch.int32),
-        )
-    ]
-    runner._mtp_request_states["req-a"] = SimpleNamespace(tail_slot_id=2)
-
-    assert runner._stage_mtp_decode_inputs(inputs, committed, [1]) == 2
-    assert runner._mtp_buffers.decode_input_ids[0, :2].tolist() == [3, 5]
-    assert runner._mtp_buffers.decode_input_ids[1, :2].tolist() == [3, 5]
-    assert runner._mtp_buffers.decode_accepted_counts[0, 0].item() == 1
-    assert runner._mtp_buffers.decode_tail_slot_ids[0, 0].item() == 2
-    assert runner._mtp_buffers.decode_tail_slot_ids[1, 0].item() == -1
-
-
 def test_deepseek_run_decode_dispatches_active_token_count():
     runner, model = _runner_for_prepared_inputs()
     runner._compiled.decode = DeepSeekV4L3Callable(compiled=object(), name="decode")
@@ -1400,6 +1725,8 @@ def test_deepseek_run_decode_dispatches_active_token_count():
 
 def test_deepseek_mtp_decode_fuses_main_verify_and_draft_into_one_dispatch():
     runner, model = _runner_for_prepared_inputs()
+    runner._compiled.num_speculative_tokens = 1
+    runner._compiled.layout = deepseek_v4_decode_layout(1)
     runner._compiled.decode = DeepSeekV4L3Callable(compiled=object(), name="decode_mtp_fused")
     runner._decode_flow = runner._run_mtp_decode
     layout = runner._compiled.layout
@@ -1450,9 +1777,22 @@ def test_deepseek_mtp_decode_fuses_main_verify_and_draft_into_one_dispatch():
         per_rank_counts=(1,) + (0,) * (layout.ranks - 1),
     )
     dispatches = []
+    prepared_rows = []
 
     runner._ensure_l3_shared_buffers = lambda _model: None
-    runner.prepare_mtp_decode_inputs = lambda _model, _batch: staged
+
+    def fake_prepare(_model, speculative_batch, *, token_rows, positions, active_width):
+        prepared_rows.append(
+            (
+                speculative_batch.seq_lens.tolist(),
+                token_rows.tolist(),
+                positions,
+                active_width,
+            )
+        )
+        return staged
+
+    runner.prepare_mtp_target_inputs = fake_prepare
     runner._stage_decode_inputs = lambda prepared: prepared
     runner._stage_fused_mtp_metadata = lambda _inputs: layout.decode_seq
     runner._require_decode_buffers = lambda: SimpleNamespace(sampled_ids=main_sampled_ids)
@@ -1486,6 +1826,7 @@ def test_deepseek_mtp_decode_fuses_main_verify_and_draft_into_one_dispatch():
     )
 
     assert dispatches == [("decode_mtp_fused", ("fused",))]
+    assert prepared_rows == [([129], [[3, 5]], ((127, 128),), 2)]
     assert result.accepted_token_ids == [[5, 9]]
     assert state.draft_token_id == 7
     assert state.tail_token_id == 9

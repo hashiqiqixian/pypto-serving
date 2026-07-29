@@ -30,6 +30,7 @@ from pypto_serving.model.deepseek.npu_runner import (
     DeepSeekV4L3Callable,
     DeepSeekV4ModelRunner,
     build_deepseek_v4_layer_plan,
+    deepseek_v4_decode_layout,
     DEEPSEEK_V4_FWD_NUM_LAYERS,
 )
 from pypto_serving.model.deepseek.weight_loader import (
@@ -177,7 +178,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         pypto_build_dir: str = "build_output",
         use_compile_cache: bool = False,
         compile_kernels: bool = False,
-        enable_mtp: bool = False,
+        num_speculative_tokens: int = 0,
     ) -> None:
         worker_device_ids = tuple(device_ids) if device_ids is not None else (int(device_id),)
         super().__init__(
@@ -189,9 +190,9 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         )
         self._kernel_dir = _find_pypto_lib_deepseek_v4_dir()
         self._compile_kernels = bool(compile_kernels)
-        # Keep production serving opt-in because older checkpoints may not carry
-        # MTP weights. The CLI passes this model-specific feature flag explicitly.
-        self._enable_mtp = bool(enable_mtp)
+        self._num_speculative_tokens = int(num_speculative_tokens)
+        if self._num_speculative_tokens < 0:
+            raise ValueError("num_speculative_tokens must be non-negative")
         self._embedding_cache: dict[str, torch.Tensor] = {}
         # Shared JIT-compile core; DeepSeek wraps each compile in a per-kernel
         # profile span (see _compile_l3_callable). With ``use_compile_cache`` the
@@ -214,7 +215,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
     @property
     def supports_device_sampling(self) -> bool:
         """Enable executor-provided greedy token acceptance for MTP only."""
-        return self._enable_mtp
+        return self._num_speculative_tokens > 0
 
     @property
     def supports_device_decode_embedding(self) -> bool:
@@ -276,15 +277,16 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         if metadata.get("checkpoint_format") != "w8a8-compressed-tensors":
             raise ValueError("DeepSeekV4PyptoExecutor requires the W8A8 compressed-tensors checkpoint")
 
-        # The main-model decode program has two valid specializations with the
-        # same eight-token tile. Normal autoregressive serving must use S=1 so
-        # compressor boundaries advance once per generated token; MTP verifies
-        # a [previous, current] pair and therefore uses S=2.
-        layout = DeepSeekV4CacheLayout(
-            decode_batch=4 if self._enable_mtp else 8,
-            decode_seq=2 if self._enable_mtp else 1,
-            decode_tokens=8,
-        )
+        if model.runtime.num_speculative_tokens != self._num_speculative_tokens:
+            raise ValueError(
+                "DeepSeekV4 executor/runtime MTP depth mismatch: "
+                f"executor={self._num_speculative_tokens}, "
+                f"runtime={model.runtime.num_speculative_tokens}"
+            )
+        # The main-model decode program keeps a fixed eight-token tile. MTP uses
+        # the smallest power-of-two request-local sequence that can cover one
+        # target-verification chunk.
+        layout = deepseek_v4_decode_layout(self._num_speculative_tokens)
         layout.validate_runtime(model.config, model.runtime, self._device_ids)
         compress_ratios = tuple(int(ratio) for ratio in metadata["compress_ratios"])
         if len(compress_ratios) != model.config.num_hidden_layers + 1:
@@ -305,7 +307,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             compress_ratios=compress_ratios,
             num_hash_layers=num_hash_layers,
         )
-        if self._enable_mtp:
+        if self._num_speculative_tokens:
             weight_store.validate_mtp_startup_contract(n_routed_experts=n_routed_experts)
 
         layer_compress_ratios = tuple(layer.compress_ratio for layer in layer_plan)
@@ -330,27 +332,33 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 modules["prefill_fwd"].l3_prefill_fwd,
                 layout=layout,
             )
+            use_fused_mtp = self._num_speculative_tokens == 1
             decode = self._compile_l3_callable(
-                "deepseek_v4_decode_mtp_fused" if self._enable_mtp else "deepseek_v4_decode",
+                "deepseek_v4_decode_mtp_fused" if use_fused_mtp else "deepseek_v4_decode",
                 (
                     modules["decode_fwd_mtp"].l3_decode_fwd_mtp
-                    if self._enable_mtp
+                    if use_fused_mtp
                     else modules["decode_fwd"].l3_decode_fwd
                 ),
                 layout=layout,
                 runtime_scalar_names=(
-                    frozenset({"mtp_num_tokens"})
-                    if self._enable_mtp
-                    else None
+                    frozenset({"mtp_num_tokens"}) if use_fused_mtp else None
                 ),
             )
-            if self._enable_mtp:
+            if self._num_speculative_tokens:
                 mtp_prefill = self._compile_l3_callable(
                     "deepseek_v4_mtp_prefill",
                     modules["prefill_mtp"].l3_mtp_prefill_fwd,
                     layout=layout,
                     runtime_scalar_names=frozenset({"num_tokens"}),
                 )
+                if not use_fused_mtp:
+                    mtp_decode = self._compile_l3_callable(
+                        "deepseek_v4_mtp_decode",
+                        modules["decode_mtp"].l3_mtp_decode_layer,
+                        layout=layout,
+                        runtime_scalar_names=frozenset({"num_tokens"}),
+                    )
             freqs_cos, freqs_sin = self._build_rope_tables(
                 modules["utils"],
                 modules["config"],
@@ -377,7 +385,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             device_ids=self._device_ids,
             n_routed_experts=n_routed_experts,
             num_hash_layers=num_hash_layers,
-            enable_mtp=self._enable_mtp,
+            num_speculative_tokens=self._num_speculative_tokens,
         )
 
     def _load_kernel_modules(self, layout: DeepSeekV4CacheLayout) -> dict[str, object]:
@@ -415,8 +423,10 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             config.RECV_MAX = config.DECODE_RECV_MAX
             modules = {"config": config}
             decode_module_names = ["decode_layer", "decode_fwd", "lm_head", "utils"]
-            if self._enable_mtp:
-                decode_module_names.extend(("decode_mtp", "decode_fwd_mtp"))
+            if self._num_speculative_tokens:
+                decode_module_names.append("decode_mtp")
+            if self._num_speculative_tokens == 1:
+                decode_module_names.append("decode_fwd_mtp")
             modules.update(
                 {
                     name: importlib.import_module(name)
@@ -459,7 +469,6 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             return self._compiler.compile(
                 name, jit_fn, use_cache=self._use_compile_cache, **runtime_scalars
             )
-
 
     def _build_rope_tables(self, utils_module: object, config_module: object) -> tuple[torch.Tensor, torch.Tensor]:
         """Build full-sequence DeepSeekV4 RoPE tables using pypto-lib's helper."""
