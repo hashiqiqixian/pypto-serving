@@ -7,6 +7,8 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+import pytest
+
 from pypto_serving.config.types import (
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -20,6 +22,11 @@ from pypto_serving.serving.sched.scheduler import (
     SchedulerConfig,
     SchedulerOutput,
 )
+
+
+def test_scheduler_rejects_speculative_depth_larger_than_token_budget():
+    with pytest.raises(ValueError, match="one decode token"):
+        SchedulerConfig(max_num_scheduled_tokens=4, num_speculative_tokens=4)
 
 
 def test_scheduler_speculative_output_counts_only_tokens_retained_before_eos():

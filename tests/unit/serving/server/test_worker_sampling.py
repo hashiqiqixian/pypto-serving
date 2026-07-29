@@ -205,7 +205,7 @@ def test_worker_resolves_placeholder_decode_token_from_cache():
     # Record two sampled tokens (simulating two prior decode steps).
     worker._record_last_tokens("r", [11])
     worker._record_last_tokens("r", [22])
-    assert worker._last_tokens["r"] == [11, 22]
+    assert worker._last_tokens["r"] == [22]
 
     placeholder = DecodeRequest(
         request_id="r",
@@ -220,9 +220,9 @@ def test_worker_resolves_placeholder_decode_token_from_cache():
     explicit = DecodeRequest(request_id="r", last_token=99, seq_len=5, block_ids=[0])
     assert worker._resolve_decode_token(explicit) == 99
 
-    # Cache keeps only the last 2 tokens (MTP prev context bound).
+    # Cache keeps only the token needed to resolve the next placeholder.
     worker._record_last_tokens("r", [33])
-    assert worker._last_tokens["r"] == [22, 33]
+    assert worker._last_tokens["r"] == [33]
 
     # Missing cache entry on placeholder is a hard error (never silently wrong).
     orphan = DecodeRequest(

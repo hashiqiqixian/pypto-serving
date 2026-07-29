@@ -72,8 +72,7 @@ class WorkerProcess:
         # Request cache: prompt tokens + sampling params registered once per request.
         # Populated by StepCommand.new_requests; entries removed when the request finishes.
         self._req_cache: dict[str, NewRequestData] = {}
-        # Last-sampled tokens per request (most-recent-last, up to 2 kept for MTP
-        # prev-token context). Under async scheduling the engine sends
+        # Latest sampled token per request. Under async scheduling the engine sends
         # PLACEHOLDER_TOKEN for a decode input it hasn't sampled yet; the worker
         # substitutes from here. Entries cleared when a request is released.
         self._last_tokens: dict[str, list[int]] = {}
@@ -278,19 +277,10 @@ class WorkerProcess:
         return StepResult(new_tokens=new_tokens, step_id=cmd.step_id)
 
     def _record_last_tokens(self, request_id: str, tokens: list[int]) -> None:
-        """Append newly committed tokens, keeping at most the last 2 (MTP prev ctx).
-
-        Also maintains the running count of committed output tokens, which is the
-        worker's authoritative view of a request's context length. Under async
-        scheduling with a speculative decoder the engine cannot know this count
-        when it builds the next step (acceptance is only resolved by the worker),
-        so the count is used to derive that step's seq_len.
-        """
+        """Remember the latest sampled token for async placeholder resolution."""
         recent = self._last_tokens.get(request_id, [])
         recent.extend(int(t) for t in tokens)
-        if len(recent) > 2:
-            recent = recent[-2:]
-        self._last_tokens[request_id] = recent
+        self._last_tokens[request_id] = recent[-1:]
 
     @staticmethod
     def _partitioned_prefill_chunks(scheduled: list, max_batch: int) -> list[list]:
