@@ -602,6 +602,31 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             compiled = jit_fn.compile(*dummy_args, config=run_config)
         if not isinstance(compiled, DistributedCompiledProgram):
             raise TypeError(f"{name} did not compile to DistributedCompiledProgram; got {type(compiled).__name__}")
+        kernel_configs = list(compiled.output_dir.glob("next_levels/*/kernel_config.py"))
+        if not kernel_configs:
+            functions = [
+                (
+                    function.name,
+                    str(function.func_type),
+                    str(function.role),
+                    str(function.level),
+                )
+                for function in compiled.program.functions.values()
+                if (
+                    "prefill" in function.name
+                    or "lm_head" in function.name
+                    or str(function.func_type)
+                    not in {
+                        "FunctionType.AIC",
+                        "FunctionType.AIV",
+                        "FunctionType.Group",
+                        "FunctionType.Spmd",
+                    }
+                )
+            ]
+            raise RuntimeError(
+                f"{name} emitted no chip-level tasks; post-pass functions={functions}"
+            )
         return DeepSeekV4L3Callable(compiled=compiled, name=name)
 
     @staticmethod
