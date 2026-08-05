@@ -24,6 +24,7 @@ from pypto_serving.model.common.executor.pypto_executor import PyptoExecutor as 
 from pypto_serving.model.common.executor.utils import build_pypto_run_config
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.model.deepseek.npu_runner import (
+    DEEPSEEK_V4_FWD_NUM_LAYERS,
     DEEPSEEK_V4_LM_HEAD_TP_SIZE,
     DeepSeekV4CacheLayout,
     DeepSeekV4CompiledKernels,
@@ -31,7 +32,6 @@ from pypto_serving.model.deepseek.npu_runner import (
     DeepSeekV4ModelRunner,
     build_deepseek_v4_layer_plan,
     deepseek_v4_decode_layout,
-    DEEPSEEK_V4_FWD_NUM_LAYERS,
 )
 from pypto_serving.model.deepseek.weight_loader import (
     DeepSeekV4StackedLayerWeights,
@@ -283,9 +283,9 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 f"executor={self._num_speculative_tokens}, "
                 f"runtime={model.runtime.num_speculative_tokens}"
             )
-        # The main-model decode program keeps a fixed eight-token tile. MTP uses
-        # the smallest power-of-two request-local sequence that can cover one
-        # target-verification chunk.
+        # Autoregressive decode keeps the established eight-token tile. MTP uses
+        # a 16-token specialization and the smallest power-of-two request-local
+        # sequence that can cover one target-verification chunk.
         layout = deepseek_v4_decode_layout(self._num_speculative_tokens)
         layout.validate_runtime(model.config, model.runtime, self._device_ids)
         compress_ratios = tuple(int(ratio) for ratio in metadata["compress_ratios"])
@@ -414,7 +414,8 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             config = importlib.import_module("config")
             # pypto-lib freezes B/S into module-level shapes at import. Override
             # the deployment preset before importing any decode program while
-            # keeping the common T=8 tile and all physical cache capacities.
+            # specializing T with the selected layout while preserving physical
+            # cache capacities.
             config.DECODE_BATCH = layout.decode_batch
             config.DECODE_SEQ = layout.decode_seq
             config.DECODE_TOKENS = layout.decode_tokens
