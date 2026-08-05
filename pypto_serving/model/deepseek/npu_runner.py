@@ -50,6 +50,7 @@ DEEPSEEK_V4_BLOCK_SIZE = 128
 DEEPSEEK_V4_DECODE_BATCH = 4
 DEEPSEEK_V4_DECODE_SEQ = 2
 DEEPSEEK_V4_DECODE_TOKENS = DEEPSEEK_V4_DECODE_BATCH * DEEPSEEK_V4_DECODE_SEQ
+DEEPSEEK_V4_MTP_DECODE_TOKENS = 16
 DEEPSEEK_V4_PREFILL_BATCH = 1
 DEEPSEEK_V4_PREFILL_SEQ = 128
 # Prefill and decode share scheduler-owned rank-local physical pools. Group
@@ -83,7 +84,7 @@ DEEPSEEK_V4_FWD_NUM_LAYERS = 43
 DEEPSEEK_V4_CSA_NUM_LAYERS = 21
 DEEPSEEK_V4_HCA_NUM_LAYERS = 20
 DEEPSEEK_V4_LM_HEAD_TP_SIZE = 4
-DEEPSEEK_V4_MAX_LOGIT_ROWS = 8
+DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS = 8
 DEEPSEEK_V4_SAMPLED_IDS_PAD = 8
 
 # Policy values indicate whether a resident argument contains mutable request
@@ -612,17 +613,21 @@ class DeepSeekV4CacheLayout:
 
 
 def deepseek_v4_decode_layout(num_speculative_tokens: int) -> DeepSeekV4CacheLayout:
-    """Select the smallest fixed eight-row decode tile for one MTP chunk.
+    """Select an aggressive 16-row decode tile for one MTP chunk.
 
-    The pypto-lib decode programs always process eight rows per DP rank. MTP
-    groups those rows into power-of-two request-local sequences so the target
-    can verify as many drafts as possible without sacrificing more batch
-    capacity than necessary. Draft depths larger than seven use repeated S=8
-    target chunks.
+    Autoregressive decode retains the established eight-row tile. MTP doubles
+    the per-rank tile to 16 rows and groups them into power-of-two request-local
+    sequences so target verification preserves twice the request capacity.
+    Draft depths larger than seven use repeated S=8 target chunks.
     """
     num_speculative_tokens = int(num_speculative_tokens)
     if num_speculative_tokens < 0:
         raise ValueError("num_speculative_tokens must be non-negative")
+    decode_tokens = (
+        DEEPSEEK_V4_DECODE_TOKENS
+        if num_speculative_tokens == 0
+        else DEEPSEEK_V4_MTP_DECODE_TOKENS
+    )
     if num_speculative_tokens == 0:
         decode_seq = 1
     elif num_speculative_tokens == 1:
@@ -632,9 +637,9 @@ def deepseek_v4_decode_layout(num_speculative_tokens: int) -> DeepSeekV4CacheLay
     else:
         decode_seq = 8
     return DeepSeekV4CacheLayout(
-        decode_batch=DEEPSEEK_V4_DECODE_TOKENS // decode_seq,
+        decode_batch=decode_tokens // decode_seq,
         decode_seq=decode_seq,
-        decode_tokens=DEEPSEEK_V4_DECODE_TOKENS,
+        decode_tokens=decode_tokens,
     )
 
 
@@ -1417,7 +1422,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._decode_assignment_cache_key: tuple[tuple[str, ...], tuple[int, ...]] | None = None
         self._decode_assignment_cache: _DeepSeekV4DecodeAssignment | None = None
         self._decode_logit_row_range = torch.arange(
-            DEEPSEEK_V4_MAX_LOGIT_ROWS,
+            compiled.layout.decode_tokens,
             dtype=torch.int32,
         )
         self._decode_fwd_args_cache: tuple[Any, ...] | None = None
@@ -1916,7 +1921,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
 
         num_tokens_per_owner = torch.zeros(layout.ranks, dtype=torch.int32)
         logit_row_indices = torch.full(
-            (layout.ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS),
+            (layout.ranks, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS),
             -1,
             dtype=torch.int32,
         )
@@ -2192,10 +2197,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
 
         for rank, count in enumerate(per_rank_counts):
             row_count = count * active_seq
-            if row_count > DEEPSEEK_V4_MAX_LOGIT_ROWS:
+            if row_count > layout.decode_tokens:
                 raise ValueError(
                     f"rank {rank} requires {row_count} logit rows, "
-                    f"capacity is {DEEPSEEK_V4_MAX_LOGIT_ROWS}"
+                    f"capacity is {layout.decode_tokens}"
                 )
             staged["num_tokens_per_owner"][rank] = row_count
             if row_count:
@@ -3775,7 +3780,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     name="decode_x_out",
                 ),
                 sampled_ids=self._shared_empty(
-                    (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS, DEEPSEEK_V4_SAMPLED_IDS_PAD),
+                    (ranks, tokens, DEEPSEEK_V4_SAMPLED_IDS_PAD),
                     torch.int32,
                     name="decode_sampled_ids",
                 ),
@@ -3824,7 +3829,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                         name="decode_num_tokens_per_owner",
                     ),
                     "logit_row_indices": self._shared_empty(
-                        (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS),
+                        (ranks, tokens),
                         torch.int32,
                         name="decode_logit_row_indices",
                     ),
@@ -3915,12 +3920,14 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 name="mtp_prefill_pre_hc_out",
             ),
             prefill_logits=self._shared_empty(
-                (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS, DEEPSEEK_V4_VOCAB_SIZE),
+                (ranks, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS, DEEPSEEK_V4_VOCAB_SIZE),
                 torch.float32,
                 name="mtp_prefill_logits",
             ),
             prefill_logit_row_indices=self._shared_empty(
-                (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS), torch.int32, name="mtp_prefill_logit_row_indices"
+                (ranks, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS),
+                torch.int32,
+                name="mtp_prefill_logit_row_indices",
             ),
             decode_hidden_out=self._shared_empty(
                 (ranks, tokens, hidden), torch.bfloat16, name="mtp_decode_hidden_out"
@@ -3931,17 +3938,17 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 name="mtp_decode_pre_hc_out",
             ),
             decode_logits=self._shared_empty(
-                (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS, DEEPSEEK_V4_VOCAB_SIZE),
+                (ranks, tokens, DEEPSEEK_V4_VOCAB_SIZE),
                 torch.float32,
                 name="mtp_decode_logits",
             ),
             decode_sampled_ids=self._shared_empty(
-                (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS, DEEPSEEK_V4_SAMPLED_IDS_PAD),
+                (ranks, tokens, DEEPSEEK_V4_SAMPLED_IDS_PAD),
                 torch.int32,
                 name="mtp_decode_sampled_ids",
             ),
             decode_logit_row_indices=self._shared_empty(
-                (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS), torch.int32, name="mtp_decode_logit_row_indices"
+                (ranks, tokens), torch.int32, name="mtp_decode_logit_row_indices"
             ),
         )
         self._mtp_buffers.prefill_kv_cache.zero_()
@@ -4004,7 +4011,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 (ranks,), torch.int32, "prefill_fwd_num_tokens_per_owner"
             ),
             "logit_row_indices": shared(
-                (ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS),
+                (ranks, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS),
                 torch.int32,
                 "prefill_fwd_logit_row_indices",
             ),
@@ -4160,7 +4167,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
     def _require_prefill_logits_buffer(self, vocab_size: int) -> torch.Tensor:
         """Return shared owner-major selected-row logits for packed prefill."""
         layout = self._compiled.layout
-        logits_shape = (layout.ranks, DEEPSEEK_V4_MAX_LOGIT_ROWS, int(vocab_size))
+        logits_shape = (layout.ranks, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS, int(vocab_size))
         if self._prefill_logits_buffer is None:
             self._ensure_shared_host_allocation_before_worker("prefill_logits")
             self._prefill_logits_buffer = self._shared_empty(
@@ -4555,7 +4562,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 logits=resident(
                     (
                         layout.ranks,
-                        DEEPSEEK_V4_MAX_LOGIT_ROWS,
+                        DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS,
                         DEEPSEEK_V4_VOCAB_SIZE,
                     ),
                     torch.float32,

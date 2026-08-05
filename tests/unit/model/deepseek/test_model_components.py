@@ -351,19 +351,20 @@ def test_deepseek_mtp_partial_target_chunk_waves_requests_on_same_rank(monkeypat
 
 
 @pytest.mark.parametrize(
-    ("num_speculative_tokens", "decode_seq", "decode_batch"),
-    [(0, 1, 8), (1, 2, 4), (2, 4, 2), (3, 4, 2), (4, 8, 1), (32, 8, 1)],
+    ("num_speculative_tokens", "decode_seq", "decode_batch", "decode_tokens"),
+    [(0, 1, 8, 8), (1, 2, 8, 16), (2, 4, 4, 16), (3, 4, 4, 16), (4, 8, 2, 16), (32, 8, 2, 16)],
 )
-def test_deepseek_mtp_depth_selects_fixed_eight_row_layout(
+def test_deepseek_mtp_depth_selects_expanded_decode_layout(
     num_speculative_tokens,
     decode_seq,
     decode_batch,
+    decode_tokens,
 ):
     layout = deepseek_v4_decode_layout(num_speculative_tokens)
 
     assert layout.decode_seq == decode_seq
     assert layout.decode_batch == decode_batch
-    assert layout.decode_tokens == 8
+    assert layout.decode_tokens == decode_tokens
 
 
 def test_deepseek_mtp_draft_depth_is_capped_by_remaining_context():
@@ -475,7 +476,7 @@ def test_cli_selects_deepseek_executor_and_configures_mtp_depth(tmp_path):
             "--max-model-len", "260",
             "--dtype", "int8",
             "--speculative-config", '{"method":"mtp","num_speculative_tokens":4}',
-            "--max-num-seqs", "8",
+            "--max-num-seqs", "16",
             "--use-compile-cache",
         ]
     )
@@ -490,7 +491,7 @@ def test_cli_selects_deepseek_executor_and_configures_mtp_depth(tmp_path):
     assert config.enable_prefix_cache is False
     assert config.executor_kwargs["num_speculative_tokens"] == 4
     assert config.runtime_config.num_speculative_tokens == 4
-    assert config.max_num_running_reqs == 8
+    assert config.max_num_running_reqs == 16
     assert config.executor_kwargs["use_compile_cache"] is True
 
 
