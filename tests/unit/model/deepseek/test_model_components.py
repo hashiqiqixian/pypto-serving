@@ -55,6 +55,19 @@ from pypto_serving.model.model_loader import ModelLoader
 from pypto_serving.tools import prepack_deepseek_v4
 
 
+class _CountingPagedOriMetadata:
+    def __init__(self, delegate):
+        self._delegate = delegate
+        self.table_calls = 0
+
+    def paged_ori_block_table_from_ids(self, rows):
+        self.table_calls += 1
+        return self._delegate.paged_ori_block_table_from_ids(rows)
+
+    def __getattr__(self, name):
+        return getattr(self._delegate, name)
+
+
 def test_deepseek_kernel_dir_uses_v4_flash_variant(tmp_path):
     kernel_dir = tmp_path / "models" / "deepseek_v4_flash_mtp"
     kernel_dir.mkdir(parents=True)
@@ -159,6 +172,14 @@ def test_deepseek_mtp_token_step_runs_one_request_per_rank_wave(monkeypatch):
         ),
     )
     runner._mtp_buffers = buffers
+    runner._decode_buffers = SimpleNamespace(
+        tensors={
+            "block_table": torch.empty(
+                (layout.ranks, layout.decode_batch, layout.ori_table_max_blocks),
+                dtype=torch.int32,
+            )
+        }
+    )
     indices_by_rank = ((0, 1),) + ((),) * (layout.ranks - 1)
     assignment = SimpleNamespace(
         ranks=(0, 0),
@@ -167,14 +188,13 @@ def test_deepseek_mtp_token_step_runs_one_request_per_rank_wave(monkeypatch):
         indices_by_rank=indices_by_rank,
     )
     monkeypatch.setattr(runner, "_decode_assignment", lambda batch: assignment)
-    prepared_request_ids = []
-
-    def fake_prepare(model, batch, **kwargs):
-        prepared_request_ids.append(tuple(batch.request_ids))
-        return SimpleNamespace(ranks=(0,), local_rows=(0,))
-
-    monkeypatch.setattr(runner, "prepare_mtp_target_inputs", fake_prepare)
-    monkeypatch.setattr(runner, "_stage_decode_inputs", lambda prepared: prepared)
+    counting_metadata = _CountingPagedOriMetadata(runner.cache_metadata)
+    runner.cache_metadata = counting_metadata
+    monkeypatch.setattr(
+        runner,
+        "prepare_mtp_target_inputs",
+        lambda *_args, **_kwargs: pytest.fail("recurrent MTP must not build full decode metadata"),
+    )
     monkeypatch.setattr(runner, "_mtp_decode_args", lambda: ())
     monkeypatch.setattr(runner, "_require_mtp_decode_callable", lambda: object())
     runner._mtp_request_states = {
@@ -201,7 +221,7 @@ def test_deepseek_mtp_token_step_runs_one_request_per_rank_wave(monkeypatch):
         token_ids=torch.tensor([[9], [19]], dtype=torch.long),
         hidden_states=torch.zeros((2, 4), dtype=torch.bfloat16),
         seq_lens=torch.tensor([129, 130], dtype=torch.int32),
-        block_ids_by_group=[{"ori": [7]}, {"ori": [8]}],
+        block_ids_by_group=_grouped_cache_rows(2),
     )
     token_ids = torch.tensor([10, 20], dtype=torch.long)
     previous_hidden = torch.stack(
@@ -217,10 +237,48 @@ def test_deepseek_mtp_token_step_runs_one_request_per_rank_wave(monkeypatch):
     )
 
     assert active_tokens == [1, 1]
-    assert prepared_request_ids == [("req-a",), ("req-b",)]
+    assert counting_metadata.table_calls == layout.ranks + 1
     assert [slot for slot, _hidden in uploaded] == [0, 1]
     assert next_tokens.tolist() == [10, 20]
     torch.testing.assert_close(next_hidden[:, 0, 0], torch.tensor([1.0, 2.0]))
+
+
+def test_deepseek_recurrent_mtp_reuses_unchanged_ori_tables():
+    runner, _model = _runner_for_prepared_inputs()
+    layout = deepseek_v4_decode_layout(3)
+    runner._compiled.layout = layout
+    runner._decode_buffers = SimpleNamespace(
+        tensors={
+            "block_table": torch.empty(
+                (layout.ranks, layout.decode_batch, layout.ori_table_max_blocks),
+                dtype=torch.int32,
+            )
+        }
+    )
+    counting_metadata = _CountingPagedOriMetadata(runner.cache_metadata)
+    runner.cache_metadata = counting_metadata
+    batch = DecodeBatch(
+        request_ids=["req-a"],
+        token_ids=torch.tensor([[9]], dtype=torch.long),
+        hidden_states=torch.zeros((1, 4), dtype=torch.bfloat16),
+        seq_lens=torch.tensor([129], dtype=torch.int32),
+        block_ids_by_group=_grouped_cache_rows(1),
+    )
+
+    runner._stage_recurrent_mtp_block_tables(
+        batch,
+        request_indices=(0,),
+        ranks=(0,),
+    )
+    first_call_count = counting_metadata.table_calls
+    runner._stage_recurrent_mtp_block_tables(
+        batch,
+        request_indices=(0,),
+        ranks=(0,),
+    )
+
+    assert first_call_count == layout.ranks
+    assert counting_metadata.table_calls == first_call_count
 
 
 def test_deepseek_mtp_target_verification_chunks_arbitrary_depth(monkeypatch):

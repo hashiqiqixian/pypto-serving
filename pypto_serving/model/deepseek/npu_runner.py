@@ -3360,7 +3360,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             raise ValueError("MTP recurrent hidden rows must align with active requests")
 
         buffers = self._require_mtp_buffers()
-        layout = self._compiled.layout
         assignment = self._decode_assignment(batch)
         token_ids = token_ids.detach().cpu().to(torch.long).reshape(actual_batch)
         positions = positions.detach().cpu().to(torch.int32).reshape(actual_batch)
@@ -3370,28 +3369,18 @@ class DeepSeekV4ModelRunner(ModelRunner):
         wave_count = max(assignment.per_rank_counts)
 
         for wave in range(wave_count):
-            wave_indices = [
-                request_indices[wave]
-                for request_indices in assignment.indices_by_rank
+            wave_items = [
+                (rank, request_indices[wave])
+                for rank, request_indices in enumerate(assignment.indices_by_rank)
                 if wave < len(request_indices)
             ]
-            wave_batch = self._select_decode_batch_rows(batch, wave_indices)
-            wave_token_rows = token_ids[wave_indices].reshape(-1, 1).expand(
-                -1,
-                layout.decode_seq,
+            wave_ranks = tuple(rank for rank, _request_index in wave_items)
+            wave_indices = tuple(request_index for _rank, request_index in wave_items)
+            self._stage_recurrent_mtp_block_tables(
+                batch,
+                request_indices=wave_indices,
+                ranks=wave_ranks,
             )
-            wave_positions = tuple(
-                (int(positions[index]),) * layout.decode_seq
-                for index in wave_indices
-            )
-            prepared = self.prepare_mtp_target_inputs(
-                model,
-                wave_batch,
-                token_rows=wave_token_rows,
-                positions=wave_positions,
-                active_width=1,
-            )
-            self._stage_decode_inputs(prepared)
 
             fallback_index = wave_indices[0]
             buffers.decode_input_ids.fill_(int(token_ids[fallback_index]))
@@ -3399,14 +3388,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             buffers.decode_accepted_counts.fill_(1)
             buffers.decode_tail_slot_ids.fill_(-1)
             buffers.decode_logit_row_indices.fill_(-1)
-            for request_index, rank, local_row in zip(
-                wave_indices,
-                prepared.ranks,
-                prepared.local_rows,
-                strict=True,
-            ):
-                if local_row != 0:
-                    raise RuntimeError("recurrent MTP waves require at most one request per rank")
+            for rank, request_index in wave_items:
                 state = self._require_mtp_request_state(batch.request_ids[request_index])
                 self._write_mtp_tail_hidden(
                     state,
@@ -3429,11 +3411,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     self._int32_scalar(1),
                 )
 
-            for request_index, rank in zip(
-                wave_indices,
-                prepared.ranks,
-                strict=True,
-            ):
+            for rank, request_index in wave_items:
                 next_tokens[request_index] = int(
                     buffers.decode_sampled_ids[rank, 0, 0].item()
                 )
@@ -3450,6 +3428,74 @@ class DeepSeekV4ModelRunner(ModelRunner):
             torch.tensor(next_tokens, dtype=torch.long),
             torch.stack(next_hidden),
         )
+
+    def _stage_recurrent_mtp_block_tables(
+        self,
+        batch: DecodeBatch,
+        *,
+        request_indices: Sequence[int],
+        ranks: Sequence[int],
+    ) -> None:
+        """Stage only the ori tables consumed by one recurrent MTP wave."""
+        if not request_indices or len(request_indices) != len(ranks):
+            raise ValueError("recurrent MTP requests and ranks must be non-empty and aligned")
+        if len(set(int(rank) for rank in ranks)) != len(ranks):
+            raise ValueError("recurrent MTP waves support at most one request per rank")
+
+        layout = self._compiled.layout
+        actual_batch = len(batch.request_ids)
+        if len(batch.block_ids_by_group) != actual_batch:
+            raise ValueError(
+                "grouped KV metadata has "
+                f"{len(batch.block_ids_by_group)} rows, expected decode batch {actual_batch}"
+            )
+        requests_by_rank = {
+            int(rank): int(request_index)
+            for rank, request_index in zip(ranks, request_indices, strict=True)
+        }
+        if any(not 0 <= rank < layout.ranks for rank in requests_by_rank):
+            raise ValueError("recurrent MTP rank is outside the compiled world")
+        if any(not 0 <= index < actual_batch for index in requests_by_rank.values()):
+            raise ValueError("recurrent MTP request index is outside the active batch")
+        active_ori_ids = {}
+        for request_index in requests_by_rank.values():
+            ori_ids = tuple(
+                int(block_id)
+                for block_id in batch.block_ids_by_group[request_index].get("ori", ())
+            )
+            if not ori_ids:
+                raise ValueError(f"decode row {request_index} is missing grouped KV blocks: ori")
+            active_ori_ids[request_index] = ori_ids
+
+        block_tables = self._require_decode_buffers().tensors["block_table"]
+        for rank in range(layout.ranks):
+            request_index = requests_by_rank.get(rank)
+            if request_index is None:
+                cache_key = (("mtp_recurrent_scratch",),)
+                if self._decode_static_metadata_keys[rank] == cache_key:
+                    continue
+                padded_ids = self._scratch_group_block_ids(
+                    group_name="ori",
+                    kernel_rows=layout.decode_batch,
+                )
+            else:
+                active_ids = active_ori_ids[request_index]
+                cache_key = (("mtp_recurrent_ori", active_ids),)
+                if self._decode_static_metadata_keys[rank] == cache_key:
+                    continue
+                padded_ids = self._pad_group_block_ids(
+                    [active_ids],
+                    group_name="ori",
+                    kernel_rows=layout.decode_batch,
+                )
+            self._copy_shared(
+                block_tables[rank],
+                self.cache_metadata.paged_ori_block_table_from_ids(padded_ids),
+                name=f"mtp_recurrent_block_table_rank{rank}",
+            )
+            # Mark the other fixed decode metadata stale. The next main-model
+            # decode will rebuild its full static set before dispatch.
+            self._decode_static_metadata_keys[rank] = cache_key
 
     def _initialize_mtp_drafts(self, batch: DecodeBatch) -> None:
         """Initialize every request's first draft without sharing mutable state."""
