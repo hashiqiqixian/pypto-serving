@@ -489,6 +489,9 @@ _MTP_PREFILL_TENSOR_ORDER = (
     "lm_head_weight", "hidden_out", "pre_hc_hidden_out", "logits", "logit_row_indices",
 )
 
+_MTP_DEVICE_STATE_TOKEN_WIDTH = 2
+_MTP_DEVICE_STATE_META_WIDTH = 4
+
 _MTP_DECODE_TENSOR_ORDER = (
     "embed_weight", "main_pre_hc_hidden", "tail_pre_hc_pool",
     "accepted_counts", "tail_slot_ids", "position_ids",
@@ -1266,6 +1269,9 @@ class _DeepSeekV4MtpSharedBuffers:
     decode_position_ids: torch.Tensor
     decode_accepted_counts: torch.Tensor
     decode_tail_slot_ids: torch.Tensor
+    decode_state_generations: torch.Tensor
+    decode_state_tokens: torch.Tensor
+    decode_state_meta: torch.Tensor
     decode_tail_token_ids: torch.Tensor
     decode_tail_positions: torch.Tensor
     tail_init_hidden: torch.Tensor
@@ -3191,11 +3197,23 @@ class DeepSeekV4ModelRunner(ModelRunner):
             return cached
         buffers = self._require_mtp_buffers()
         mtp_args = self._mtp_decode_args()
-        fused_mtp_args = tuple(
-            arg
-            for name, arg in zip(_MTP_DECODE_TENSOR_ORDER, mtp_args, strict=True)
-            if name not in _FUSED_MTP_SHARED_TENSORS
-        )
+        fused_mtp_args = []
+        for name, arg in zip(_MTP_DECODE_TENSOR_ORDER, mtp_args, strict=True):
+            if name in _FUSED_MTP_SHARED_TENSORS:
+                continue
+            fused_mtp_args.append(arg)
+            if name == "tail_slot_ids":
+                # pypto-lib's persistent-state ABI is optional at runtime: a
+                # zero valid bit leaves the Host-staged recurrent inputs
+                # untouched. Keep that compatibility mode here so arbitrary
+                # MTP depth can continue to own request state on the Host.
+                fused_mtp_args.extend(
+                    (
+                        buffers.decode_state_generations,
+                        buffers.decode_state_tokens,
+                        buffers.decode_state_meta,
+                    )
+                )
         args = (
             *main_args,
             buffers.decode_tail_token_ids,
@@ -3945,6 +3963,21 @@ class DeepSeekV4ModelRunner(ModelRunner):
             decode_tail_slot_ids=self._shared_empty(
                 (ranks, layout.decode_batch), torch.int32, name="mtp_decode_tail_slot_ids"
             ),
+            decode_state_generations=self._shared_empty(
+                (ranks, layout.decode_batch),
+                torch.int32,
+                name="mtp_decode_state_generations",
+            ).zero_(),
+            decode_state_tokens=self._shared_empty(
+                (ranks, layout.decode_batch, _MTP_DEVICE_STATE_TOKEN_WIDTH),
+                torch.long,
+                name="mtp_decode_state_tokens",
+            ).zero_(),
+            decode_state_meta=self._shared_empty(
+                (ranks, layout.decode_batch, _MTP_DEVICE_STATE_META_WIDTH),
+                torch.int32,
+                name="mtp_decode_state_meta",
+            ).zero_(),
             decode_tail_token_ids=self._shared_empty(
                 (ranks, layout.decode_batch), torch.long, name="mtp_decode_tail_token_ids"
             ),
