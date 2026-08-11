@@ -198,13 +198,14 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         # profile span (see _compile_l3_callable). With ``use_compile_cache`` the
         # build dir doubles as the on-disk kernel cache (load-or-compile, slotted
         # by kernel name); otherwise pypto uses its default per-kernel build dirs.
+        compile_cache_dir = self._pypto_build_dir if self._use_compile_cache else None
         self._compiler = KernelCompiler(
             run_config=build_pypto_run_config(
                 platform=self._platform,
                 device_ids=self._device_ids,
-                pypto_build_dir=self._pypto_build_dir,
+                pypto_build_dir=compile_cache_dir,
             ),
-            cache_dir=self._pypto_build_dir,
+            cache_dir=compile_cache_dir,
         )
 
     @property

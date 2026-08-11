@@ -670,6 +670,31 @@ def test_deepseek_compile_attaches_lazy_weight_store_without_opening_shards(tmp_
     assert compiled.layer_plan[3].include_gate_bias is True
 
 
+@pytest.mark.parametrize("use_compile_cache", [False, True])
+def test_deepseek_compiler_only_sets_cache_dir_when_enabled(tmp_path, monkeypatch, use_compile_cache):
+    """Disabled caching keeps PyPTO's fresh per-kernel build directories."""
+    kernel_dir = _write_deepseek_kernel_dir(tmp_path, lm_head_tp_size=8)
+    captured: dict[str, object] = {}
+
+    class _Compiler:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(npu_executor, "_find_pypto_lib_deepseek_v4_dir", lambda *args, **kwargs: kernel_dir)
+    monkeypatch.setattr(npu_executor, "KernelCompiler", _Compiler)
+
+    executor = npu_executor.DeepSeekV4PyptoExecutor(
+        platform="a2a3sim",
+        device_ids=tuple(range(8)),
+        pypto_build_dir=str(tmp_path / "build"),
+        use_compile_cache=use_compile_cache,
+    )
+
+    expected_dir = executor._pypto_build_dir if use_compile_cache else None
+    assert captured["cache_dir"] == expected_dir
+    assert getattr(captured["run_config"], "save_kernels_dir") == expected_dir
+
+
 @pytest.mark.parametrize("num_speculative_tokens", [1, 3])
 def test_deepseek_compile_selects_mtp_programs(
     tmp_path,
