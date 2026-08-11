@@ -24,7 +24,7 @@ import pypto_serving.cli.main as cli
 from pypto_serving.config.types import DecodeBatch, PrefillBatch, RuntimeConfig
 from pypto_serving.model import model_loader
 from pypto_serving.model import tokenizer as tokenizer_module
-from pypto_serving.model.deepseek import npu_executor, weight_loader
+from pypto_serving.model.deepseek import npu_executor, npu_runner, weight_loader
 from pypto_serving.model.deepseek.npu_runner import (
     DEEPSEEK_V4_LM_HEAD_TP_SIZE,
     DeepSeekV4CacheLayout,
@@ -1981,6 +1981,39 @@ def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
     assert buffers.weights["weight"] is weight
     assert not buffers.weights["weight"].is_shared()
     assert buffers.prefill_kv_cache is buffers.decode_kv_cache
+    assert buffers.decode_state_generations.shape == (1, 1)
+    assert buffers.decode_state_tokens.shape == (1, 1, 2)
+    assert buffers.decode_state_meta.shape == (1, 1, 4)
+    assert not torch.count_nonzero(buffers.decode_state_meta)
+
+
+def test_deepseek_fused_mtp_args_bind_optional_device_state_after_slot_ids():
+    runner, _model = _runner_for_prepared_inputs()
+    sentinels = {name: object() for name in npu_runner._MTP_DECODE_TENSOR_ORDER}
+    buffers = SimpleNamespace(
+        decode_tail_token_ids=object(),
+        decode_tail_positions=object(),
+        decode_state_generations=object(),
+        decode_state_tokens=object(),
+        decode_state_meta=object(),
+    )
+    runner._require_mtp_buffers = lambda: buffers
+    runner._mtp_decode_args = lambda: tuple(
+        sentinels[name] for name in npu_runner._MTP_DECODE_TENSOR_ORDER
+    )
+    runner._int32_scalar = lambda value: ("runtime", value)
+
+    main_args = tuple(object() for _name in npu_runner._DECODE_FWD_TENSOR_ORDER)
+    args = runner._fused_mtp_decode_args(main_args, active_tokens=2)
+    tail_slot_index = args.index(sentinels["tail_slot_ids"])
+
+    assert len(args) == 142
+    assert args[tail_slot_index + 1 : tail_slot_index + 4] == (
+        buffers.decode_state_generations,
+        buffers.decode_state_tokens,
+        buffers.decode_state_meta,
+    )
+    assert args[-1] == ("runtime", 2)
 
 
 def test_deepseek_mtp_prefill_outputs_allocate_empty_rank_shards_once():
