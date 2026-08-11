@@ -205,6 +205,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 pypto_build_dir=self._pypto_build_dir,
             ),
             cache_dir=self._pypto_build_dir,
+            enable_scope_stats=True,
         )
 
     @property
