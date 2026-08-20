@@ -51,6 +51,7 @@ class SchedulerConfig:
     enable_chunk_prefill: bool = True
     num_speculative_tokens: int = 0
     supports_chunked_prefill_with_speculation: bool = True
+    requires_homogeneous_prefill_decode: bool = False
     # Async (pipelined) scheduling: schedule step N+1 before step N's sampled
     # token returns, advancing request state optimistically via placeholders.
     async_scheduling: bool = False
@@ -179,6 +180,11 @@ class Scheduler:
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
         self.requests: dict[str, Request] = {}
+        # Kernels with a homogeneous P/D contract keep each external dispatch
+        # in one phase. Rotate the preferred phase so a long
+        # chunked prefill cannot starve already-ready decode work (and vice
+        # versa). Decode goes first when both kinds of work initially coexist.
+        self._next_grouped_cache_phase = "decode"
 
     def add_request(self, request: Request) -> None:
         prompt_len = len(request.prompt_token_ids)
@@ -338,19 +344,28 @@ class Scheduler:
             if request.status is not RequestStatus.PREEMPTED
         ]
 
-        # Fixed-shape DeepSeek decode rows use otherwise-free cache blocks as
-        # scratch space. Do not admit a new prefill wave while a decode wave is
-        # active, or those padding rows could overwrite the new request's cache.
+        # Keep grouped-cache commands single-phase. Prefill may run in the next
+        # scheduler step, after the round-robin selector rotates away from decode.
         if grouped_phase == "decode":
             return output
 
         # Phase 2: schedule WAITING requests (new prefill)
+        preempted_this_step = {
+            request.request_id for request in output.preempted_requests
+        }
         remaining_waiting: deque[Request] = deque()
         while self.waiting and token_budget > 0:
             if len(self.running) >= self.config.max_num_running_reqs:
                 break
 
             request = self.waiting.popleft()
+            # Keep a victim PREEMPTED until any older in-flight result has
+            # drained. Re-admitting it in this same schedule() call would make
+            # that stale result indistinguishable from output for the restarted
+            # request under the depth-2 async pipeline.
+            if request.request_id in preempted_this_step:
+                remaining_waiting.append(request)
+                continue
 
             # Prefix cache lookup
             if self.config.enable_prefix_cache:
@@ -543,14 +558,42 @@ class Scheduler:
         return min(needed, limit)
 
     def _grouped_cache_phase(self) -> str | None:
-        """Choose one execution phase when grouped caches share decode scratch space."""
-        if not self.kv_cache_manager.has_groups:
+        """Choose one homogeneous kernel phase and rotate fairly."""
+        if not self.config.requires_homogeneous_prefill_decode:
             return None
-        if any(request.is_prefill and request.num_new_tokens_needed > 0 for request in self.running):
-            return "prefill"
-        if any(not request.is_prefill and request.num_new_tokens_needed > 0 for request in self.running):
-            return "decode"
-        return None
+        has_running_prefill = any(
+            request.status is not RequestStatus.PREEMPTED
+            and not request.terminal_prefill_in_flight
+            and request.is_prefill
+            and request.num_new_tokens_needed > 0
+            for request in self.running
+        )
+        can_admit_waiting_prefill = bool(self.waiting) and (
+            len(self.running) < self.config.max_num_running_reqs
+        )
+        has_prefill = has_running_prefill or can_admit_waiting_prefill
+        has_decode = any(
+            request.status is not RequestStatus.PREEMPTED
+            and not request.terminal_prefill_in_flight
+            and not request.is_prefill
+            and request.num_new_tokens_needed > 0
+            for request in self.running
+        )
+        if not has_prefill and not has_decode:
+            return None
+
+        if has_prefill and has_decode:
+            phase = self._next_grouped_cache_phase
+        elif has_prefill:
+            phase = "prefill"
+        else:
+            phase = "decode"
+
+        # Rotate on selection rather than completion. If the selected phase
+        # cannot allocate cache this pass, the other phase still gets a chance
+        # on the next schedule() call.
+        self._next_grouped_cache_phase = "decode" if phase == "prefill" else "prefill"
+        return phase
 
     def advance_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         """Optimistically advance state for a just-scheduled step (async mode).
