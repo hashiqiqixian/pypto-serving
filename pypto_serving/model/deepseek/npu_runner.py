@@ -3807,6 +3807,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         if draft_token_id is None:
             raise RuntimeError("DeepSeekV4 MTP draft prefill did not produce a token")
         state.draft_token_id = draft_token_id
+        state.draft_pre_hc_hidden = self._read_mtp_prefill_pre_hc(owner_rank, row=0)
+        state.draft_position = context.position_id + 1
         state.tail_token_id = int(first_token[0].item())
         self._write_mtp_tail_hidden(
             state,
