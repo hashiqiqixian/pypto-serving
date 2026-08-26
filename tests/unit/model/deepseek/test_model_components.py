@@ -24,7 +24,12 @@ import torch
 from pypto.runtime import DeviceTensor, StackedDeviceTensor
 
 import pypto_serving.cli.main as cli
-from pypto_serving.config.types import DecodeBatch, PrefillBatch, RuntimeConfig
+from pypto_serving.config.types import (
+    PREFILL_CHUNK_SIZE_CHOICES,
+    DecodeBatch,
+    PrefillBatch,
+    RuntimeConfig,
+)
 from pypto_serving.model import model_loader
 from pypto_serving.model import tokenizer as tokenizer_module
 from pypto_serving.model.deepseek import npu_executor, weight_loader
@@ -732,9 +737,11 @@ def test_cli_selects_deepseek_executor_and_configures_mtp_depth(tmp_path):
     assert config.executor_kwargs["num_speculative_tokens"] == 4
     assert config.runtime_config.num_speculative_tokens == 4
     assert config.runtime_config.max_prefill_tokens_per_request == 8192
+    assert config.runtime_config.prefill_chunk_size_choices == PREFILL_CHUNK_SIZE_CHOICES
     assert config.runtime_config.supports_chunked_prefill_with_speculation is True
     assert config.runtime_config.requires_homogeneous_prefill_decode is True
     assert config.max_num_running_reqs == 16
+    assert config.long_prefill_token_threshold == 2048
     assert config.executor_kwargs["use_compile_cache"] is True
 
 

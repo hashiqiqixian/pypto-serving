@@ -45,6 +45,7 @@ class SchedulerConfig:
     max_num_scheduled_tokens: int = 4096
     long_prefill_token_threshold: int = 2048
     max_prefill_tokens_per_request: int | None = None
+    prefill_chunk_size_choices: tuple[int, ...] = ()
     max_seq_len: int = 4096
     # Feature flags
     enable_prefix_cache: bool = True
@@ -69,6 +70,17 @@ class SchedulerConfig:
             and self.max_prefill_tokens_per_request <= 0
         ):
             raise ValueError("max_prefill_tokens_per_request must be positive when specified")
+        valid_prefill_chunk_size = (
+            isinstance(self.long_prefill_token_threshold, int)
+            and not isinstance(self.long_prefill_token_threshold, bool)
+            and self.long_prefill_token_threshold in self.prefill_chunk_size_choices
+        )
+        if self.prefill_chunk_size_choices and not valid_prefill_chunk_size:
+            choices = ", ".join(str(size) for size in self.prefill_chunk_size_choices)
+            raise ValueError(
+                f"long_prefill_token_threshold must be one of ({choices}), "
+                f"got {self.long_prefill_token_threshold}"
+            )
 
 
 @dataclass

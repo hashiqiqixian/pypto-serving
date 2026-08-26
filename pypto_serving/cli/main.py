@@ -20,7 +20,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pypto_serving.config.parallel import ParallelConfig, parse_device_ids
-from pypto_serving.config.types import GenerateConfig, RuntimeConfig
+from pypto_serving.config.types import (
+    PREFILL_CHUNK_SIZE_CHOICES,
+    GenerateConfig,
+    RuntimeConfig,
+)
 from pypto_serving.model.model_family import detect_model_family, read_model_config
 from pypto_serving.tools.profile import (
     ProfileConfig,
@@ -210,7 +214,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--long-prefill-token-threshold",
         type=int,
         default=2048,
-        help="Chunked prefill threshold in serving mode (default: 2048).",
+        help=(
+            "Maximum tokens per request in one chunked-prefill scheduling step. "
+            "DeepSeek V4 accepts 1024, 2048, 4096, or 8192; the final prompt "
+            "chunk may be smaller (default: 2048)."
+        ),
     )
     parser.add_argument(
         "--enable-prefix-caching",
@@ -266,6 +274,10 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = read_model_config(model_dir)
     model_family = detect_model_family(model_config_data)
+    _validate_prefill_chunk_size(
+        model_family,
+        args.long_prefill_token_threshold,
+    )
     num_speculative_tokens = _resolve_num_speculative_tokens(args)
     if model_family == "deepseek_v4":
         executor_kwargs["compile_kernels"] = True
@@ -334,6 +346,7 @@ def _build_runtime_config(
 
     kv_cache_groups = ()
     max_prefill_tokens_per_request = None
+    prefill_chunk_size_choices = ()
     supports_chunked_prefill_with_speculation = True
     requires_homogeneous_prefill_decode = False
     if model_family == "deepseek_v4":
@@ -362,6 +375,7 @@ def _build_runtime_config(
         max_prefill_tokens_per_request = int(
             kernel_contract.max_prefill_tokens_per_request
         )
+        prefill_chunk_size_choices = PREFILL_CHUNK_SIZE_CHOICES
         requires_homogeneous_prefill_decode = bool(
             kernel_contract.requires_homogeneous_prefill_decode
         )
@@ -376,6 +390,7 @@ def _build_runtime_config(
         npu_memory_utilization=args.npu_memory_utilization,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_prefill_tokens_per_request=max_prefill_tokens_per_request,
+        prefill_chunk_size_choices=prefill_chunk_size_choices,
         supports_chunked_prefill_with_speculation=supports_chunked_prefill_with_speculation,
         requires_homogeneous_prefill_decode=requires_homogeneous_prefill_decode,
         num_speculative_tokens=num_speculative_tokens,
@@ -554,6 +569,22 @@ def _executor_cls_for_model_family(model_family: str) -> str:
     return "PyptoQwen14BExecutor"
 
 
+def _validate_prefill_chunk_size(model_family: str, chunk_size: object) -> None:
+    """Reject unsupported user-configured DeepSeek prefill chunk sizes."""
+    if model_family != "deepseek_v4":
+        return
+    if (
+        not isinstance(chunk_size, int)
+        or isinstance(chunk_size, bool)
+        or chunk_size not in PREFILL_CHUNK_SIZE_CHOICES
+    ):
+        choices = ", ".join(str(size) for size in PREFILL_CHUNK_SIZE_CHOICES)
+        raise ValueError(
+            "--long-prefill-token-threshold must be one of "
+            f"({choices}) for DeepSeek V4, got {chunk_size}"
+        )
+
+
 def _validate_model_topology(
     model_family: str,
     args: argparse.Namespace,
@@ -650,7 +681,7 @@ def run_serve(
     print(f"  Parallelism: {_format_parallelism(config)}")
     print(f"  Max running requests: {config.max_num_running_reqs}")
     print(f"  Max scheduled tokens/iter: {config.max_num_scheduled_tokens}")
-    print(f"  Chunked prefill threshold: {config.long_prefill_token_threshold}")
+    print(f"  Configured prefill chunk size: {config.long_prefill_token_threshold}")
     runtime = config.runtime_config
     model_prefill_limit = (
         runtime.max_prefill_tokens_per_request

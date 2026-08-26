@@ -13,10 +13,58 @@ from __future__ import annotations
 import pytest
 
 import pypto_serving.cli.main as cli
+from pypto_serving.config.types import PREFILL_CHUNK_SIZE_CHOICES
 
 
 def _parse_cli_args(argv: list[str]):
     return cli.build_parser().parse_args(argv)
+
+
+@pytest.mark.parametrize("chunk_size", PREFILL_CHUNK_SIZE_CHOICES)
+def test_cli_accepts_supported_prefill_chunk_sizes(chunk_size):
+    args = _parse_cli_args(
+        ["--model", "model", "--long-prefill-token-threshold", str(chunk_size)]
+    )
+
+    assert args.long_prefill_token_threshold == chunk_size
+
+
+@pytest.mark.parametrize(
+    "chunk_size",
+    [None, -1, 0, 128, 1023, 3072, 8193, "1024", 1024.0, True],
+)
+def test_deepseek_rejects_unsupported_prefill_chunk_sizes(chunk_size):
+    with pytest.raises(
+        ValueError,
+        match="--long-prefill-token-threshold must be one of",
+    ):
+        cli._validate_prefill_chunk_size("deepseek_v4", chunk_size)
+
+
+def test_cli_keeps_generic_model_chunk_sizes_unrestricted():
+    args = _parse_cli_args(
+        ["--model", "model", "--long-prefill-token-threshold", "128"]
+    )
+
+    cli._validate_prefill_chunk_size("qwen", args.long_prefill_token_threshold)
+    assert args.long_prefill_token_threshold == 128
+
+
+def test_build_serving_engine_config_rejects_unsupported_deepseek_chunk_size(
+    tmp_path,
+):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type":"deepseek_v4"}')
+    args = _parse_cli_args(
+        ["--model", str(model_dir), "--long-prefill-token-threshold", "3072"]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="--long-prefill-token-threshold must be one of",
+    ):
+        cli.build_serving_engine_config(args)
 
 
 def test_build_serving_engine_config_uses_parallel_config_for_devices(tmp_path):

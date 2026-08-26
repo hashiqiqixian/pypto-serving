@@ -190,6 +190,7 @@ class ReplicaEngineCore:
             max_num_scheduled_tokens=self.config.max_num_scheduled_tokens,
             long_prefill_token_threshold=self.config.long_prefill_token_threshold,
             max_prefill_tokens_per_request=runtime.max_prefill_tokens_per_request,
+            prefill_chunk_size_choices=runtime.prefill_chunk_size_choices,
             max_seq_len=runtime.max_seq_len,
             enable_prefix_cache=self.config.enable_prefix_cache,
             enable_chunk_prefill=self.config.enable_chunk_prefill,

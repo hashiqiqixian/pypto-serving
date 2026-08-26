@@ -17,6 +17,9 @@ import torch
 from pypto_serving.model.tokenizer import TokenizerAdapter
 
 
+PREFILL_CHUNK_SIZE_CHOICES = (1024, 2048, 4096, 8192)
+
+
 @dataclass(frozen=True)
 class GenerateConfig:
     """User-facing options that control text generation."""
@@ -151,6 +154,9 @@ class RuntimeConfig:
     # single dispatch. ``None`` means the model has no stricter per-request
     # limit than ``max_num_batched_tokens``.
     max_prefill_tokens_per_request: int | None = None
+    # User-selectable scheduler chunk sizes supported by this model. Empty
+    # means that the shared scheduler imposes no model-specific allowlist.
+    prefill_chunk_size_choices: tuple[int, ...] = ()
     # Whether speculative decoding can safely consume a prompt produced by
     # more than one prefill dispatch.
     supports_chunked_prefill_with_speculation: bool = True

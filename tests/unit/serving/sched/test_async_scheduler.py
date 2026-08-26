@@ -12,6 +12,7 @@ import pytest
 from pypto_serving.config.types import (
     KVCacheGroupSpec,
     KVCacheSpec,
+    PREFILL_CHUNK_SIZE_CHOICES,
 )
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.sched.scheduler import (
@@ -27,6 +28,49 @@ from pypto_serving.serving.sched.scheduler import (
 def test_scheduler_rejects_speculative_depth_larger_than_token_budget():
     with pytest.raises(ValueError, match="one decode token"):
         SchedulerConfig(max_num_scheduled_tokens=4, num_speculative_tokens=4)
+
+
+@pytest.mark.parametrize("chunk_size", PREFILL_CHUNK_SIZE_CHOICES)
+def test_scheduler_accepts_model_prefill_chunk_size_choices(chunk_size):
+    config = SchedulerConfig(
+        long_prefill_token_threshold=chunk_size,
+        prefill_chunk_size_choices=PREFILL_CHUNK_SIZE_CHOICES,
+    )
+
+    assert config.long_prefill_token_threshold == chunk_size
+
+
+@pytest.mark.parametrize(
+    "chunk_size",
+    [None, -1, 0, 128, 1023, 3072, 8193, "1024", 1024.0, True],
+)
+def test_scheduler_rejects_unsupported_model_prefill_chunk_size(chunk_size):
+    with pytest.raises(
+        ValueError,
+        match="long_prefill_token_threshold must be one of",
+    ):
+        SchedulerConfig(
+            long_prefill_token_threshold=chunk_size,
+            prefill_chunk_size_choices=PREFILL_CHUNK_SIZE_CHOICES,
+        )
+
+
+def test_scheduler_rejects_unsupported_chunk_size_when_chunking_is_disabled():
+    with pytest.raises(
+        ValueError,
+        match="long_prefill_token_threshold must be one of",
+    ):
+        SchedulerConfig(
+            long_prefill_token_threshold=3072,
+            prefill_chunk_size_choices=PREFILL_CHUNK_SIZE_CHOICES,
+            enable_chunk_prefill=False,
+        )
+
+
+def test_scheduler_keeps_generic_internal_chunk_sizes_unrestricted():
+    config = SchedulerConfig(long_prefill_token_threshold=2)
+
+    assert config.long_prefill_token_threshold == 2
 
 
 def test_scheduler_speculative_output_counts_only_tokens_retained_before_eos():
@@ -346,6 +390,21 @@ _DYNAMIC_AR_PREFILL_OPTIONS = _DYNAMIC_PREFILL_OPTIONS | {"num_speculative_token
         (129, {"threshold": 64}, [(0, 64), (64, 64), (128, 1)]),
         (129, {"model_limit": None, "num_speculative_tokens": 0}, [(0, 129)]),
         (257, _DYNAMIC_AR_PREFILL_OPTIONS, [(0, 257)]),
+        (
+            2177,
+            _DYNAMIC_AR_PREFILL_OPTIONS | {"threshold": 1024},
+            [(0, 1024), (1024, 1024), (2048, 129)],
+        ),
+        (
+            8192,
+            _DYNAMIC_AR_PREFILL_OPTIONS | {"threshold": 4096},
+            [(0, 4096), (4096, 4096)],
+        ),
+        (
+            8192,
+            _DYNAMIC_AR_PREFILL_OPTIONS | {"max_scheduled_tokens": 4096},
+            [(0, 4096), (4096, 4096)],
+        ),
         (8192, _DYNAMIC_AR_PREFILL_OPTIONS, [(0, 8192)]),
         (8191, _DYNAMIC_PREFILL_OPTIONS, [(0, 8191)]),
         (8192, _DYNAMIC_PREFILL_OPTIONS, [(0, 8192)]),
