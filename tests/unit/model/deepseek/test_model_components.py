@@ -736,12 +736,71 @@ def test_cli_keeps_deepseek_autoregressive_decode_when_mtp_is_disabled(tmp_path)
     assert config.runtime_config.max_prefill_tokens_per_request == DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS
 
 
+def test_cli_selects_deepseek_dspark_topology(tmp_path):
+    model_dir = _write_deepseek_model_dir(tmp_path)
+    devices = ",".join(str(device) for device in range(16))
+    args = cli.build_parser().parse_args(
+        [
+            "--model",
+            str(model_dir),
+            "--devices",
+            devices,
+            "--dp",
+            "4",
+            "--tp",
+            "4",
+            "--ep",
+            "16",
+            "--block-size",
+            "32",
+            "--speculative-config",
+            '{"method":"dspark","num_speculative_tokens":7}',
+        ]
+    )
+
+    config = cli.build_serving_engine_config(args)
+
+    assert config.device_ids == tuple(range(16))
+    assert config.parallel_config.worker_group_size == 16
+    assert config.executor_kwargs["num_speculative_tokens"] == 7
+    assert config.enable_prefix_cache is False
+
+
+def test_cli_rejects_dspark_with_mtp_topology(tmp_path):
+    model_dir = _write_deepseek_model_dir(tmp_path)
+    args = cli.build_parser().parse_args(
+        [
+            "--model",
+            str(model_dir),
+            "--devices",
+            "0,1,2,3,4,5,6,7",
+            "--dp",
+            "8",
+            "--tp",
+            "1",
+            "--ep",
+            "8",
+            "--block-size",
+            "128",
+            "--speculative-config",
+            '{"method":"dspark","num_speculative_tokens":7}',
+        ]
+    )
+
+    with pytest.raises(ValueError, match="--dp 4 --tp 4 --ep 16"):
+        cli.build_serving_engine_config(args)
+
+
 @pytest.mark.parametrize(
     ("config", "message"),
     [
         ({"method": "draft_model", "num_speculative_tokens": 3}, "method='mtp'"),
         ({"method": "mtp"}, "requires num_speculative_tokens"),
         ({"method": "mtp", "num_speculative_tokens": 0}, "must be positive"),
+        (
+            {"method": "dspark", "num_speculative_tokens": 6},
+            "requires num_speculative_tokens=7",
+        ),
     ],
 )
 def test_cli_rejects_invalid_deepseek_speculative_config(config, message):
