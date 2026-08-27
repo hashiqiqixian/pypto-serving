@@ -283,6 +283,10 @@ class PrefillBatch:
     block_ids: list[list[int]] = field(default_factory=list)
     block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
     cache_partitions: list[int | None] = field(default_factory=list)
+    # Optional prompt lookahead used by parallel block drafters during chunked
+    # prefill. ``None`` marks a chunk that reaches the end of the prompt; its
+    # anchor becomes the target model's sampled token in ``finalize_prefill``.
+    next_prefill_token_ids: list[int | None] = field(default_factory=list)
 
 
 @dataclass

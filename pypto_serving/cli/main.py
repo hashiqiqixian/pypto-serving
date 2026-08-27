@@ -277,6 +277,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     if model_family == "deepseek_v4":
         executor_kwargs["compile_kernels"] = True
         executor_kwargs["num_speculative_tokens"] = num_speculative_tokens
+        executor_kwargs["speculative_method"] = speculative_method
     elif num_speculative_tokens:
         raise ValueError(
             "--speculative-config/--num-speculative-tokens/--enable-mtp is only "
@@ -350,6 +351,7 @@ def _build_runtime_config(
             DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS,
             build_deepseek_v4_cache_group_specs,
             deepseek_v4_decode_layout,
+            deepseek_v4_dspark_decode_layout,
         )
 
         config_data = config_data or {}
@@ -357,13 +359,18 @@ def _build_runtime_config(
         if not isinstance(compress_ratios, list):
             compress_ratios = None
         num_hidden_layers = int(config_data.get("num_hidden_layers", 43))
-        layout = deepseek_v4_decode_layout(num_speculative_tokens)
+        layout = (
+            deepseek_v4_dspark_decode_layout()
+            if _resolve_speculative_method(args) == "dspark"
+            else deepseek_v4_decode_layout(num_speculative_tokens)
+        )
         kv_cache_groups = build_deepseek_v4_cache_group_specs(
             num_hidden_layers,
             compress_ratios,
             decode_batch=layout.decode_batch,
             enable_mtp=num_speculative_tokens == 1,
             max_seq_len=args.max_model_len,
+            layout=layout,
         )
         max_prefill_tokens_per_request = DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS
 
@@ -651,8 +658,10 @@ def _validate_model_topology(
         )
     if speculative_method == "dspark":
         # pypto-lib DSpark fixes 64 requests per DP group and four DP groups.
+        from pypto_serving.model.deepseek.npu_runner import deepseek_v4_dspark_decode_layout
+
         max_global_batch = 4 * 64
-        max_model_len = 1_048_576
+        max_model_len = deepseek_v4_dspark_decode_layout().max_seq_len
     else:
         from pypto_serving.model.deepseek.npu_runner import deepseek_v4_decode_layout
 

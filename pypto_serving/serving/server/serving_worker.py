@@ -667,6 +667,15 @@ class WorkerProcess:
             chunk_tokens_list = [pr.chunk_tokens for pr in scheduled]
             seq_lens = [pr.num_computed_tokens + len(pr.chunk_tokens) for pr in scheduled]
             chunk_starts = [pr.num_computed_tokens for pr in scheduled]
+            next_prefill_token_ids = []
+            for pr in scheduled:
+                prompt_token_ids = self._req_cache[pr.request_id].prompt_token_ids
+                chunk_end = pr.num_computed_tokens + len(pr.chunk_tokens)
+                next_prefill_token_ids.append(
+                    prompt_token_ids[chunk_end]
+                    if chunk_end < len(prompt_token_ids)
+                    else None
+                )
             block_ids_list = [pr.block_ids for pr in scheduled]
             allow_device_greedy_sampling = (
                 self.executor.supports_device_sampling
@@ -693,6 +702,7 @@ class WorkerProcess:
                     block_ids=block_ids_list,
                     block_ids_by_group=[pr.block_ids_by_group for pr in scheduled],
                     cache_partitions=[pr.cache_partition for pr in scheduled],
+                    next_prefill_token_ids=next_prefill_token_ids,
                 ),
             )
 
