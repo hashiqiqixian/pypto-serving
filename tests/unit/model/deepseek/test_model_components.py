@@ -341,6 +341,18 @@ def test_deepseek_mtp_token_step_runs_one_request_per_rank_wave(monkeypatch):
             (layout.ranks, layout.decode_tokens),
             dtype=torch.int32,
         ),
+        "sampling_temperatures": torch.empty(
+            (layout.ranks, layout.decode_tokens), dtype=torch.float32
+        ),
+        "sampling_top_ks": torch.empty(
+            (layout.ranks, layout.decode_tokens), dtype=torch.int32
+        ),
+        "sampling_seeds": torch.empty(
+            (layout.ranks, layout.decode_tokens), dtype=torch.int32
+        ),
+        "sampling_positions": torch.empty(
+            (layout.ranks, layout.decode_tokens), dtype=torch.int32
+        ),
     }
     runner._mtp_buffers = SimpleNamespace()
     runner._mtp_decode_task_args = [SimpleNamespace(tensors=mtp_slots)]
@@ -1634,6 +1646,14 @@ def test_deepseek_dspark_decode_keeps_a_stable_tp_query_owner():
         for request_id in first.request_ids
     } == {"req-a": 0, "req-b": 0, "req-c": 0, "req-d": 0, "req-e": 1}
     assert runner._dspark_partial_decode_waves(first) == ((0, 1, 2, 3), (4,))
+    sampling_slots = {}
+    runner._stage_sampling_inputs(
+        sampling_slots,
+        first,
+        assignment=first_assignment,
+        positions=((0,),) * len(first.request_ids),
+    )
+    assert sampling_slots == {}
     for index, request_id in enumerate(first.request_ids):
         runner._dspark_request_states[request_id] = SimpleNamespace(
             committed_seq_len=10 + index

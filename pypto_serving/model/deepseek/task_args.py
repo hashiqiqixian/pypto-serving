@@ -384,6 +384,10 @@ _DECODE_FWD_TENSOR_ORDER = (
     "final_norm_w",
     "pre_hc_hidden_out",
     "lm_head_weight",
+    "sampling_temperatures",
+    "sampling_top_ks",
+    "sampling_seeds",
+    "sampling_positions",
     "hidden_out",
     "logits",
     "sampled_ids",
@@ -456,7 +460,8 @@ _FUSED_MTP_BASE_TENSOR_ORDER = (
     "routed_w2", "routed_w2_scale", "shared_w1", "shared_w1_scale",
     "shared_w3", "shared_w3_scale", "shared_w2", "shared_w2_scale",
     "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base", "mtp_norm_w",
-    "lm_head_weight", "hidden_out", "next_pre_hc_hidden", "logits", "sampled_ids",
+    "lm_head_weight", "sampling_temperatures", "sampling_top_ks", "sampling_seeds",
+    "sampling_positions", "hidden_out", "next_pre_hc_hidden", "logits", "sampled_ids",
     "logit_row_indices",
 )
 
@@ -477,7 +482,8 @@ _MTP_DECODE_TENSOR_ORDER = (
     "routed_w2", "routed_w2_scale", "shared_w1", "shared_w1_scale",
     "shared_w3", "shared_w3_scale", "shared_w2", "shared_w2_scale",
     "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base", "mtp_norm_w",
-    "lm_head_weight", "hidden_out", "next_pre_hc_hidden", "logits", "sampled_ids",
+    "lm_head_weight", "sampling_temperatures", "sampling_top_ks", "sampling_seeds",
+    "sampling_positions", "hidden_out", "next_pre_hc_hidden", "logits", "sampled_ids",
     "logit_row_indices",
 )
 
@@ -905,6 +911,10 @@ def _decode_slot_specs(layout, hidden: int, vocab: int) -> dict[str, tuple[torch
         "input_ids": (torch.int64, (ranks, tokens)),
         "num_tokens_per_owner": (torch.int32, (ranks,)),
         "logit_row_indices": (torch.int32, (ranks, tokens)),
+        "sampling_temperatures": (torch.float32, (ranks, tokens)),
+        "sampling_top_ks": (torch.int32, (ranks, tokens)),
+        "sampling_seeds": (torch.int32, (ranks, tokens)),
+        "sampling_positions": (torch.int32, (ranks, tokens)),
         "sampled_ids": (torch.int32, (ranks, tokens, DEEPSEEK_V4_SAMPLED_IDS_PAD)),
         # outputs
         "hidden_out": (torch.bfloat16, (ranks, tokens, hidden)),
@@ -1017,7 +1027,15 @@ def decode_task_args(
                 placement = (
                     Placement.DEVICE_RESIDENT
                     if runner._compiled.num_speculative_tokens == 1
-                    and name in {"hidden_out", "logits"}
+                    and name
+                    in {
+                        "hidden_out",
+                        "logits",
+                        "sampling_temperatures",
+                        "sampling_top_ks",
+                        "sampling_seeds",
+                        "sampling_positions",
+                    }
                     else Placement.HOST_SHARED
                 )
             ta.add_slot(Slot(name, placement, dtype, lambda _, s=shape: s))
@@ -1366,6 +1384,10 @@ def _mtp_decode_slots(layout, hidden: int) -> dict[str, tuple[torch.dtype, tuple
         "input_ids": (torch.int64, (ranks, tokens)),
         "sampled_ids": (torch.int32, (ranks, tokens, DEEPSEEK_V4_SAMPLED_IDS_PAD)),
         "logit_row_indices": (torch.int32, (ranks, tokens)),
+        "sampling_temperatures": (torch.float32, (ranks, tokens)),
+        "sampling_top_ks": (torch.int32, (ranks, tokens)),
+        "sampling_seeds": (torch.int32, (ranks, tokens)),
+        "sampling_positions": (torch.int32, (ranks, tokens)),
         "hidden_out": (torch.bfloat16, (ranks, tokens, hidden)),
         "next_pre_hc_hidden": (torch.float32, (ranks, tokens, layout.hc_mult, hidden)),
         "logits": (torch.float32, (ranks, tokens, DEEPSEEK_V4_VOCAB_SIZE)),
@@ -1405,6 +1427,10 @@ def mtp_decode_task_args(
                 "hidden_out",
                 "next_pre_hc_hidden",
                 "logits",
+                "sampling_temperatures",
+                "sampling_top_ks",
+                "sampling_seeds",
+                "sampling_positions",
             }
             placement = (
                 Placement.DEVICE_RESIDENT

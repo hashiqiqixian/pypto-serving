@@ -677,10 +677,7 @@ class WorkerProcess:
                     else None
                 )
             block_ids_list = [pr.block_ids for pr in scheduled]
-            allow_device_greedy_sampling = (
-                self.executor.supports_device_sampling
-                and all(self._req_cache[pr.request_id].temperature <= 0.0 for pr in scheduled)
-            )
+            allow_device_greedy_sampling = self._allow_device_sampled_ids(scheduled)
             allow_device_topk_sampling = self._allow_device_topk_sampling(scheduled)
             embedding_lookup = None
             if not self.executor.supports_device_embedding:
@@ -709,6 +706,7 @@ class WorkerProcess:
             # Sample only for requests whose prefill chunk completes the prompt.
             completed_request_ids: list[str] = []
             completed_token_ids: list[int] = []
+            completed_sampling_params: list[SamplingParams] = []
             for i, pr in enumerate(scheduled):
                 cached = self._req_cache[pr.request_id]
                 # num_prompt_tokens is len(prompt_token_ids), which we have in cache.
@@ -723,6 +721,7 @@ class WorkerProcess:
                         temperature=cached.temperature,
                         top_p=cached.top_p,
                         top_k=cached.top_k,
+                        seed=cached.seed,
                     )
                     token_id = self._sample_result_row(
                         prefill_result,
@@ -735,6 +734,7 @@ class WorkerProcess:
                     new_tokens[pr.request_id] = [token_id]
                     completed_request_ids.append(pr.request_id)
                     completed_token_ids.append(token_id)
+                    completed_sampling_params.append(params)
 
             # MTP prefill needs the first sampled output token to build its
             # shifted input. Keep that work in the terminal-prefill command so
@@ -744,6 +744,7 @@ class WorkerProcess:
                     runtime_model,
                     completed_request_ids,
                     completed_token_ids,
+                    completed_sampling_params,
                 )
 
     def _resolve_decode_token(self, dr: DecodeRequest) -> int:
@@ -778,10 +779,7 @@ class WorkerProcess:
         runtime_model = self.model_record.runtime_model
         if buffer_slot is None:
             buffer_slot = cmd.step_id % _DECODE_PIPELINE_SLOTS
-        allow_device_greedy_sampling = (
-            self.executor.supports_device_sampling
-            and all(self._req_cache[dr.request_id].temperature <= 0.0 for dr in cmd.decode_requests)
-        )
+        allow_device_greedy_sampling = self._allow_device_sampled_ids(cmd.decode_requests)
         allow_device_topk_sampling = self._allow_device_topk_sampling(cmd.decode_requests)
         # Tokens remain placeholders during early preparation. Executors with a
         # host-token dependency may patch them on the device lane; fused MTP
@@ -835,6 +833,15 @@ class WorkerProcess:
             ),
             allow_device_greedy_sampling=allow_device_greedy_sampling,
             allow_device_topk_sampling=allow_device_topk_sampling,
+            sampling_params=[
+                SamplingParams(
+                    temperature=self._req_cache[dr.request_id].temperature,
+                    top_p=self._req_cache[dr.request_id].top_p,
+                    top_k=self._req_cache[dr.request_id].top_k,
+                    seed=self._req_cache[dr.request_id].seed,
+                )
+                for dr in scheduled
+            ],
             block_ids=[dr.block_ids for dr in scheduled],
             block_ids_by_group=[dr.block_ids_by_group for dr in scheduled],
             cache_partitions=[dr.cache_partition for dr in scheduled],
@@ -852,10 +859,7 @@ class WorkerProcess:
             cat="worker",
             args={"batch_size": len(scheduled), "request_ids": [dr.request_id for dr in scheduled]},
         ):
-            allow_device_greedy_sampling = (
-                self.executor.supports_device_sampling
-                and all(self._req_cache[dr.request_id].temperature <= 0.0 for dr in scheduled)
-            )
+            allow_device_greedy_sampling = self._allow_device_sampled_ids(scheduled)
             allow_device_topk_sampling = self._allow_device_topk_sampling(scheduled)
 
             batch = self._make_decode_batch(
@@ -888,10 +892,7 @@ class WorkerProcess:
             for i, dr in enumerate(scheduled):
                 new_tokens[dr.request_id] = list(decode_result.accepted_token_ids[i])
             return
-        allow_device_greedy_sampling = (
-            self.executor.supports_device_sampling
-            and all(self._req_cache[dr.request_id].temperature <= 0.0 for dr in scheduled)
-        )
+        allow_device_greedy_sampling = self._allow_device_sampled_ids(list(scheduled))
         allow_device_topk_sampling = self._allow_device_topk_sampling(list(scheduled))
         for i, dr in enumerate(scheduled):
             cached = self._req_cache[dr.request_id]
@@ -906,6 +907,7 @@ class WorkerProcess:
                 temperature=cached.temperature,
                 top_p=cached.top_p,
                 top_k=cached.top_k,
+                seed=cached.seed,
             )
             token_id = self._sample_result_row(
                 decode_result,
@@ -961,6 +963,20 @@ class WorkerProcess:
             and all(request.top_k is not None for request in cached_requests)
             and all(request.top_k > 0 for request in cached_requests)
             and all(request.top_k <= max_device_topk for request in cached_requests)
+        )
+
+    def _allow_device_sampled_ids(self, scheduled: list) -> bool:
+        """Return whether the executor can perform every request's sampling policy."""
+        if not self.executor.supports_device_sampling:
+            return False
+        requests = [self._req_cache[item.request_id] for item in scheduled]
+        return all(
+            request.temperature <= 0.0
+            or (
+                getattr(self.executor, "supports_device_stochastic_sampling", False)
+                and request.top_p >= 1.0
+            )
+            for request in requests
         )
 
 
