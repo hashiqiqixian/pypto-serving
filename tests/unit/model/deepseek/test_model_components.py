@@ -852,6 +852,14 @@ def test_cli_rejects_dspark_with_mtp_topology(tmp_path):
             {"method": "dspark", "num_speculative_tokens": 6},
             "requires num_speculative_tokens=7",
         ),
+        (
+            {
+                "method": "dspark",
+                "num_speculative_tokens": 7,
+                "enable_adaptive_verification": True,
+            },
+            "adaptive verification requires runtime cost profiling",
+        ),
     ],
 )
 def test_cli_rejects_invalid_deepseek_speculative_config(config, message):
@@ -1579,8 +1587,10 @@ def test_deepseek_dspark_cache_groups_use_dp4_partitions_and_compressed_pages():
     assert all(spec.num_partitions == 4 for spec in specs)
     assert by_name["ori"].spec.block_size == 32
     assert by_name["cmp_c4"].max_blocks_per_seq == 128
+    assert by_name["cmp_c4"].spec.token_capacity == 128
     assert by_name["cmp_c4"].spec.page_size_bytes == 21 * 32 * 512 * 2
     assert by_name["cmp_c128"].max_blocks_per_seq == 4
+    assert by_name["cmp_c128"].spec.token_capacity == 4096
 
 
 def test_deepseek_dspark_decode_keeps_a_stable_tp_query_owner():
@@ -1599,28 +1609,42 @@ def test_deepseek_dspark_decode_keeps_a_stable_tp_query_owner():
         )
     )
     first = DecodeBatch(
-        request_ids=["req-a", "req-b", "req-c"],
-        token_ids=torch.ones((3, 1), dtype=torch.long),
-        seq_lens=torch.ones(3, dtype=torch.int32),
-        cache_partitions=[1, 1, 1],
+        request_ids=["req-a", "req-b", "req-c", "req-d", "req-e"],
+        token_ids=torch.ones((5, 1), dtype=torch.long),
+        hidden_states=None,
+        seq_lens=torch.ones(5, dtype=torch.int32),
+        cache_partitions=[1, 1, 1, 1, 1],
     )
     reordered = DecodeBatch(
-        request_ids=["req-c", "req-a", "req-b"],
-        token_ids=torch.ones((3, 1), dtype=torch.long),
-        seq_lens=torch.ones(3, dtype=torch.int32),
-        cache_partitions=[1, 1, 1],
+        request_ids=["req-e", "req-c", "req-a", "req-d", "req-b"],
+        token_ids=torch.ones((5, 1), dtype=torch.long),
+        hidden_states=None,
+        seq_lens=torch.ones(5, dtype=torch.int32),
+        cache_partitions=[1, 1, 1, 1, 1],
     )
 
     first_assignment = runner._decode_assignment(first)
     reordered_assignment = runner._decode_assignment(reordered)
 
     owners = dict(zip(first.request_ids, first_assignment.ranks, strict=True))
-    assert owners == {"req-a": 4, "req-b": 5, "req-c": 6}
+    assert owners == {"req-a": 4, "req-b": 5, "req-c": 6, "req-d": 7, "req-e": 4}
     assert reordered_assignment.ranks == tuple(owners[request_id] for request_id in reordered.request_ids)
+    assert {
+        request_id: runner._dspark_request_owners[request_id].local_row
+        for request_id in first.request_ids
+    } == {"req-a": 0, "req-b": 0, "req-c": 0, "req-d": 0, "req-e": 1}
+    assert runner._dspark_partial_decode_waves(first) == ((0, 1, 2, 3), (4,))
+    for index, request_id in enumerate(first.request_ids):
+        runner._dspark_request_states[request_id] = SimpleNamespace(
+            committed_seq_len=10 + index
+        )
+    optimistic = replace(first, seq_lens=torch.full((5,), 18, dtype=torch.int32))
+    assert runner._correct_dspark_seq_lens(optimistic).tolist() == [10, 11, 12, 13, 14]
 
     runner.release_finished_requests(["req-b"])
-    replacement = runner._reserve_dspark_request_owner("req-d", 1)
+    replacement = runner._reserve_dspark_request_owner("req-f", 1)
     assert replacement.rank == 5
+    assert replacement.local_row == 0
 
 
 def test_deepseek_dspark_prefill_replicates_group_metadata_and_scatters_local_tokens():
@@ -1838,6 +1862,20 @@ def test_deepseek_cache_metadata_maps_scheduler_block_ids():
     assert swa_lens.tolist() == [128, 128]
     assert swa_indices[0, -1].item() == 64 * 128 + 127
     assert swa_indices[1, -1].item() == 65 * 128
+
+
+def test_deepseek_cache_metadata_rotates_prefill_state_pages_for_decode():
+    metadata = DeepSeekV4CacheMetadataBuilder(layout=deepseek_v4_dspark_decode_layout())
+    state_blocks = list(range(100, 2150))
+
+    table = metadata.recurrent_state_block_table_from_ids(
+        [state_blocks],
+        [4100],
+        state_block_size=2,
+        max_blocks=4,
+    )
+
+    assert table.tolist() == [[2148, 2149, 2146, 2147]]
 
 
 _DEEPSEEK_TEST_COMPRESS_RATIOS = (0, 0, *([4] * 21), *([128] * 20))
