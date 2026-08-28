@@ -265,10 +265,11 @@ _DSPARK_PREFILL_FWD_TENSOR_ORDER = (
     "routed_w2", "routed_w2_scale",
     "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
     "shared_w2", "shared_w2_scale",
-    "hc_head_fn", "hc_head_scale", "hc_head_base", "final_norm_w",
-    "lm_head_weight", "hidden_out", "logits", "logit_row_indices",
     "o_proj_wo_a_full", "o_proj_wo_b_full", "attn_stage", "x_mixed",
     "post_ffn", "comb_ffn", "ffn_out",
+    "hc_head_fn", "hc_head_scale", "hc_head_base", "final_norm_w",
+    "lm_head_weight", "logit_row_indices", "hidden_workspace", "x_out",
+    "logits", "sampled_ids",
 )
 
 _PREFILL_DYNAMIC_INPUT_NAMES = frozenset(
@@ -293,7 +294,7 @@ _DSPARK_PREFILL_GROUP_DYNAMIC_NAMES = frozenset(
         "hca_cmp_slot_mapping_full", "hca_state_slot_mapping_full",
         "csa_cmp_slot_mapping_full", "csa_idx_slot_mapping_full",
         "csa_state_slot_mapping_full", "csa_inner_state_slot_mapping_full",
-        "hidden_out", "attn_stage", "x_mixed", "post_ffn", "comb_ffn",
+        "hidden_workspace", "x_out", "attn_stage", "x_mixed", "post_ffn", "comb_ffn",
     }
 )
 _DSPARK_PREFILL_LOCAL_DYNAMIC_NAMES = frozenset(
@@ -756,11 +757,18 @@ def _dspark_prefill_slot_specs(
         "csa_idx_slot_mapping_full": (torch.int64, (ranks, group_tokens), none, host),
         "csa_state_slot_mapping_full": (torch.int64, (ranks, group_tokens), none, host),
         "csa_inner_state_slot_mapping_full": (torch.int64, (ranks, group_tokens), none, host),
-        "hidden_out": (torch.bfloat16, (ranks, group_tokens, hidden), none, device),
+        "hidden_workspace": (torch.bfloat16, (ranks, group_tokens, hidden), none, device),
+        "x_out": (torch.bfloat16, (ranks, group_tokens, hidden), none, device),
         "logits": (
             torch.float32,
             (ranks, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS, vocab),
             ClearPolicy.ZERO,
+            host,
+        ),
+        "sampled_ids": (
+            torch.int32,
+            (ranks, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS, DEEPSEEK_V4_SAMPLED_IDS_PAD),
+            none,
             host,
         ),
         "logit_row_indices": (
