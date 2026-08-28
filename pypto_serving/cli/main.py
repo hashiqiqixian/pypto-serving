@@ -421,6 +421,13 @@ def _resolve_num_speculative_tokens(args: argparse.Namespace) -> int:
             raise ValueError("num_speculative_tokens must be positive")
         if method == "dspark" and configured != 7:
             raise ValueError("DeepSeek V4 DSpark requires num_speculative_tokens=7")
+        if method == "dspark" and speculative_config.get(
+            "enable_adaptive_verification", False
+        ):
+            raise ValueError(
+                "DeepSeek V4 DSpark adaptive verification requires runtime cost "
+                "profiling and is not supported yet"
+            )
         return configured
 
     legacy_enabled = bool(legacy_value)
