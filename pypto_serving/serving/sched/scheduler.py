@@ -281,10 +281,11 @@ class Scheduler:
                 continue
 
             is_prefill = request.is_prefill
-            speculative_tokens = (
-                self.config.num_speculative_tokens
-                if not is_prefill and request.temperature <= 0.0
-                else 0
+            speculative_tokens = self._speculative_tokens_for_step(
+                request,
+                is_prefill=is_prefill,
+                num_computed_tokens=request.num_computed_tokens,
+                num_new_tokens=num_new,
             )
             scheduled_tokens = num_new + speculative_tokens
             if scheduled_tokens > token_budget:
@@ -618,9 +619,27 @@ class Scheduler:
         Mirrors the accounting ``schedule()`` uses when allocating blocks: only
         greedy decode steps get speculative capacity.
         """
-        if scheduled.is_prefill or request.temperature > 0.0:
+        return self._speculative_tokens_for_step(
+            request,
+            is_prefill=scheduled.is_prefill,
+            num_computed_tokens=scheduled.num_computed_tokens,
+            num_new_tokens=scheduled.num_new_tokens,
+        )
+
+    def _speculative_tokens_for_step(
+        self,
+        request: "Request",
+        *,
+        is_prefill: bool,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+    ) -> int:
+        """Return draft positions that fit this request's remaining context."""
+        if is_prefill or request.temperature > 0.0:
             return 0
-        return self.config.num_speculative_tokens
+        step_context_len = num_computed_tokens + num_new_tokens
+        remaining_context = max(0, self.config.max_seq_len - step_context_len)
+        return min(self.config.num_speculative_tokens, remaining_context)
 
     def update_from_output(
         self,

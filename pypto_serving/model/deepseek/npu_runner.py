@@ -170,15 +170,15 @@ def build_deepseek_v4_cache_group_specs(
         if layout is None
         else int(layout.hca_state_max_blocks)
     )
-    csa_state_table_max_blocks = (
-        DEEPSEEK_V4_CSA_STATE_MAX_BLOCKS
+    prefill_csa_state_table_max_blocks = (
+        DEEPSEEK_V4_PREFILL_CSA_STATE_MAX_BLOCKS
         if layout is None
-        else int(layout.csa_state_max_blocks)
+        else int(layout.prefill_csa_state_max_blocks)
     )
-    csa_inner_state_table_max_blocks = (
-        DEEPSEEK_V4_CSA_INNER_STATE_MAX_BLOCKS
+    prefill_csa_inner_state_table_max_blocks = (
+        DEEPSEEK_V4_PREFILL_CSA_INNER_STATE_MAX_BLOCKS
         if layout is None
-        else int(layout.csa_inner_state_max_blocks)
+        else int(layout.prefill_csa_inner_state_max_blocks)
     )
     c128_state_block_size = (
         DEEPSEEK_V4_C128_STATE_BLOCK_SIZE
@@ -211,7 +211,7 @@ def build_deepseek_v4_cache_group_specs(
     )
     if cmp_history_blocks > min(cmp_table_max_blocks, idx_table_max_blocks):
         raise ValueError(
-            f"DeepSeekV4 max_seq_len={max_seq_len} needs {cmp_history_blocks} compressed "
+            f"DeepSeekV4 max_seq_len={max_seq_len} needs {cmp_history_blocks} source-token "
             f"blocks, but the compiled block tables support {cmp_table_max_blocks}"
         )
     if hca_history_blocks > cmp_table_max_blocks:
@@ -248,11 +248,15 @@ def build_deepseek_v4_cache_group_specs(
     rolling_capacities = (
         ("ori", ori_blocks_per_request, ori_table_max_blocks),
         ("hca_state", hca_state_blocks_per_request, hca_state_table_max_blocks),
-        ("csa_state", csa_state_blocks_per_request, csa_state_table_max_blocks),
+        (
+            "csa_state",
+            csa_state_blocks_per_request,
+            prefill_csa_state_table_max_blocks,
+        ),
         (
             "csa_inner_state",
             csa_state_blocks_per_request,
-            csa_inner_state_table_max_blocks,
+            prefill_csa_inner_state_table_max_blocks,
         ),
     )
     for name, required, compiled_limit in rolling_capacities:
@@ -291,11 +295,16 @@ def build_deepseek_v4_cache_group_specs(
             if compressed_output_pages and compress_ratio > 1
             else block_size // compress_ratio
         )
+        source_block_size = (
+            block_size * compress_ratio
+            if compressed_output_pages and compress_ratio > 1
+            else block_size
+        )
         return KVCacheGroupSpec(
             name=name,
             layer_indices=layers,
             spec=KVCacheSpec(
-                block_size=block_size,
+                block_size=source_block_size,
                 # One scheduler-visible block owns a page in every layer of
                 # this cache family. Keep the complete physical footprint here
                 # so all heterogeneous pools share one accurate HBM budget.
@@ -374,7 +383,7 @@ def build_deepseek_v4_cache_group_specs(
             block_size=c4_state_block_size,
             element_bytes=4,
             row_width=DEEPSEEK_V4_CSA_STATE_DIM,
-            max_blocks=csa_state_table_max_blocks,
+            max_blocks=prefill_csa_state_table_max_blocks,
             max_blocks_per_seq=csa_state_blocks_per_request,
             sliding_window=4,
         ),
@@ -384,7 +393,7 @@ def build_deepseek_v4_cache_group_specs(
             block_size=c4_state_block_size,
             element_bytes=4,
             row_width=DEEPSEEK_V4_CSA_INNER_STATE_DIM,
-            max_blocks=csa_inner_state_table_max_blocks,
+            max_blocks=prefill_csa_inner_state_table_max_blocks,
             max_blocks_per_seq=csa_state_blocks_per_request,
             sliding_window=4,
         ),
@@ -783,7 +792,7 @@ class DeepSeekV4CacheMetadataBuilder:
                 if logical_block >= len(block_ids):
                     raise ValueError(
                         f"compressed slot-mapping row {row} position {position} requires "
-                        f"logical block {logical_block}, but only {len(block_ids)} blocks "
+                        f"source block {logical_block}, but only {len(block_ids)} blocks "
                         "are allocated"
                     )
                 mapping[row, col] = (
@@ -804,6 +813,41 @@ class DeepSeekV4CacheMetadataBuilder:
             positions,
             block_size=state_block_size,
         )
+
+    @staticmethod
+    def recurrent_state_block_table_from_ids(
+        per_request_block_ids: Sequence[Sequence[int]],
+        first_positions: Sequence[int],
+        *,
+        state_block_size: int,
+        max_blocks: int,
+    ) -> torch.Tensor:
+        """Map the recurrent window before each decode chunk into its ring ABI."""
+        if state_block_size <= 0 or max_blocks <= 0:
+            raise ValueError("state_block_size and max_blocks must be positive")
+        if len(per_request_block_ids) != len(first_positions):
+            raise ValueError("block IDs and first positions must have the same row count")
+        table = torch.full(
+            (len(per_request_block_ids), max_blocks),
+            -1,
+            dtype=torch.int32,
+        )
+        state_rows = state_block_size * max_blocks
+        for row, (block_ids, first_position) in enumerate(
+            zip(per_request_block_ids, first_positions, strict=True)
+        ):
+            ids = tuple(int(block_id) for block_id in block_ids)
+            if not ids:
+                raise ValueError(f"recurrent state row {row} has no allocated blocks")
+            first_position = int(first_position)
+            if first_position < 0:
+                raise ValueError("first positions must not be negative")
+            first_history_position = max(0, first_position - state_rows + 1)
+            first_block = first_history_position // state_block_size
+            last_block = (first_position - 1) // state_block_size
+            for logical_block in range(first_block, last_block + 1):
+                table[row, logical_block % max_blocks] = ids[logical_block % len(ids)]
+        return table
 
 
 class DeepSeekV4InputBuilder:
@@ -1070,6 +1114,7 @@ class _DeepSeekV4DSparkOwner:
 
     partition: int
     rank: int
+    local_row: int
 
 
 @dataclass(frozen=True)
@@ -1082,10 +1127,10 @@ class _DeepSeekV4PendingDSparkPrefill:
 
 @dataclass
 class _DeepSeekV4DSparkRequestState:
-    """Seven draft tokens and confidence values owned by one request."""
+    """Committed sequence length and the next seven drafts for one request."""
 
+    committed_seq_len: int
     draft_token_ids: torch.Tensor | None = None
-    confidence_probs: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -1310,6 +1355,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         self._dspark_owner_lock = threading.RLock()
         self._dspark_request_owners: dict[str, _DeepSeekV4DSparkOwner] = {}
         self._dspark_owner_counts = [0] * compiled.layout.ranks
+        self._dspark_free_rows: list[list[int]] = [
+            list(range(compiled.layout.decode_batch - 1, -1, -1))
+            for _ in range(compiled.layout.ranks)
+        ]
         self._mtp_free_tail_slots: list[list[int]] = [
             list(range(compiled.layout.decode_batch - 1, -1, -1))
             for _ in range(compiled.layout.ranks)
@@ -1575,6 +1624,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                     self._dspark_owner_counts[owner.rank] -= 1
                     if self._dspark_owner_counts[owner.rank] < 0:
                         raise RuntimeError("DeepSeekV4 DSpark owner count became negative")
+                    self._dspark_free_rows[owner.rank].append(owner.local_row)
                 self._dspark_request_states.pop(request_id, None)
             with self._mtp_state_lock:
                 state = self._mtp_request_states.pop(request_id, None)
@@ -2519,6 +2569,23 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                     )
                 else:
                     rank_positions = [positions[0]] * layout.decode_batch
+                first_positions = [row[0] for row in rank_positions]
+                values["csa_compress_state_block_table"] = (
+                    self.cache_metadata.recurrent_state_block_table_from_ids(
+                        padded_group_ids["csa_state"],
+                        first_positions,
+                        state_block_size=layout.c4_state_block_size,
+                        max_blocks=layout.csa_state_max_blocks,
+                    )
+                )
+                values["csa_inner_compress_state_block_table"] = (
+                    self.cache_metadata.recurrent_state_block_table_from_ids(
+                        padded_group_ids["csa_inner_state"],
+                        first_positions,
+                        state_block_size=layout.c4_state_block_size,
+                        max_blocks=layout.csa_inner_state_max_blocks,
+                    )
+                )
                 ori_slots = self.cache_metadata.paged_decode_slot_mapping_from_ids(
                     padded_group_ids["ori"],
                     rank_positions,
@@ -2755,7 +2822,17 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         logits = torch.stack(
             tuple(logits_buffer[rank, 0] for rank in inputs.ranks),
         ).float()
-        return PrefillResult(last_hidden=None, logits=logits)
+        sampled_token_ids = None
+        if self._compiled.speculative_method == "dspark":
+            sampled_ids = self._prefill_task_args.tensors["sampled_ids"]
+            sampled_token_ids = torch.stack(
+                tuple(sampled_ids[rank, 0, 0] for rank in inputs.ranks),
+            ).to(torch.long)
+        return PrefillResult(
+            last_hidden=None,
+            logits=logits,
+            sampled_token_ids=sampled_token_ids,
+        )
 
     def finalize_prefill(
         self,
@@ -2837,40 +2914,41 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             rank // DEEPSEEK_V4_DSPARK_TP_SIZE: index
             for index, rank in enumerate(inputs.ranks)
         }
-        terminal_requests: list[tuple[str, int]] = []
+        terminal_requests: list[tuple[str, _DeepSeekV4DSparkOwner]] = []
         for partition in range(layout.cache_partitions):
             request_index = request_by_partition.get(partition)
             if request_index is None:
                 continue
             request_id = inputs.request_ids[request_index]
-            base_rank = partition * DEEPSEEK_V4_DSPARK_TP_SIZE
+            owner = self._dspark_request_owners[request_id]
             actual_tokens = int(inputs.actual_tokens[request_index])
-            anchor = int(inputs.position_ids_full[base_rank, actual_tokens - 1])
+            anchor = int(inputs.position_ids_full[owner.rank, actual_tokens - 1])
             lookahead = inputs.next_prefill_token_ids[request_index]
             sampled = sampled_token_ids.get(request_id)
             if lookahead is None and sampled is None:
                 raise RuntimeError(
                     f"terminal DSpark prefill request {request_id!r} has no sampled token"
                 )
-            for rank in range(
-                base_rank,
-                base_rank + DEEPSEEK_V4_DSPARK_TP_SIZE,
-            ):
-                anchor_positions[rank, 0] = anchor
-                if sampled is not None:
-                    num_sampled[rank, 0] = 1
-                    last_sampled[rank, 0] = sampled
-                else:
-                    next_prefill[rank, 0] = int(lookahead)
-                source_table = inputs.ori_block_table[rank]
-                block_tables[rank, :, 0, : source_table.numel()].copy_(
-                    source_table.view(1, -1).expand(
-                        DEEPSEEK_V4_DSPARK_DRAFT_LAYERS,
-                        -1,
-                    )
-                )
+            anchor_positions[owner.rank, owner.local_row] = anchor
             if sampled is not None:
-                terminal_requests.append((request_id, base_rank))
+                num_sampled[owner.rank, owner.local_row] = 1
+                last_sampled[owner.rank, owner.local_row] = sampled
+            else:
+                next_prefill[owner.rank, owner.local_row] = int(lookahead)
+            source_table = inputs.ori_block_table[owner.rank]
+            block_tables[
+                owner.rank,
+                :,
+                owner.local_row,
+                : source_table.numel(),
+            ].copy_(
+                source_table.view(1, -1).expand(
+                    DEEPSEEK_V4_DSPARK_DRAFT_LAYERS,
+                    -1,
+                )
+            )
+            if sampled is not None:
+                terminal_requests.append((request_id, owner))
 
         context_slots = inputs.ori_slot_mapping.unsqueeze(1).expand(
             -1,
@@ -2914,10 +2992,13 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._require_dspark_markov_callable(),
             *markov.build(),
         )
-        for request_id, rank in terminal_requests:
+        for request_id, owner in terminal_requests:
             self._dspark_request_states[request_id] = _DeepSeekV4DSparkRequestState(
-                draft_token_ids=markov.tensors["draft_token_ids"][rank, 0].clone(),
-                confidence_probs=markov.tensors["confidence_probs"][rank, 0].clone(),
+                draft_token_ids=markov.tensors["draft_token_ids"][
+                    owner.rank,
+                    owner.local_row,
+                ].clone(),
+                committed_seq_len=int(anchor_positions[owner.rank, owner.local_row]) + 2,
             )
 
     def run_decode(self, model, batch: DecodeBatch) -> DecodeResult:
@@ -2984,7 +3065,77 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         """Run the DSpark target-verification and seven-token proposal flow."""
         if not batch.allow_device_greedy_sampling:
             raise RuntimeError("DeepSeekV4 DSpark currently requires greedy device sampling")
+        batch = replace(batch, seq_lens=self._correct_dspark_seq_lens(batch))
+        speculative_rows = []
+        target_only_rows = []
+        for row, request_id in enumerate(batch.request_ids):
+            state = self._dspark_request_states.get(request_id)
+            if state is None:
+                raise RuntimeError(
+                    f"DeepSeekV4 DSpark state is not initialized for {request_id!r}"
+                )
+            rows = speculative_rows if state.draft_token_ids is not None else target_only_rows
+            rows.append(row)
+
+        accepted: list[list[int] | None] = [None] * len(batch.request_ids)
+        if speculative_rows:
+            speculative = self._run_dspark_speculative_decode(
+                model,
+                self._select_decode_batch_rows(batch, speculative_rows),
+            )
+            for row, tokens in zip(speculative_rows, speculative, strict=True):
+                accepted[row] = tokens
+        if target_only_rows:
+            target_only = self._run_dspark_target_only_decode(
+                model,
+                self._select_decode_batch_rows(batch, target_only_rows),
+            )
+            for row, tokens in zip(target_only_rows, target_only, strict=True):
+                accepted[row] = tokens
+        if any(tokens is None for tokens in accepted):
+            raise RuntimeError("DeepSeekV4 DSpark decode left an incomplete request result")
+        committed = [tokens for tokens in accepted if tokens is not None]
+        for request_id, tokens in zip(batch.request_ids, committed, strict=True):
+            state = self._dspark_request_states[request_id]
+            state.committed_seq_len += len(tokens)
+        return DecodeResult(
+            hidden_states=None,
+            logits=None,
+            accepted_token_ids=committed,
+        )
+
+    def _correct_dspark_seq_lens(self, batch: DecodeBatch) -> torch.Tensor:
+        """Replace optimistic scheduler lengths with committed DSpark lengths."""
+        corrected = batch.seq_lens[: len(batch.request_ids)].detach().cpu().to(torch.int32).clone()
+        for index, request_id in enumerate(batch.request_ids):
+            state = self._dspark_request_states.get(request_id)
+            if state is not None:
+                corrected[index] = state.committed_seq_len
+        return corrected
+
+    def _run_dspark_speculative_decode(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+    ) -> list[list[int]]:
+        """Verify initialized DSpark drafts and advance eligible requests."""
         actual_batch = len(batch.request_ids)
+        num_drafts = self._dspark_draft_count(model, batch)
+        if num_drafts < self._compiled.num_speculative_tokens:
+            waves = self._dspark_partial_decode_waves(batch)
+            if waves:
+                accepted: list[list[int] | None] = [None] * actual_batch
+                for wave in waves:
+                    wave_accepted = self._run_dspark_speculative_decode(
+                        model,
+                        self._select_decode_batch_rows(batch, wave),
+                    )
+                    for request_index, tokens in zip(wave, wave_accepted, strict=True):
+                        accepted[request_index] = tokens
+                if any(tokens is None for tokens in accepted):
+                    raise RuntimeError("DeepSeekV4 DSpark partial decode lost a request")
+                return [tokens for tokens in accepted if tokens is not None]
+
         drafts = []
         for request_id in batch.request_ids:
             state = self._dspark_request_states.get(request_id)
@@ -2992,7 +3143,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 raise RuntimeError(
                     f"DeepSeekV4 DSpark drafts are not initialized for {request_id!r}"
                 )
-            drafts.append(state.draft_token_ids.to(torch.long))
+            drafts.append(state.draft_token_ids[:num_drafts].to(torch.long))
         draft_rows = torch.stack(drafts)
         current = batch.token_ids.detach().cpu().to(torch.long)
         if current.ndim == 1:
@@ -3000,26 +3151,37 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         else:
             current = current[:actual_batch, :1]
         token_rows = torch.cat((current, draft_rows), dim=1)
-        if token_rows.shape[1] != self._compiled.layout.decode_seq:
-            raise RuntimeError("DSpark target verification must consume one token plus seven drafts")
+        active_width = token_rows.shape[1]
+        width = self._compiled.layout.decode_seq
+        if active_width > width:
+            raise RuntimeError("DSpark target verification exceeds the compiled decode width")
         positions = tuple(
             tuple(
                 int(batch.seq_lens[row].item()) - 1 + offset
-                for offset in range(self._compiled.layout.decode_seq)
+                for offset in range(active_width)
             )
             for row in range(actual_batch)
         )
+        if active_width < width:
+            token_rows = torch.cat(
+                (token_rows, token_rows[:, -1:].expand(-1, width - active_width)),
+                dim=1,
+            )
+            positions = tuple(
+                row + (row[-1],) * (width - active_width)
+                for row in positions
+            )
         prepared = self.prepare_mtp_target_inputs(
             model,
             batch,
             token_rows=token_rows,
             positions=positions,
-            active_width=self._compiled.layout.decode_seq,
+            active_width=active_width,
         )
         output = self._execute_main_decode(
             model,
             prepared,
-            active_seq=self._compiled.layout.decode_seq,
+            active_seq=active_width,
         )
         main_rows = []
         for rank, local_row in zip(
@@ -3031,21 +3193,101 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             main_rows.append(
                 output.sampled_ids[
                     rank,
-                    start : start + self._compiled.layout.decode_seq,
+                    start : start + active_width,
                     0,
                 ].to(torch.long)
             )
         main_token_ids = torch.stack(main_rows)
-        accepted = accept_mtp_tokens(main_token_ids, draft_rows)
+        if num_drafts:
+            accepted = accept_mtp_tokens(main_token_ids, draft_rows)
+        else:
+            accepted = [[int(token)] for token in main_token_ids[:, 0]]
+        for row, seq_len in enumerate(batch.seq_lens[:actual_batch]):
+            remaining_outputs = max(0, model.runtime.max_seq_len - int(seq_len))
+            accepted[row] = accepted[row][:remaining_outputs]
+            if not accepted[row]:
+                raise RuntimeError("DeepSeekV4 DSpark decode has no remaining output position")
         self._advance_dspark_after_decode(
             batch,
             output,
             accepted,
+            max_seq_len=model.runtime.max_seq_len,
         )
-        return DecodeResult(
-            hidden_states=None,
-            logits=None,
-            accepted_token_ids=accepted,
+        return accepted
+
+    def _run_dspark_target_only_decode(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+    ) -> list[list[int]]:
+        """Run one target token after a request can no longer fit seven drafts."""
+        actual_batch = len(batch.request_ids)
+        waves = self._dspark_partial_decode_waves(batch)
+        if waves:
+            accepted: list[list[int] | None] = [None] * actual_batch
+            for wave in waves:
+                wave_accepted = self._run_dspark_target_only_decode(
+                    model,
+                    self._select_decode_batch_rows(batch, wave),
+                )
+                for request_index, tokens in zip(wave, wave_accepted, strict=True):
+                    accepted[request_index] = tokens
+            if any(tokens is None for tokens in accepted):
+                raise RuntimeError("DeepSeekV4 DSpark target-only decode lost a request")
+            return [tokens for tokens in accepted if tokens is not None]
+
+        current = batch.token_ids.detach().cpu().to(torch.long)
+        if current.ndim == 1:
+            current = current[:actual_batch].view(actual_batch, 1)
+        else:
+            current = current[:actual_batch, :1]
+        width = self._compiled.layout.decode_seq
+        current = current.expand(-1, width).contiguous()
+        positions = tuple(
+            (int(batch.seq_lens[row].item()) - 1,) * width
+            for row in range(actual_batch)
+        )
+        prepared = self.prepare_mtp_target_inputs(
+            model,
+            batch,
+            token_rows=current,
+            positions=positions,
+            active_width=1,
+        )
+        output = self._execute_main_decode(model, prepared, active_seq=1)
+        return [
+            [int(output.sampled_ids[rank, local_row * self._compiled.layout.decode_seq, 0])]
+            for rank, local_row in zip(
+                prepared.ranks,
+                prepared.local_rows,
+                strict=True,
+            )
+        ]
+
+    def _dspark_draft_count(self, model: RuntimeModel, batch: DecodeBatch) -> int:
+        """Cap DSpark verification at the shortest remaining KV context."""
+        remaining_context = min(
+            model.runtime.max_seq_len - int(seq_len)
+            for seq_len in batch.seq_lens[: len(batch.request_ids)]
+        )
+        return min(self._compiled.num_speculative_tokens, max(0, remaining_context))
+
+    def _dspark_partial_decode_waves(
+        self,
+        batch: DecodeBatch,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Serialize partial-width requests that share one physical Query rank."""
+        assignment = self._decode_assignment(batch)
+        wave_count = max(assignment.per_rank_counts)
+        if wave_count <= 1:
+            return ()
+        return tuple(
+            tuple(
+                request_indices[wave]
+                for request_indices in assignment.indices_by_rank
+                if wave < len(request_indices)
+            )
+            for wave in range(wave_count)
         )
 
     def _advance_dspark_after_decode(
@@ -3053,6 +3295,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         batch: DecodeBatch,
         output: _DeepSeekV4MainDecodeOutput,
         accepted_token_ids: Sequence[Sequence[int]],
+        *,
+        max_seq_len: int,
     ) -> None:
         """Compact accepted target context, then propose the next DSpark block."""
         drafter = self._dspark_drafter_task_args
@@ -3068,8 +3312,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         batch_per_rank = DEEPSEEK_V4_DSPARK_DECODE_BATCH_PER_RANK
         width = int(host_target.shape[-1])
         row_bytes = width * host_target.element_size()
-        cursors = [0] * ranks
-        worker = self._shared_l3_worker()
+        advancing = []
         for request_index, (rank, local_row, accepted) in enumerate(
             zip(
                 output.inputs.ranks,
@@ -3078,6 +3321,22 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 strict=True,
             )
         ):
+            owner = self._dspark_request_owners[batch.request_ids[request_index]]
+            if owner.rank != rank:
+                raise RuntimeError("DeepSeekV4 DSpark Query owner changed during decode")
+            next_context_len = int(batch.seq_lens[request_index]) + len(accepted)
+            if next_context_len + self._compiled.num_speculative_tokens <= max_seq_len:
+                advancing.append((request_index, rank, local_row, owner.local_row, accepted))
+            else:
+                state = self._dspark_request_states[batch.request_ids[request_index]]
+                state.draft_token_ids = None
+        if not advancing:
+            self._dspark_target_hidden_arg = None
+            return
+
+        cursors = [0] * ranks
+        worker = self._shared_l3_worker()
+        for request_index, rank, local_row, _, accepted in advancing:
             count = len(accepted)
             if count <= 0 or count > layout.decode_seq:
                 raise RuntimeError(f"invalid DSpark accepted count {count}")
@@ -3141,14 +3400,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             len(batch.request_ids),
         )
         rank_cursors = [0] * ranks
-        for request_index, (rank, local_row, accepted) in enumerate(
-            zip(
-                output.inputs.ranks,
-                output.inputs.local_rows,
-                accepted_token_ids,
-                strict=True,
-            )
-        ):
+        for request_index, rank, _, draft_row, accepted in advancing:
             count = len(accepted)
             start_position = int(batch.seq_lens[request_index].item()) - 1
             positions = tuple(start_position + offset for offset in range(count))
@@ -3167,14 +3419,14 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 slots.view(1, -1).expand(DEEPSEEK_V4_DSPARK_DRAFT_LAYERS, -1)
             )
             rank_cursors[rank] += count
-            num_sampled[rank, local_row] = count
-            last_sampled[rank, local_row] = int(accepted[-1])
-            anchor_positions[rank, local_row] = start_position + count
+            num_sampled[rank, draft_row] = count
+            last_sampled[rank, draft_row] = int(accepted[-1])
+            anchor_positions[rank, draft_row] = start_position + count
             table = self.cache_metadata.ring_block_table_from_ids(
                 (block_ids,),
                 max_blocks=block_tables.shape[-1],
             )[0]
-            block_tables[rank, :, local_row].copy_(
+            block_tables[rank, :, draft_row].copy_(
                 table.view(1, -1).expand(DEEPSEEK_V4_DSPARK_DRAFT_LAYERS, -1)
             )
 
@@ -3210,20 +3462,12 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._require_dspark_markov_callable(),
             *markov.build(),
         )
-        for request_id, rank, local_row in zip(
-            batch.request_ids,
-            output.inputs.ranks,
-            output.inputs.local_rows,
-            strict=True,
-        ):
+        for request_index, rank, _, draft_row, _ in advancing:
+            request_id = batch.request_ids[request_index]
             state = self._dspark_request_states[request_id]
             state.draft_token_ids = markov.tensors["draft_token_ids"][
                 rank,
-                local_row,
-            ].clone()
-            state.confidence_probs = markov.tensors["confidence_probs"][
-                rank,
-                local_row,
+                draft_row,
             ].clone()
         self._dspark_target_hidden_arg = None
 
@@ -5105,10 +5349,14 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 "DeepSeekV4 resident MTP weights uploaded; released_parent_host_bytes=%d",
                 parent_host_bytes,
             )
-        if self._dspark_host_weights is not None and self._dspark_device_weights is None:
+        dspark_host_weights = getattr(self, "_dspark_host_weights", None)
+        if (
+            dspark_host_weights is not None
+            and getattr(self, "_dspark_device_weights", None) is None
+        ):
             parent_host_bytes = sum(
                 tensor.numel() * tensor.element_size()
-                for tensor in self._dspark_host_weights.values()
+                for tensor in dspark_host_weights.values()
             )
             with profile_span(
                 "DeepSeekV4ModelRunner.upload_resident_dspark_weights",
@@ -5116,7 +5364,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             ):
                 self._dspark_device_weights = self._upload_weight_group(
                     worker,
-                    self._dspark_host_weights,
+                    dspark_host_weights,
                 )
             self._dspark_host_weights = None
             logger.info(
@@ -5537,6 +5785,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._dspark_request_states.clear()
             self._dspark_request_owners.clear()
             self._dspark_owner_counts = [0] * self._compiled.layout.ranks
+            self._dspark_free_rows = [
+                list(range(self._compiled.layout.decode_batch - 1, -1, -1))
+                for _ in range(self._compiled.layout.ranks)
+            ]
             self._static_dspark_freqs_cos = None
             self._static_dspark_freqs_sin = None
             if self._mtp_prefill_task_args is not None:
@@ -5892,13 +6144,24 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
 
             group_base = partition * tp_size
             group_ranks = tuple(range(group_base, group_base + tp_size))
-            rank = min(group_ranks, key=lambda candidate: (self._dspark_owner_counts[candidate], candidate))
-            if self._dspark_owner_counts[rank] >= layout.decode_batch:
+            available_ranks = tuple(
+                candidate for candidate in group_ranks if self._dspark_free_rows[candidate]
+            )
+            if not available_ranks:
                 raise ValueError(
                     f"DSpark cache partition {partition} exceeds its "
                     f"{tp_size * layout.decode_batch}-request decode capacity"
                 )
-            owner = _DeepSeekV4DSparkOwner(partition=partition, rank=rank)
+            rank = min(
+                available_ranks,
+                key=lambda candidate: (self._dspark_owner_counts[candidate], candidate),
+            )
+            local_row = self._dspark_free_rows[rank].pop()
+            owner = _DeepSeekV4DSparkOwner(
+                partition=partition,
+                rank=rank,
+                local_row=local_row,
+            )
             self._dspark_request_owners[request_id] = owner
             self._dspark_owner_counts[rank] += 1
             return owner
