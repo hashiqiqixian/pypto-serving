@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import zlib
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
@@ -34,6 +35,7 @@ from pypto_serving.config.types import (
     PrefillResult,
     RuntimeConfig,
     RuntimeModel,
+    SamplingParams,
 )
 from pypto_serving.model.common.runner.buffer_set import (
     copy_shared,
@@ -448,11 +450,16 @@ def deepseek_v4_physical_cache_blocks(
 
 
 _MTP_DEVICE_STATE_TOKEN_WIDTH = 2
-_MTP_DEVICE_STATE_META_WIDTH = 4
+_MTP_DEVICE_STATE_META_WIDTH = 7
 _MTP_STATE_VALID = 0
 _MTP_STATE_GENERATION = 1
 _MTP_STATE_TAIL_POSITION = 2
 _MTP_STATE_COMMITTED_COUNT = 3
+_MTP_STATE_TEMPERATURE_MICROS = 4
+_MTP_STATE_TOP_K = 5
+_MTP_STATE_SEED = 6
+_MTP_TEMPERATURE_SCALE = 1_000_000
+_MTP_MAX_TEMPERATURE_MICROS = 2_147_483_647
 
 
 @dataclass(frozen=True)
@@ -2022,7 +2029,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         fused_mtp = self._compiled.num_speculative_tokens == 1
         if fused_mtp:
             if not batch.allow_device_greedy_sampling:
-                raise RuntimeError("DeepSeekV4 MTP decode currently requires greedy device sampling")
+                raise RuntimeError("DeepSeekV4 fused MTP decode requires device sampling")
             for request_id, rank in zip(batch.request_ids, assignment.ranks, strict=True):
                 self._reserve_mtp_request_state(request_id, rank)
         actual_batch = len(batch.request_ids)
@@ -2441,6 +2448,12 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                     staged[name][rank, local_row] = batch.seq_lens[request_index]
         if self._compiled.speculative_method == "dspark":
             self._stage_dspark_decode_rope(staged)
+        self._stage_sampling_inputs(
+            staged,
+            batch,
+            assignment=assignment,
+            positions=positions,
+        )
 
     def _stage_dspark_decode_rope(self, staged: dict[str, torch.Tensor]) -> None:
         """Materialize the documented SWA/CSA/HCA RoPE rows for one decode tile."""
@@ -2487,6 +2500,55 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             .view_as(staged["hca_cmp_freqs_sin"])
             .float()
         )
+
+    def _stage_sampling_inputs(
+        self,
+        staged: dict[str, torch.Tensor],
+        batch: DecodeBatch,
+        *,
+        assignment: _DeepSeekV4DecodeAssignment,
+        positions: tuple[tuple[int, ...], ...],
+    ) -> None:
+        """Stage per-logit-row controls for the integrated DSV4 sampler."""
+        # DSpark's target entry retains its own fixed greedy sampler ABI. The
+        # controls below belong only to the main/MTP entries added by #1065.
+        if (
+            self._compiled.speculative_method == "dspark"
+            or self._compiled.num_speculative_tokens == 1
+        ):
+            return
+        layout = self._compiled.layout
+        params = batch.sampling_params
+        if params and len(params) != len(batch.request_ids):
+            raise ValueError("decode sampling params must align with request IDs")
+        default_params = SamplingParams(temperature=0.0, top_p=1.0, top_k=None)
+
+        staged["sampling_temperatures"].zero_()
+        staged["sampling_top_ks"].fill_(DEEPSEEK_V4_VOCAB_SIZE)
+        staged["sampling_seeds"].zero_()
+        staged["sampling_positions"].zero_()
+        for rank, request_indices in enumerate(assignment.indices_by_rank):
+            for local_row, request_index in enumerate(request_indices):
+                request_params = params[request_index] if params else default_params
+                top_k = request_params.top_k
+                if top_k is None or top_k <= 0:
+                    top_k = DEEPSEEK_V4_VOCAB_SIZE
+                seed = request_params.seed
+                if seed is None:
+                    seed = zlib.crc32(batch.request_ids[request_index].encode())
+                seed = int(seed) & 0x3FFFFFFF
+                row_start = local_row * layout.decode_seq
+                row_stop = row_start + layout.decode_seq
+                staged["sampling_temperatures"][rank, row_start:row_stop].fill_(
+                    float(request_params.temperature)
+                )
+                staged["sampling_top_ks"][rank, row_start:row_stop].fill_(
+                    min(int(top_k), DEEPSEEK_V4_VOCAB_SIZE)
+                )
+                staged["sampling_seeds"][rank, row_start:row_stop].fill_(seed)
+                staged["sampling_positions"][rank, row_start:row_stop].copy_(
+                    torch.tensor(positions[request_index], dtype=torch.int32) + 1
+                )
 
     def _stage_decode_cache_metadata(
         self,
@@ -2838,6 +2900,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         self,
         request_ids: Sequence[str],
         sampled_token_ids: Sequence[int],
+        sampling_params: Sequence[SamplingParams] | None = None,
     ) -> None:
         """Publish speculative state after target-model prefill sampling."""
         if not self._compiled.num_speculative_tokens:
@@ -2876,15 +2939,27 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 self._dspark_target_hidden_arg = None
                 self._dspark_pending_prefill = None
             return
+        if sampling_params is None:
+            sampling_params = [
+                SamplingParams(temperature=0.0, top_p=1.0, top_k=None)
+                for _ in request_ids
+            ]
+        if len(request_ids) != len(sampling_params):
+            raise ValueError("MTP sampling params must align with request IDs")
         with profile_span(
             "DeepSeekV4ModelRunner.prefill.mtp_initialize",
             cat="executor",
             args={"batch_size": len(request_ids)},
         ):
-            for request_id, token_id in zip(request_ids, sampled_token_ids, strict=True):
+            for request_id, token_id, params in zip(
+                request_ids,
+                sampled_token_ids,
+                sampling_params,
+                strict=True,
+            ):
                 state = self._require_mtp_request_state(request_id)
                 if state.draft_token_id is None:
-                    self._initialize_mtp_draft(request_id, state, int(token_id))
+                    self._initialize_mtp_draft(request_id, state, int(token_id), params)
 
     def _run_dspark_prefill_context(
         self,
@@ -3049,6 +3124,22 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             inputs,
             active_seq=1,
         )
+        if batch.allow_device_greedy_sampling:
+            sampled_token_ids = torch.stack(
+                tuple(
+                    output.sampled_ids[rank, local_row, 0]
+                    for rank, local_row in zip(
+                        output.inputs.ranks,
+                        output.inputs.local_rows,
+                        strict=True,
+                    )
+                )
+            ).to(torch.int32)
+            return DecodeResult(
+                hidden_states=None,
+                logits=None,
+                sampled_token_ids=sampled_token_ids,
+            )
         logits = torch.stack(
             tuple(
                 output.logits[rank, local_row]
@@ -3685,7 +3776,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         if self._compiled.num_speculative_tokens != 1:
             raise RuntimeError("split decode dispatch requires fused DeepSeekV4 K=1 MTP")
         if not batch.allow_device_greedy_sampling:
-            raise RuntimeError("DeepSeekV4 MTP decode currently requires greedy device sampling")
+            raise RuntimeError("DeepSeekV4 fused MTP decode requires device sampling")
         if prepared is None:
             with profile_span(
                 "DeepSeekV4ModelRunner.decode.prepare_inputs_fallback",
@@ -3820,7 +3911,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
     ) -> DecodeResult:
         """Generate and verify the configured number of request-local MTP drafts."""
         if not batch.allow_device_greedy_sampling:
-            raise RuntimeError("DeepSeekV4 MTP decode currently requires greedy device sampling")
+            raise RuntimeError("DeepSeekV4 standalone MTP decode requires device sampling")
         batch = replace(batch, seq_lens=self._correct_mtp_seq_lens(batch))
         num_drafts = self._mtp_draft_count(model, batch)
         drafts = self._propose_mtp_tokens(model, batch, num_drafts=num_drafts)
@@ -4546,6 +4637,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 )
             )
             mtp_slots["logit_row_indices"].fill_(-1)
+            mtp_slots["sampling_temperatures"].zero_()
+            mtp_slots["sampling_top_ks"].fill_(DEEPSEEK_V4_VOCAB_SIZE)
+            mtp_slots["sampling_seeds"].zero_()
+            mtp_slots["sampling_positions"].zero_()
             for rank, request_index in wave_items:
                 mtp_slots["input_ids"][rank, 0] = int(token_ids[request_index])
                 mtp_slots["position_ids"][rank, 0] = int(positions[request_index])
@@ -4553,6 +4648,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                     previous_hidden[request_index]
                 )
                 mtp_slots["logit_row_indices"][rank, 0] = 0
+                mtp_slots["sampling_positions"][rank, 0] = int(positions[request_index]) + 1
             mtp_slots["hidden_states"].copy_(
                 self._embedding_rows(
                     mtp_slots["input_ids"].reshape(-1),
@@ -4717,6 +4813,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         request_id: str,
         state: _DeepSeekV4MtpRequestState,
         first_token_id: int,
+        sampling_params: SamplingParams | None = None,
     ) -> None:
         context = state.prefill_context
         if context is None:
@@ -4746,7 +4843,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         )
         state.tail_position = context.position_id
         state.prompt_len = context.prompt_len
-        self._initialize_mtp_device_state(state)
+        self._initialize_mtp_device_state(state, request_id, sampling_params)
         state.prefill_context = None
 
     def _write_mtp_tail_hidden(
@@ -4774,7 +4871,12 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             worker_id=rank,
         )
 
-    def _initialize_mtp_device_state(self, state: _DeepSeekV4MtpRequestState) -> None:
+    def _initialize_mtp_device_state(
+        self,
+        state: _DeepSeekV4MtpRequestState,
+        request_id: str,
+        sampling_params: SamplingParams | None = None,
+    ) -> None:
         """Seed one stable device slot after the first MTP draft is available."""
         if state.device_state_initialized:
             return
@@ -4800,6 +4902,19 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         meta_row[_MTP_STATE_GENERATION] = state.generation
         meta_row[_MTP_STATE_TAIL_POSITION] = state.tail_position
         meta_row[_MTP_STATE_COMMITTED_COUNT] = state.committed_count
+        params = sampling_params or SamplingParams(temperature=0.0, top_p=1.0, top_k=None)
+        top_k = params.top_k
+        if top_k is None or top_k <= 0:
+            top_k = DEEPSEEK_V4_VOCAB_SIZE
+        meta_row[_MTP_STATE_TEMPERATURE_MICROS] = min(
+            round(max(float(params.temperature), 0.0) * _MTP_TEMPERATURE_SCALE),
+            _MTP_MAX_TEMPERATURE_MICROS,
+        )
+        meta_row[_MTP_STATE_TOP_K] = min(int(top_k), DEEPSEEK_V4_VOCAB_SIZE)
+        seed = params.seed
+        if seed is None:
+            seed = zlib.crc32(request_id.encode())
+        meta_row[_MTP_STATE_SEED] = int(seed) & 0x3FFFFFFF
         worker = self._shared_l3_worker()
         for device_tensor, source in (
             (self._materialize_mtp_device_state_tokens(), token_row),

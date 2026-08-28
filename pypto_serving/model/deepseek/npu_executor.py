@@ -91,6 +91,7 @@ _DEEPSEEK_V4_IMPORT_MODULES = (
     "prefill_sparse_attn",
     "qkv_proj_rope",
     "rmsnorm",
+    "sample",
     "utils",
 )
 
@@ -250,8 +251,13 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
 
     @property
     def supports_device_sampling(self) -> bool:
-        """Enable executor-provided greedy token acceptance for MTP only."""
-        return self._num_speculative_tokens > 0
+        """Use sampled IDs emitted by the integrated decode sampler."""
+        return True
+
+    @property
+    def supports_device_stochastic_sampling(self) -> bool:
+        """Use temperature/top-k sampling for AR and fused K=1 decode."""
+        return self._num_speculative_tokens <= 1
 
     @property
     def supports_device_decode_embedding(self) -> bool:
