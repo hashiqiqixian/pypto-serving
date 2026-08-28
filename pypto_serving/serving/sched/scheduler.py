@@ -82,8 +82,9 @@ class Request:
     stop_strings: tuple[str, ...] = ()
     eos_token_id: int | None = None
     temperature: float = 0.8
-    top_p: float = 0.95
+    top_p: float = 1.0
     top_k: int | None = None
+    seed: int | None = None
     cached_block_ids: list[int] = field(default_factory=list)
     allocated_block_ids: list[int] = field(default_factory=list)
     allocated_group_block_ids: dict[str, list[int]] = field(default_factory=dict)

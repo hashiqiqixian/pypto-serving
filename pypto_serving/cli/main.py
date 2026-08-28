@@ -539,6 +539,11 @@ def _validate_generate_config_options(options: dict[str, object]) -> None:
         "temperature": ("a non-negative number", lambda v: is_number(v) and v >= 0),
         "top_p": ("a number in (0, 1]", lambda v: is_number(v) and 0 < v <= 1),
         "top_k": ("a positive int or null", lambda v: v is None or is_positive_int(v)),
+        "seed": (
+            "a non-negative int or null",
+            lambda v: v is None
+            or (isinstance(v, int) and not isinstance(v, bool) and v >= 0),
+        ),
         "stop": ("a list of strings", lambda v: isinstance(v, list) and all(isinstance(item, str) for item in v)),
         "stream": ("a boolean", lambda v: isinstance(v, bool)),
         "ignore_eos": ("a boolean", lambda v: isinstance(v, bool)),
