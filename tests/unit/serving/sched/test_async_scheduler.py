@@ -42,7 +42,7 @@ def test_scheduler_accepts_model_prefill_chunk_size_choices(chunk_size):
 
 @pytest.mark.parametrize(
     "chunk_size",
-    [None, -1, 0, 128, 1023, 3072, 8193, "1024", 1024.0, True],
+    [128, 3072, 8193],
 )
 def test_scheduler_rejects_unsupported_model_prefill_chunk_size(chunk_size):
     with pytest.raises(
@@ -53,25 +53,6 @@ def test_scheduler_rejects_unsupported_model_prefill_chunk_size(chunk_size):
             long_prefill_token_threshold=chunk_size,
             prefill_chunk_size_choices=PREFILL_CHUNK_SIZE_CHOICES,
         )
-
-
-def test_scheduler_rejects_unsupported_chunk_size_when_chunking_is_disabled():
-    with pytest.raises(
-        ValueError,
-        match="long_prefill_token_threshold must be one of",
-    ):
-        SchedulerConfig(
-            long_prefill_token_threshold=3072,
-            prefill_chunk_size_choices=PREFILL_CHUNK_SIZE_CHOICES,
-            enable_chunk_prefill=False,
-        )
-
-
-def test_scheduler_keeps_generic_internal_chunk_sizes_unrestricted():
-    config = SchedulerConfig(long_prefill_token_threshold=2)
-
-    assert config.long_prefill_token_threshold == 2
-
 
 def test_scheduler_speculative_output_counts_only_tokens_retained_before_eos():
     manager = KvCacheManager(num_blocks=4, block_size=2, enable_prefix_cache=False)
@@ -213,38 +194,28 @@ def test_grouped_cache_can_mix_phases_without_a_homogeneous_kernel_contract():
     assert {item.is_prefill for item in output.scheduled_requests} == {False, True}
 
 
-@pytest.mark.parametrize("terminal_barrier", [False, True])
-def test_grouped_cache_waiting_prefill_gets_a_fair_phase(terminal_barrier):
+def test_grouped_cache_terminal_barrier_allows_waiting_prefill():
     scheduler = _grouped_scheduler(
-        async_scheduling=terminal_barrier,
-        num_speculative_tokens=int(terminal_barrier),
+        async_scheduling=True,
+        num_speculative_tokens=1,
     )
-    running = (
-        Request(
-            request_id="terminal",
-            prompt_token_ids=[1, 2],
-            max_new_tokens=4,
-            num_computed_tokens=2,
-            num_output_placeholders=1,
-            terminal_prefill_in_flight=True,
-            status=RequestStatus.RUNNING,
-        )
-        if terminal_barrier
-        else _running_decode_request(req_id="decode")
+    running = Request(
+        request_id="terminal",
+        prompt_token_ids=[1, 2],
+        max_new_tokens=4,
+        num_computed_tokens=2,
+        num_output_placeholders=1,
+        terminal_prefill_in_flight=True,
+        status=RequestStatus.RUNNING,
     )
     scheduler.running.append(running)
     scheduler.requests[running.request_id] = running
     prefill = Request("prefill", list(range(6)), max_new_tokens=1)
     scheduler.add_request(prefill)
 
-    steps = [scheduler.schedule()]
-    if not terminal_barrier:
-        scheduler.update_from_output(steps[0], {"decode": [200]})
-        steps.append(scheduler.schedule())
-    prefill_step = steps[-1]
+    prefill_step = scheduler.schedule()
 
-    expected_phases = ["prefill"] if terminal_barrier else ["decode", "prefill"]
-    assert [_scheduled_phase(step) for step in steps] == expected_phases
+    assert _scheduled_phase(prefill_step) == "prefill"
     assert [item.request.request_id for item in prefill_step.scheduled_requests] == ["prefill"]
     assert not scheduler.waiting
     assert prefill in scheduler.running

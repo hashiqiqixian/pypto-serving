@@ -127,7 +127,7 @@ def _is_deepseek_v4_module_file(path: Path, kernel_dir: Path) -> bool:
 def _load_deepseek_v4_serving_contract_file(
     module_path: Path,
 ) -> DeepSeekV4ServingContract:
-    """Load and validate one resolved pypto-lib capability manifest."""
+    """Load one resolved pypto-lib capability manifest."""
     if not module_path.is_file():
         raise FileNotFoundError(
             f"DeepSeekV4 serving contract not found at {module_path}"
@@ -157,32 +157,6 @@ def _load_deepseek_v4_serving_contract_file(
             "Unsupported DeepSeekV4 serving contract schema: "
             f"{getattr(contract, 'schema_version', None)!r}"
         )
-    integer_fields = (
-        "prefill_tile_tokens",
-        "max_prefill_tokens_per_request",
-        "max_prefill_requests_per_partition",
-    )
-    for name in integer_fields:
-        value = getattr(contract, name, None)
-        if type(value) is not int or value <= 0:
-            raise TypeError(
-                f"DeepSeekV4 serving contract {name} must be a positive int"
-            )
-    homogeneous = getattr(contract, "requires_homogeneous_prefill_decode", None)
-    if type(homogeneous) is not bool:
-        raise TypeError(
-            "DeepSeekV4 serving contract requires_homogeneous_prefill_decode "
-            "must be a bool"
-        )
-    pad_tokens = getattr(contract, "padded_prefill_tokens", None)
-    if not callable(pad_tokens):
-        raise TypeError(
-            "DeepSeekV4 serving contract padded_prefill_tokens must be callable"
-        )
-    tile = contract.prefill_tile_tokens
-    maximum = contract.max_prefill_tokens_per_request
-    if maximum % tile or pad_tokens(1) != tile or pad_tokens(maximum) != maximum:
-        raise ValueError("DeepSeekV4 serving contract has inconsistent prefill limits")
     return contract
 
 

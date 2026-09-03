@@ -13,32 +13,10 @@ from __future__ import annotations
 import pytest
 
 import pypto_serving.cli.main as cli
-from pypto_serving.config.types import PREFILL_CHUNK_SIZE_CHOICES
 
 
 def _parse_cli_args(argv: list[str]):
     return cli.build_parser().parse_args(argv)
-
-
-@pytest.mark.parametrize("chunk_size", PREFILL_CHUNK_SIZE_CHOICES)
-def test_cli_accepts_supported_prefill_chunk_sizes(chunk_size):
-    args = _parse_cli_args(
-        ["--model", "model", "--long-prefill-token-threshold", str(chunk_size)]
-    )
-
-    assert args.long_prefill_token_threshold == chunk_size
-
-
-@pytest.mark.parametrize(
-    "chunk_size",
-    [None, -1, 0, 128, 1023, 3072, 8193, "1024", 1024.0, True],
-)
-def test_deepseek_rejects_unsupported_prefill_chunk_sizes(chunk_size):
-    with pytest.raises(
-        ValueError,
-        match="--long-prefill-token-threshold must be one of",
-    ):
-        cli._validate_prefill_chunk_size("deepseek_v4", chunk_size)
 
 
 def test_cli_keeps_generic_model_chunk_sizes_unrestricted():

@@ -98,6 +98,20 @@ class EngineConfig:
             return self.async_scheduling
         return True
 
+    def resolve_runtime_config(self) -> RuntimeConfig:
+        """Return runtime settings with executor requirements resolved."""
+        runtime = self.runtime_config or RuntimeConfig()
+        is_deepseek_v4 = self.executor_cls == "PyptoDeepSeekV4Executor"
+        homogeneous_prefill_decode = (
+            runtime.requires_homogeneous_prefill_decode or is_deepseek_v4
+        )
+        if runtime.requires_homogeneous_prefill_decode == homogeneous_prefill_decode:
+            return runtime
+        return replace(
+            runtime,
+            requires_homogeneous_prefill_decode=homogeneous_prefill_decode,
+        )
+
     def worker_device_ids(self) -> tuple[int, ...]:
         """Return the device ids this engine worker should own."""
         if self.parallel_config is not None:
@@ -162,9 +176,9 @@ class ReplicaEngineCore:
         config: EngineConfig,
         tokenizer
     ) -> None:
-        self.config = config
+        runtime = config.resolve_runtime_config()
+        self.config = replace(config, runtime_config=runtime)
         self.tokenizer = tokenizer
-        runtime = self.config.runtime_config or RuntimeConfig()
         block_size = runtime.page_size
         self._runtime = runtime
         # Block metadata is initialised lazily after the worker reports the
@@ -941,6 +955,7 @@ class AsyncLLMEngine:
         *,
         core_factory: Callable[..., ReplicaEngineCore] = ReplicaEngineCore,
     ) -> None:
+        config = replace(config, runtime_config=config.resolve_runtime_config())
         parallel = config.parallel_config
         if parallel is None:
             worker_devices = config.worker_device_ids()
