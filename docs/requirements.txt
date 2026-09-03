@@ -1,0 +1,8 @@
+# Documentation-only dependencies. Building the site must not install PyPTO
+# Serving, CANN, or this repository's runtime dependencies.
+#
+# Kept alongside the docs rather than as a pyproject extra so CI installs it with
+# a plain `pip install -r`, matching pypto's docs job.
+mkdocs>=1.6
+mkdocs-material>=9.5
+PyYAML>=6,<7

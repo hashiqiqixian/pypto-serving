@@ -1,4 +1,4 @@
-# Weight staging
+# Weight Staging
 
 How a checkpoint on disk becomes the tensors a fused kernel reads. One pipeline, two model
 families, and the parts that differ expressed as data rather than as separate code paths.
@@ -16,6 +16,8 @@ question, sharing nothing. Adding a third family meant writing a third one.
 
 ## The four stages
 
+The module paths below are relative to `pypto_serving/model/`.
+
 | Module | Owns |
 |---|---|
 | `common/weights/store.py` | reading named tensors from a safetensors checkpoint, one shard open per group of names |
@@ -25,8 +27,8 @@ question, sharing nothing. Adding a third family meant writing a third one.
 | `common/weights/stacker.py` | slab geometry: allocate once, hand each layer a view of its slice |
 | `common/weights/pipeline.py` | staging order — serial or pooled — and the per-layer release |
 
-A family supplies a rule table (`model/<family>/weight_spec.py`) and nothing else. The shared
-code never learns what a weight *means*.
+A family supplies a rule table (`pypto_serving/model/<family>/weight_spec.py`) and nothing
+else. The shared code never learns what a weight *means*.
 
 ## Rule kinds
 

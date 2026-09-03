@@ -1,0 +1,136 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+#
+# MkDocs configuration for the PyPTO Serving documentation site.
+#
+# The markdown under `docs/` is the single source of truth and must stay readable
+# directly on GitHub; this file only describes how it is rendered. The built site
+# is never committed -- CI publishes it to GitHub Pages (see .github/workflows/docs.yml).
+#
+# Build locally:
+#   pip install -r docs/requirements.txt
+#   mkdocs serve            # live preview on http://127.0.0.1:8000
+#   mkdocs build --strict   # what CI runs; warnings (broken links) fail the build
+
+site_name: PyPTO Serving
+site_description: Local inference serving with PyPTO kernels on Ascend NPUs
+site_url: https://hw-native-sys.github.io/pypto-serving/
+repo_url: https://github.com/hw-native-sys/pypto-serving
+repo_name: hw-native-sys/pypto-serving
+edit_uri: edit/main/docs/
+copyright: Copyright &copy; PyPTO Contributors
+
+docs_dir: docs
+site_dir: site
+
+# Build inputs that live under docs/ but are not content.
+exclude_docs: |
+  _hooks/
+  requirements.txt
+
+# Broken internal links must fail the build, not warn. `mkdocs build --strict`
+# promotes every warning to an error; these settings decide what counts as one.
+validation:
+  links:
+    not_found: warn
+    absolute_links: warn
+    unrecognized_links: warn
+    anchors: warn
+  nav:
+    omitted_files: warn
+    not_found: warn
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - content.code.copy
+    - content.action.edit
+    - search.suggest
+    - search.highlight
+    - toc.follow
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+# Rewrites repo-relative links that escape `docs/` (source files, examples/) into
+# GitHub blob URLs at build time. The markdown keeps working relative links for
+# readers browsing the repo, and the site gets links that resolve -- without which
+# `--strict` fails on every such reference.
+hooks:
+  - docs/_hooks/repo_links.py
+
+plugins:
+  - search
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/hw-native-sys/pypto-serving
+      name: PyPTO Serving on GitHub
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - User Guide:
+      - Getting Started:
+          - Installation: get-started/installation.md
+          - Quickstart: get-started/quickstart.md
+      - Inference and Serving:
+          - Offline Inference: user-guide/offline-inference.md
+          - Online Serving: user-guide/online-serving.md
+          - Parallelism and Scaling: user-guide/parallel.md
+          - Benchmarking: user-guide/benchmarking.md
+          - Profiling: user-guide/profile.md
+      - Models:
+          - Qwen3-14B: user-guide/qwen.md
+          - DeepSeek V4: user-guide/deepseek-v4.md
+  - CLI Reference:
+      - Overview: cli-reference/index.md
+      - pypto-serving: cli-reference/pypto-serving.md
+      - DeepSeek V4 Conversion: cli-reference/deepseek-v4-conversion.md
+      - pypto-prepack-deepseek-v4: cli-reference/pypto-prepack-deepseek-v4.md
+  - Developer Guide:
+      - Architecture: developer-guide/architecture.md
+      - Model Integration: developer-guide/model-integration.md
+      - Weight Staging: developer-guide/weight-staging.md
+      - DeepSeek V4 Runtime: developer-guide/deepseek-v4-runtime.md

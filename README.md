@@ -1,8 +1,16 @@
 # pypto-serving
 
-PyPTO Serving is a small local inference stack for running Qwen3-14B and
-DeepSeek V4 generation with PyPTO kernels on Ascend NPUs. It includes an
-installable Python package, model executor integrations and CLI entry points.
+PyPTO Serving is a small local inference stack for running Qwen3-14B and DeepSeek V4 generation with PyPTO kernels on Ascend NPUs. It includes an installable Python package, model executor integrations and CLI entry points.
+
+## Documentation
+
+The external documentation lives under [`docs/`](docs/index.md). Start with:
+
+- [Installation](docs/get-started/installation.md)
+- [Quickstart](docs/get-started/quickstart.md)
+- [Online Serving](docs/user-guide/online-serving.md)
+- [CLI Reference](docs/cli-reference/index.md)
+- [DeepSeek V4](docs/user-guide/deepseek-v4.md)
 
 ## Layout
 
@@ -23,19 +31,9 @@ tests/                         host-side unit tests and CI NPU accuracy guards
 
 ## Platform
 
-The `platform/` subtree is the first-party C++ platform-management layer for
-PyPTO Serving. It is separate from the Python model-serving path and manages
-distributed-system bootstrap, deployment metadata, channel lifecycle, module
-services, and instance lifecycle. Model support keeps ownership of LLM-specific
-behavior (batching, KV cache policy, token scheduling, sampling, execution),
-while the platform orchestrates and supervises instances without sitting in the
-per-token execution hot path.
+The `platform/` subtree is the first-party C++ platform-management layer for PyPTO Serving. It is separate from the Python model-serving path and manages distributed-system bootstrap, deployment metadata, channel lifecycle, module services, and instance lifecycle. Model support keeps ownership of LLM-specific behavior (batching, KV cache policy, token scheduling, sampling, execution), while the platform orchestrates and supervises instances without sitting in the per-token execution hot path.
 
-It is built around `serving::system::Engine`, which owns a set of
-`serving::modules::Module` instances and starts, supervises, and finalizes them
-across instances over RPC, using host-side channel primitives for control
-traffic. See [`platform/docs/README.md`](platform/docs/README.md) for the full
-design split, source layout, and runtime shape.
+It is built around `serving::system::Engine`, which owns a set of `serving::modules::Module` instances and starts, supervises, and finalizes them across instances over RPC, using host-side channel primitives for control traffic. See [`platform/docs/README.md`](platform/docs/README.md) for the full design split, source layout, and runtime shape.
 
 ## Quick Checks
 
@@ -54,8 +52,7 @@ pypto-serving --help
 
 ## NPU Generation (offline)
 
-Offline generation runs through the same engine as serving (scheduler, worker
-process, KV cache) from the `pypto-serving` CLI, without opening a port:
+Offline generation runs through the same engine as serving (scheduler, worker process, KV cache) from the `pypto-serving` CLI, without opening a port:
 
 ```bash
 pypto-serving \
@@ -71,18 +68,18 @@ DeepSeek V4 Flash W8A8 offline generation on eight devices:
 
 ```bash
 pypto-serving \
-  --model /data/models/dsv4-flash-w8a8 \
+  --model /path/to/dsv4-flash-w8a8 \
   --devices 0,1,2,3,4,5,6,7 \
   --dp 8 --ep 8 \
   --max-model-len 512 \
+  --long-prefill-token-threshold 2048 \
   --prompt 'Huawei is' \
   --generate-config '{"max_new_tokens": 20}' \
+  --no-enable-prefix-caching \
   --num-speculative-tokens 1
 ```
 
-Repeat `--prompt` for offline continuous batching. Add `--profile` to capture
-the generation window. DeepSeek V4 requires exactly eight devices with
-overlapped attention DP=8 and MoE EP=8.
+Repeat `--prompt` for offline continuous batching. Add `--profile` to capture the generation window. DeepSeek V4 requires exactly eight devices with overlapped attention DP=8 and MoE EP=8.
 
 ## HTTP Serving (OpenAI-compatible API)
 
@@ -126,16 +123,9 @@ Override them per request or with `--generate-config` when starting the server.
 
 ## Notes
 
-- All model/device/runtime options are passed via CLI arguments. Run
-  `pypto-serving --help` for the full list.
-- Parallel serving development notes live in `docs/dev/parallel.md`.
-- DeepSeek V4 checkpoint preparation and NPU serving notes live in
-  `docs/dev/model/deepseek-v4.md`.
-- Generated kernel artifacts are written under `build_output/` and are ignored
-  by git.
-- This repository expects PyPTO, CANN, torch, safetensors, transformers, and the
-  local Ascend runtime environment to be available in the active Python
-  environment.
-- `pypto-lib/` is not included in the wheel. An editable checkout discovers its
-  kernel submodule automatically; for any other installation, set `PYPTO_LIB_ROOT`
-  to the root of a `pypto-lib` checkout before loading a model.
+- All model/device/runtime options are passed via CLI arguments. Run `pypto-serving --help` for the exact arguments available in the installed package. See `docs/cli-reference/pypto-serving.md` for the documented reference.
+- Parallel serving notes live in `docs/user-guide/parallel.md`.
+- DeepSeek V4 checkpoint preparation lives in `docs/user-guide/deepseek-v4.md#checkpoint-conversion`.
+- Generated kernel artifacts are written under `build_output/` and are ignored by git.
+- This repository expects PyPTO, CANN, torch, safetensors, transformers, and the local Ascend runtime environment to be available in the active Python environment.
+- `pypto-lib/` is not included in the wheel. An editable checkout discovers its kernel submodule automatically; for any other installation, set `PYPTO_LIB_ROOT` to the root of a `pypto-lib` checkout before loading a model.

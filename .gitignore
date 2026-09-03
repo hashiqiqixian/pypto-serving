@@ -17,6 +17,9 @@ __pycache__/
 venv/
 env/
 
+# MkDocs build output
+site/
+
 # PyPTO/CANN generated artifacts
 build_output/
 outputs/
