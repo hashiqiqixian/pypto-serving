@@ -19,6 +19,32 @@ def _parse_cli_args(argv: list[str]):
     return cli.build_parser().parse_args(argv)
 
 
+def test_cli_keeps_generic_model_chunk_sizes_unrestricted():
+    args = _parse_cli_args(
+        ["--model", "model", "--long-prefill-token-threshold", "128"]
+    )
+
+    cli._validate_prefill_chunk_size("qwen", args.long_prefill_token_threshold)
+    assert args.long_prefill_token_threshold == 128
+
+
+def test_build_serving_engine_config_rejects_unsupported_deepseek_chunk_size(
+    tmp_path,
+):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type":"deepseek_v4"}')
+    args = _parse_cli_args(
+        ["--model", str(model_dir), "--long-prefill-token-threshold", "3072"]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="--long-prefill-token-threshold must be one of",
+    ):
+        cli.build_serving_engine_config(args)
+
+
 def test_build_serving_engine_config_uses_parallel_config_for_devices(tmp_path):
     model_dir = tmp_path / "model"
     model_dir.mkdir()

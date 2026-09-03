@@ -98,6 +98,20 @@ class EngineConfig:
             return self.async_scheduling
         return True
 
+    def resolve_runtime_config(self) -> RuntimeConfig:
+        """Return runtime settings with executor requirements resolved."""
+        runtime = self.runtime_config or RuntimeConfig()
+        is_deepseek_v4 = self.executor_cls == "PyptoDeepSeekV4Executor"
+        homogeneous_prefill_decode = (
+            runtime.requires_homogeneous_prefill_decode or is_deepseek_v4
+        )
+        if runtime.requires_homogeneous_prefill_decode == homogeneous_prefill_decode:
+            return runtime
+        return replace(
+            runtime,
+            requires_homogeneous_prefill_decode=homogeneous_prefill_decode,
+        )
+
     def worker_device_ids(self) -> tuple[int, ...]:
         """Return the device ids this engine worker should own."""
         if self.parallel_config is not None:
@@ -162,9 +176,9 @@ class ReplicaEngineCore:
         config: EngineConfig,
         tokenizer
     ) -> None:
-        self.config = config
+        runtime = config.resolve_runtime_config()
+        self.config = replace(config, runtime_config=runtime)
         self.tokenizer = tokenizer
-        runtime = self.config.runtime_config or RuntimeConfig()
         block_size = runtime.page_size
         self._runtime = runtime
         # Block metadata is initialised lazily after the worker reports the
@@ -190,12 +204,16 @@ class ReplicaEngineCore:
             max_num_scheduled_tokens=self.config.max_num_scheduled_tokens,
             long_prefill_token_threshold=self.config.long_prefill_token_threshold,
             max_prefill_tokens_per_request=runtime.max_prefill_tokens_per_request,
+            prefill_chunk_size_choices=runtime.prefill_chunk_size_choices,
             max_seq_len=runtime.max_seq_len,
             enable_prefix_cache=self.config.enable_prefix_cache,
             enable_chunk_prefill=self.config.enable_chunk_prefill,
             num_speculative_tokens=runtime.num_speculative_tokens,
             supports_chunked_prefill_with_speculation=(
                 runtime.supports_chunked_prefill_with_speculation
+            ),
+            requires_homogeneous_prefill_decode=(
+                runtime.requires_homogeneous_prefill_decode
             ),
             async_scheduling=self._async_scheduling,
         )
@@ -937,6 +955,7 @@ class AsyncLLMEngine:
         *,
         core_factory: Callable[..., ReplicaEngineCore] = ReplicaEngineCore,
     ) -> None:
+        config = replace(config, runtime_config=config.resolve_runtime_config())
         parallel = config.parallel_config
         if parallel is None:
             worker_devices = config.worker_device_ids()

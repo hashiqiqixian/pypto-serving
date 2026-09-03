@@ -53,9 +53,9 @@ class MtpAccuracyCase:
 
 
 # K=1 uses EAGLE look-ahead, so a reusable 128-token prefix needs another
-# complete page after it. Repeating a common single-token fragment keeps the
-# prompt comfortably above that boundary and below the 1024-token test limit.
-PREFIX_PROMPT = " and" * 300 + " Huawei is"
+# complete page after it. Repeating a common single-token fragment also keeps
+# this case above one 1024-token serving chunk and below the 2048-token limit.
+PREFIX_PROMPT = " and" * 1200 + " Huawei is"
 
 # The K=1 target model has a near-tied argmax after " a leading global"
 # ("provider" vs "information"), and the accepted NPU kernel nondeterminism
@@ -169,10 +169,9 @@ def _server_command(
     num_speculative_tokens: int,
     enable_prefix_caching: bool = False,
 ) -> list[str]:
-    # Keep these serving options aligned with docs/user-guide/deepseek-v4.md.
     # CI substitutes only the checkpoint, task-submit devices, and free port.
-    # The ring sizing (per-dispatch RunConfig) is what this matrix was tuned
-    # for under the old PTO2_RING_* envs.
+    # Scalar ring values are broadcast to all four levels, prewarming the same
+    # 4 GiB arena used by later dispatches.
     return [
         sys.executable,
         "-m",
@@ -194,24 +193,24 @@ def _server_command(
         "--block-size",
         "128",
         "--max-model-len",
-        "1024" if enable_prefix_caching else "260",
+        "2048" if enable_prefix_caching else "260",
         "--max-num-seqs",
         "8",
         "--max-num-batched-tokens",
-        "512",
+        "1024",
         "--npu-memory-utilization",
         "0.90",
         "--long-prefill-token-threshold",
-        "128",
+        "1024",
         "--num-speculative-tokens",
         str(num_speculative_tokens),
         "--enable-prefix-caching" if enable_prefix_caching else "--no-enable-prefix-caching",
         "--ring-dep-pool",
-        "131072",
+        "16384",
         "--ring-task-window",
-        "131072",
+        "16384",
         "--ring-heap",
-        "2147483648",
+        "1073741824",
         "--port",
         str(port),
         "--show-startup-logs",
@@ -544,7 +543,7 @@ def test_deepseek_v4_http_completion_matches_expected_text(
 
                 if enable_prefix_caching:
                     prompt_tokens = responses[0].get("usage", {}).get("prompt_tokens", 0)
-                    assert prompt_tokens > 2 * 128
+                    assert prompt_tokens > 1024
                     # The target model's near-tie makes run-to-run text
                     # equality unattainable; cache corruption is guarded by
                     # pinning the set of known-valid continuations.
@@ -607,6 +606,10 @@ def test_server_command_uses_explicit_mtp_depth_and_serving_capacity(tmp_path) -
     assert "--enable-mtp" not in command
     assert command[command.index("--num-speculative-tokens") + 1] == "3"
     assert command[command.index("--max-num-seqs") + 1] == "8"
+    assert command[command.index("--long-prefill-token-threshold") + 1] == "1024"
+    assert command[command.index("--ring-dep-pool") + 1] == "16384"
+    assert command[command.index("--ring-task-window") + 1] == "16384"
+    assert command[command.index("--ring-heap") + 1] == "1073741824"
 
 
 def test_mtp_matrix_covers_fused_and_standalone_shapes() -> None:

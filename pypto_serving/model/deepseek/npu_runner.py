@@ -15,7 +15,7 @@ import threading
 import zlib
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from pypto_serving.model.common.runner.task_args import TaskArgs
@@ -56,6 +56,20 @@ from pypto_serving.tools.profile import profile_span
 logger = logging.getLogger(__name__)
 
 
+class DeepSeekV4ServingContract(Protocol):
+    """Serving-visible constraints exported by the pypto-lib kernels."""
+
+    schema_version: str
+    prefill_tile_tokens: int
+    max_prefill_tokens_per_request: int
+    max_prefill_requests_per_partition: int
+    requires_homogeneous_prefill_decode: bool
+
+    def padded_prefill_tokens(self, active_tokens: int) -> int:
+        """Return the kernel extent for one active prefill request."""
+        ...
+
+
 DEEPSEEK_V4_RANKS = 8
 DEEPSEEK_V4_HC_MULT = 4
 DEEPSEEK_V4_VOCAB_SIZE = 129280
@@ -76,7 +90,6 @@ DEEPSEEK_V4_PREFILL_SEQ = 128
 # used by vLLM's SlidingWindowSpec.
 DEEPSEEK_V4_MAX_IN_FLIGHT_PREFILL_TOKENS = 2 * DEEPSEEK_V4_PREFILL_SEQ
 DEEPSEEK_V4_MAX_SEQ_LEN = 16384
-DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS = 8192
 # Prefill and decode share scheduler-owned rank-local physical pools. Group
 # block IDs are local to each DP rank and address worker-resident cache shards.
 DEEPSEEK_V4_PREFILL_ORI_MAX_BLOCKS = 128
@@ -785,6 +798,7 @@ class DeepSeekV4CompiledKernels:
     compress_ratios: tuple[int, ...]
     layer_plan: tuple["DeepSeekV4LayerPlan", ...]
     kernel_dir: str
+    kernel_contract: DeepSeekV4ServingContract
     prepacked_layer_weights: DeepSeekV4StackedLayerWeights | None = None
     runtime_model: RuntimeModel | None = None
     prefill: DeepSeekV4L3Callable | None = None
@@ -1113,6 +1127,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         self._mtp_decode_task_args: list[TaskArgs] = []
         self._mtp_request_states: dict[str, _DeepSeekV4MtpRequestState] = {}
         self._mtp_state_lock = threading.RLock()
+        self._pending_mtp_dispatch_lock = threading.Lock()
+        self._pending_mtp_dispatches: dict[int, PendingL3Dispatch] = {}
         self._mtp_free_tail_slots: list[list[int]] = [
             list(range(compiled.layout.decode_batch - 1, -1, -1))
             for _ in range(compiled.layout.ranks)
@@ -1226,28 +1242,13 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         device_ids = self._compiled.device_ids or (self._compiled.device_id,)
         worker = self._shared_l3_worker()
         utilization = float(getattr(runtime, "npu_memory_utilization", 0.90))
-        # Ring sizing rides the per-dispatch RunConfig (see _configure_l3_rings),
-        # so the 4 x ring_heap pool is first materialized on the first L3
-        # dispatch — AFTER this sizing, which therefore cannot see it in
-        # peak_non_kv. Charge it against the budget explicitly, or the pool
-        # lands in the (1 - utilization) headroom at first prefill and the
-        # rtMalloc fails (4 x 2 GiB far exceeds ~6.5 GB of headroom on a
-        # 65 GB card). The old process-wide PTO2_RING_HEAP env never had this
-        # problem: it materialized the rings at worker creation, before sizing.
-        ring_heap = getattr(runtime, "ring_heap", None)
-        if ring_heap is None:
-            pending_ring_bytes = 0
-        elif isinstance(ring_heap, (list, tuple)):
-            pending_ring_bytes = sum(int(value) for value in ring_heap)
-        else:
-            pending_ring_bytes = int(ring_heap) * 4
         budgets = []
         memory_rows = []
         for worker_id in range(self._compiled.layout.ranks):
             free_bytes, total_bytes = worker.device_memory_info(worker_id)
             device_id = device_ids[worker_id] if worker_id < len(device_ids) else worker_id
             peak_non_kv = int(total_bytes) - int(free_bytes)
-            budget = int(int(total_bytes) * utilization - peak_non_kv - pending_ring_bytes)
+            budget = int(int(total_bytes) * utilization - peak_non_kv)
             budgets.append(budget)
             memory_rows.append((int(device_id), int(free_bytes), int(total_bytes), budget))
 
@@ -1282,7 +1283,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             raise RuntimeError(
                 "DeepSeekV4 KV cache cannot fit one capacity slot within "
                 f"npu_memory_utilization={utilization:.2f} on npu:{device_id}: "
-                f"post-weight budget={budget} bytes, requires at least "
+                f"post-resident budget={budget} bytes, requires at least "
                 f"{minimum_bytes} bytes ({scratch_bytes} scratch + "
                 f"{bytes_per_slot} one slot); total={total_bytes} bytes, "
                 f"free={free_bytes} bytes"
@@ -1290,17 +1291,16 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         capacity_slots = (kv_budget - scratch_bytes) // bytes_per_slot
         logger.info(
             "DeepSeekV4 KV cache sizing: utilization=%.2f, limiting_budget=%.2f GB, "
-            "pending_rings=%.2f GB, slot=%.1f MB, scratch=%.1f MB, requested_slots=%d",
+            "slot=%.1f MB, scratch=%.1f MB, requested_slots=%d",
             utilization,
             kv_budget / 1e9,
-            pending_ring_bytes / 1e9,
             bytes_per_slot / 1e6,
             scratch_bytes / 1e6,
             capacity_slots,
         )
         for device_id, free_bytes, total_bytes, budget in memory_rows:
             logger.info(
-                "  npu:%d total=%.2f GB free=%.2f GB post-weight KV budget=%.2f GB",
+                "  npu:%d total=%.2f GB free=%.2f GB post-resident KV budget=%.2f GB",
                 device_id,
                 total_bytes / 1e9,
                 free_bytes / 1e9,
@@ -1438,9 +1438,79 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             n_routed_experts=self._compiled.n_routed_experts,
         )
 
+    @staticmethod
+    def _validate_prefill_batch_metadata(batch: PrefillBatch, request_count: int) -> None:
+        """Validate the packed-token metadata consumed by DeepSeek prefill."""
+        metadata = (
+            ("seq_lens", batch.seq_lens),
+            ("chunk_lens", batch.chunk_lens),
+            ("chunk_offsets", batch.chunk_offsets),
+            ("chunk_starts", batch.chunk_starts),
+        )
+        for name, values in metadata:
+            if len(values) != request_count:
+                raise ValueError(
+                    f"DeepSeekV4 prefill {name} has {len(values)} entries for "
+                    f"{request_count} requests"
+                )
+
+        packed_tokens = 0
+        for index in range(request_count):
+            seq_len = int(batch.seq_lens[index])
+            chunk_len = int(batch.chunk_lens[index])
+            chunk_offset = int(batch.chunk_offsets[index])
+            chunk_start = int(batch.chunk_starts[index])
+            if chunk_len <= 0:
+                raise ValueError(
+                    f"DeepSeekV4 prefill chunk_lens[{index}] must be positive, got {chunk_len}"
+                )
+            if seq_len < 0:
+                raise ValueError(
+                    f"DeepSeekV4 prefill seq_lens[{index}] must be non-negative, got {seq_len}"
+                )
+            if chunk_start < 0:
+                raise ValueError(
+                    f"DeepSeekV4 prefill chunk_starts[{index}] must be non-negative, got {chunk_start}"
+                )
+            expected_seq_len = chunk_start + chunk_len
+            if seq_len != expected_seq_len:
+                raise ValueError(
+                    f"DeepSeekV4 prefill seq_lens[{index}]={seq_len} must equal "
+                    f"chunk_starts[{index}]={chunk_start} + chunk_lens[{index}]={chunk_len}"
+                )
+            if chunk_offset != packed_tokens:
+                raise ValueError(
+                    f"DeepSeekV4 prefill chunk_offsets[{index}]={chunk_offset} must equal "
+                    f"packed token offset {packed_tokens}"
+                )
+            packed_tokens += chunk_len
+
+        if batch.token_ids.ndim != 1:
+            raise ValueError(
+                "DeepSeekV4 prefill token_ids must be 1-D packed, "
+                f"got shape={tuple(batch.token_ids.shape)}"
+            )
+        token_extent = int(batch.token_ids.shape[0])
+        if token_extent != packed_tokens:
+            raise ValueError(
+                f"DeepSeekV4 prefill token_ids contains {token_extent} packed tokens, "
+                f"expected {packed_tokens} from chunk_lens"
+            )
+        if batch.input_embeddings is not None:
+            if batch.input_embeddings.ndim != 2:
+                raise ValueError(
+                    "DeepSeekV4 prefill input_embeddings must have shape [tokens, hidden], "
+                    f"got shape={tuple(batch.input_embeddings.shape)}"
+                )
+            embedding_extent = int(batch.input_embeddings.shape[0])
+            if embedding_extent != packed_tokens:
+                raise ValueError(
+                    f"DeepSeekV4 prefill input_embeddings contains {embedding_extent} packed rows, "
+                    f"expected {packed_tokens} from chunk_lens"
+                )
+
     def prepare_prefill_inputs(self, model: RuntimeModel, batch: PrefillBatch) -> DeepSeekV4PreparedPrefillInputs:
         """Build DeepSeekV4 prefill host inputs for the current scheduler chunk."""
-        builder = self._require_input_builder()
         layout = self._compiled.layout
         request_count = len(batch.request_ids)
         if request_count <= 0 or request_count > layout.ranks * layout.prefill_batch:
@@ -1448,6 +1518,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 "DeepSeekV4 prefill supports one local request per rank and "
                 f"at most {layout.ranks} global requests, got {request_count}"
             )
+        self._validate_prefill_batch_metadata(batch, request_count)
+        builder = self._require_input_builder()
         if len(batch.cache_partitions) != request_count:
             raise ValueError("DeepSeekV4 prefill requires one cache partition per request")
         ranks = tuple(int(rank) for rank in batch.cache_partitions)
@@ -2285,10 +2357,58 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
     def _free_kv_cache_tensor(self, tensor: DeviceTensor) -> None:
         return None
 
+    def _track_pending_mtp_dispatch(
+        self,
+        buffer_slot: int,
+        dispatch: PendingL3Dispatch,
+    ) -> None:
+        """Keep a fused dispatch visible until reclaim or a prefill barrier."""
+        with self._pending_mtp_dispatch_lock:
+            if buffer_slot in self._pending_mtp_dispatches:
+                raise RuntimeError(
+                    f"DeepSeekV4 MTP decode buffer slot {buffer_slot} was reused before completion"
+                )
+            self._pending_mtp_dispatches[buffer_slot] = dispatch
+
+    def _forget_pending_mtp_dispatch(
+        self,
+        buffer_slot: int,
+        dispatch: PendingL3Dispatch,
+    ) -> None:
+        """Drop a completed dispatch without removing a newer slot owner."""
+        with self._pending_mtp_dispatch_lock:
+            if self._pending_mtp_dispatches.get(buffer_slot) is dispatch:
+                del self._pending_mtp_dispatches[buffer_slot]
+
+    def _wait_for_pending_mtp_dispatches(self) -> None:
+        """Fence shared prefill staging behind earlier fused decode work."""
+        with self._pending_mtp_dispatch_lock:
+            pending = tuple(sorted(self._pending_mtp_dispatches.items()))
+        if not pending:
+            return
+
+        first_error: BaseException | None = None
+        with profile_span(
+            "DeepSeekV4ModelRunner.prefill.wait_pending_decode",
+            cat="executor",
+            args={"buffer_slots": [buffer_slot for buffer_slot, _ in pending]},
+        ):
+            for buffer_slot, dispatch in pending:
+                try:
+                    dispatch.wait()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                finally:
+                    self._forget_pending_mtp_dispatch(buffer_slot, dispatch)
+        if first_error is not None:
+            raise first_error
+
     def run_prefill(self, model, batch: PrefillBatch) -> PrefillResult:
         """Run all DeepSeekV4 hidden layers for one prefill chunk in a single packed call."""
         if self._compiled.prefill is None:
             raise RuntimeError("DeepSeekV4 kernels were not compiled for this runner")
+        self._wait_for_pending_mtp_dispatches()
         with profile_span("DeepSeekV4ModelRunner.prefill.prepare", cat="executor"):
             with profile_span("DeepSeekV4ModelRunner.prefill.ensure_l3_shared_buffers", cat="executor"):
                 self._ensure_l3_shared_buffers(model)
@@ -2704,6 +2824,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 "DeepSeekV4 fused main/MTP decode dispatch failed "
                 f"(actual_batch={inputs.actual_batch}, ranks={inputs.ranks})"
             ) from exc
+        self._track_pending_mtp_dispatch(inputs.buffer_slot, dispatch)
         ta = self._decode_task_args[inputs.buffer_slot]
         mtp_ta = self._mtp_decode_task_args[inputs.buffer_slot]
         mtp = mtp_ta.tensors
@@ -2718,7 +2839,13 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
 
     def _reclaim_mtp_decode(self, pending: _DeepSeekV4PendingMtpDecode) -> DecodeResult:
         """Convert one completed output slot into scheduler-visible tokens."""
-        pending.dispatch.wait()
+        try:
+            pending.dispatch.wait()
+        finally:
+            self._forget_pending_mtp_dispatch(
+                pending.inputs.buffer_slot,
+                pending.dispatch,
+            )
         inputs = pending.inputs
         layout = self._compiled.layout
         decode_seq = layout.decode_seq
@@ -4207,12 +4334,16 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 cat="executor",
                 args={"callable_count": len(compiled)},
             ):
-                worker = DistributedWorker(
-                    compiled,
-                    persistent=True,
-                    reset_persistent_windows=False,
-                    inherited_host_tensors=self._inherited_host_weights(),
-                )
+                worker_kwargs: dict[str, Any] = {
+                    "persistent": True,
+                    "reset_persistent_windows": False,
+                    "inherited_host_tensors": self._inherited_host_weights(),
+                }
+                run_config = getattr(self, "_l3_run_config", None)
+                if run_config is not None:
+                    # Materialize the full ring arena before KV sizing reads free HBM.
+                    worker_kwargs["config"] = run_config
+                worker = DistributedWorker(compiled, **worker_kwargs)
             self._l3_worker = worker
         return worker
 
@@ -4553,6 +4684,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._mtp_device_kv_cache = None
             self._main_pre_hc_host_mirror = None
             self._mtp_request_states.clear()
+            with self._pending_mtp_dispatch_lock:
+                self._pending_mtp_dispatches.clear()
             self._l3_static_tensors.clear()
             for task_args in self._decode_task_args:
                 task_args.close()
@@ -4614,7 +4747,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
 
     def _prefill_active_token_limit(self, runtime: RuntimeConfig | None) -> int:
         """Return the configured active-token limit for one main-prefill call."""
-        limits = [DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS]
+        limits = [int(self._compiled.kernel_contract.max_prefill_tokens_per_request)]
         if runtime is not None:
             limits.append(int(runtime.max_num_batched_tokens))
             limits.append(int(runtime.max_seq_len))
@@ -4649,14 +4782,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 f"DeepSeekV4 {mode} prefill received {actual_tokens} active tokens; "
                 f"the configured single-request limit is {active_limit}"
             )
-        tile_tokens = self._compiled.layout.prefill_seq
-        kernel_tokens = ((int(actual_tokens) + tile_tokens - 1) // tile_tokens) * tile_tokens
-        if kernel_tokens > DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS:
-            raise ValueError(
-                f"DeepSeekV4 main prefill kernel supports at most "
-                f"{DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS} rows, got {kernel_tokens}"
-            )
-        return kernel_tokens
+        return int(self._compiled.kernel_contract.padded_prefill_tokens(actual_tokens))
 
     @staticmethod
     def _prefill_kernel_positions(
