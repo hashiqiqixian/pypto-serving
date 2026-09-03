@@ -472,12 +472,6 @@ def test_deepseek_v4_http_completion_matches_expected_text(
     tmp_path: Path,
     case: MtpAccuracyCase,
 ) -> None:
-    if (
-        os.environ.get("PYPTO_DSV4_SKIP_STANDALONE_MTP") == "1"
-        and case.num_speculative_tokens > 1
-    ):
-        pytest.skip("standalone MTP decode is temporarily disabled in NPU CI")
-
     model_dir_env = os.environ.get("PYPTO_DSV4_MODEL_DIR")
     model_dir = Path(model_dir_env) if model_dir_env else None
     if model_dir is None or not model_dir.is_dir():
