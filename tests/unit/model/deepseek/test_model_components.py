@@ -2203,7 +2203,7 @@ def test_deepseek_prepare_decode_inputs_rebuilds_slot_metadata():
 
     first = prepare(128, _grouped_cache_rows(1))
     first_ring_table_calls = counting_metadata.ring_table_calls
-    assert first_ring_table_calls == 3 * runner._compiled.layout.ranks
+    assert first_ring_table_calls == 3
     assert first.block_table.is_shared()
 
     second = prepare(129, _grouped_cache_rows(1))
