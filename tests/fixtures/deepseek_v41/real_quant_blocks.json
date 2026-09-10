@@ -1,0 +1,66 @@
+{
+  "model_id": "deepseek-ai/DeepSeek-V4.1-Flash",
+  "revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+  "shard": "model-00003-of-00048.safetensors",
+  "header_sha256": "71213f444f9c15a4af6dbcbddc36f7611542884ebb3aadef54de650071357449",
+  "cases": [
+    {
+      "format": "fp8_dense",
+      "tensor": "layers.0.attn.wq_a",
+      "logical_shape": [
+        1,
+        32
+      ],
+      "slice": "row 0, columns [0,32)",
+      "buffers": {
+        "weight": {
+          "hex": "71e76aeced71e959f0e2e4ee5f6d604f566e70dae6e95d62ededec606c6064ee",
+          "sha256": "3fd3d9c18aff49093b68ba9498cfb716f60958326b14b391293cc51aa03c8a0c",
+          "file_byte_range": [
+            511100472,
+            511100503
+          ],
+          "storage_dtype": "F8_E4M3"
+        },
+        "scale": {
+          "hex": "73",
+          "sha256": "043a718774c572bd8a25adbeb1bfcd5c0256ae11cecf9f9c3f925d0e52beaf89",
+          "file_byte_range": [
+            8226360,
+            8226360
+          ],
+          "storage_dtype": "F8_E8M0"
+        }
+      }
+    },
+    {
+      "format": "fp4_expert",
+      "tensor": "layers.0.ffn.experts.0.w1",
+      "logical_shape": [
+        1,
+        32
+      ],
+      "slice": "row 0, columns [0,32)",
+      "buffers": {
+        "weight": {
+          "hex": "a0a8ec4aadaf42aacc82256ffa054544",
+          "sha256": "71c5de051c4951346501c152bc2b44783899e3a68c67ca55f06bec5e7b027c34",
+          "file_byte_range": [
+            594986552,
+            594986567
+          ],
+          "storage_dtype": "I8"
+        },
+        "scale": {
+          "hex": "78",
+          "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+          "file_byte_range": [
+            8273720,
+            8273720
+          ],
+          "storage_dtype": "F8_E8M0"
+        }
+      }
+    }
+  ]
+}
