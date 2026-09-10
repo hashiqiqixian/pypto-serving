@@ -145,6 +145,22 @@ a test input without `local_rows` (86 passed, 1 failed before maxfail stopped it
 That revision differs from the selected local base `4afc60e`; use the captured
 baseline/after logs for comparisons. No V4 full-checkpoint test was run.
 
+The reviewed implementation was committed and CPU-tested as `eb00bfd`:
+
+| Check | Actual result |
+| --- | --- |
+| Local isolated tests, Python 3.12 | 116 PASS; one module SKIPPED because Torch is absent |
+| Remote isolated tests, Python 3.10.9 / Torch 2.10.0+cpu | 121 PASS, including five real-block fixture/numeric checks |
+| V4 baseline at `4afc60e` | 121 PASS, 1 FAIL |
+| V4 after at `eb00bfd` | 121 PASS, same 1 FAIL |
+| Ruff check/format, headers, diff whitespace | PASS |
+
+The matched baseline/after failure is
+`test_deepseek_mtp_prefill_reads_only_selected_owner_outputs`: its `FakeWorker.copy_from`
+does not accept `src_offset`. No new failures appeared in this bounded V4 CPU suite.
+This is not evidence of full-checkpoint or device non-regression. Logs are
+`v41-tests.log`, `v4-baseline.log`, and `v4-after.log` in the artifact directory.
+
 No working V4.1 build, weight upload, serving start, token golden, or S1 benchmark
 command exists in this patch. Supplying a V4 command with a V4.1 checkpoint would
 misrepresent its support.
