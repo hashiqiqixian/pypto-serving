@@ -204,3 +204,53 @@ collectives, HTTP model inference, long-context capacity, peak device-wide HBM
 and the formal M0/P0 acceptance remain unverified until weights and A5 hardware
 are available. Performance measurements must use matched workloads on the same
 machine; none is inferred from CPU unit tests.
+
+## Validation snapshot and plan position
+
+On 2026-09-11, implementation revision `9a73a7a` passed the bounded V4.1 CPU
+suite: **530 passed, 2 skipped** in 74.55 seconds. The skipped tests required
+optional downloaded references. Both were subsequently run separately: the
+official ViT tensor comparison passed on the CPU validation host, and the full
+draft checkpoint metadata comparison passed locally. Neither test uses complete
+real model weights. The ViT oracle uses the pinned source with SHA256
+`5d49edc196a4ef22384abe76d35a40098cbe1e74b586c8f66a2edff4f076b26c`.
+
+The CPU environment was Python 3.10.9, Torch 2.10.0+cpu, safetensors 0.8.0 and
+PyPTO revision `c9af90508b674f1a568bba3f293051d3c2ef5823`, with one Torch/BLAS
+thread. The two PyPTO tests generated actual A5 PTO containing BF16 Cube
+operations and FP32 accumulators; assembler and device execution were disabled.
+The two-rank Gloo tests exercise transport, collectives and mirrored transactions,
+not complete-model TP/EP numerical agreement. The Windows dependency-limited
+suite passed 293 tests with 14 skips before the final test-context correction.
+
+Shared CLI, tokenizer, V4 model-component and serving tests at `1d05f99` reported
+225 passed and two failures. Both failures reproduced at baseline `290213a`:
+`test_deepseek_mtp_prefill_reads_only_selected_owner_outputs` has a test worker
+without the `src_offset` argument, and
+`test_worker_releases_preempted_state_before_same_command_reregistration` creates
+a worker without its sampler. Revision `9a73a7a` only corrects a V4.1 test's
+inference-mode mutation context; shared production code is identical. These
+baseline failures remain unresolved and are not reported as passing regression.
+
+| Plan step | Code and CPU evidence | Required acceptance still pending |
+|---|---|---|
+| P0-1 | Independent config, checkpoint contracts, sliced loading and quantized arithmetic tested | Real checkpoint layer load/pack/upload and A5 tensor goldens |
+| P0-2 | Backbone, CSA2, MoE, Engram and packed cache arithmetic tested with miniature weights | Real model short-token goldens, A5 TP/EP and 8K prefill/decode |
+| Minimum serving / P0-3 | Existing request pipeline, streaming, lifecycle and recovery integrated and tested | Real-weight A5 HTTP requests and deterministic reference agreement |
+| M0 | NOT_RUN / BLOCKED by unavailable A5 and complete checkpoint | All five model/device acceptance items below |
+| P1 | DSpark, Engram, vision and HTTP measurement code implemented | Real-weight goldens, accelerated speculation, prefix reuse, capacity and performance measurements |
+
+The five M0 items remain NOT_RUN: complete real-checkpoint inference; target
+multi-rank 8K prefill and single-token decode; 64-to-128-token golden plus
+continuous real-model HTTP requests; a matching device artifact including peak
+HBM; and S1 smoke with 8K input, 128 output and concurrency one. CPU codegen and
+test artifacts do not replace any of these. P0 and the final project are not
+accepted as complete.
+
+The next device step is one real checkpoint layer with captured intermediate
+tensors, followed by short-model logits, 8K chunk prefill and the M0 HTTP/S1
+workload. Start with ordinary greedy decode and private pages. Prefix sharing,
+native low-precision optimization and performance tuning remain separate work.
+Local evidence is retained under `artifacts/deepseek-v41-implementation/`:
+`progress.json`, `cpu-9a73a7a.log`, `official-vision-9a73a7a.log`,
+`shared-1d05f99.log` and `baseline-two-failures-290213a.log`.
