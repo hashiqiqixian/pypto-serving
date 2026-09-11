@@ -33,6 +33,21 @@ def load(name):
 dspark, engram = load("dspark"), load("engram")
 
 
+@pytest.mark.parametrize("scores,capacity,floor,count", [
+    ([3., -2., 9.], 3, None, 3), ([3., -2., 9.], 3, 0., 1),
+    ([-1., 9.], 2, 0., 0), ([1., 1.], 1, 1., 1), ([], 0, None, 0),
+])
+def test_explicit_confidence_scheduling(scores, capacity, floor, count):
+    assert dspark.choose_verification_count(scores, capacity, floor) == count
+
+
+@pytest.mark.parametrize("scores,capacity,floor", [([float("nan")], 1, None), ([1.], 2, None),
+                                                ([1.], 1, float("inf")), ([True], 1, None)])
+def test_confidence_scheduling_rejects_invalid_measurements(scores, capacity, floor):
+    with pytest.raises(ValueError):
+        dspark.choose_verification_count(scores, capacity, floor)
+
+
 @pytest.mark.parametrize(
     "target,emitted,accepted,pending,compared",
     [

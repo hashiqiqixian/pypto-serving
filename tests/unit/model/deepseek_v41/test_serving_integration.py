@@ -284,9 +284,10 @@ def test_directory_loader_classifies_vision_and_draft_without_loading_them(case)
     assert loaded.runtime_model.extra["weight_map"] == case.weight_map
 
 
-def test_executor_without_implemented_factory_fails_before_device_start(modules):
-    with pytest.raises(RuntimeError, match="not bundled"):
-        modules.executor.DeepSeekV41PyptoExecutor()
+def test_executor_uses_bundled_factory_without_device_start(modules):
+    executor = modules.executor.DeepSeekV41PyptoExecutor()
+    assert executor._factory.__module__ == "pypto_serving.model.deepseek_v41.backend"
+    assert executor._runner is None
     with pytest.raises(ValueError, match="platform='a5'"):
         modules.executor.DeepSeekV41PyptoExecutor(platform="a2a3", kernel_factory=lambda **kwargs: None)
 
@@ -459,7 +460,7 @@ def test_programmatic_engine_resolves_same_cache_topology_as_directory_loader(
     assert resolved == loaded.runtime_model.runtime
     assert {group.name for group in resolved.kv_cache_groups} == {"main_kv.0", "index_k.0", "swa.0"}
     assert resolved.max_prefill_tokens_per_request == expected_chunk
-    assert resolved.supports_chunked_prefill_with_speculation is False
+    assert resolved.supports_chunked_prefill_with_speculation is True
     assert runtime.kv_cache_groups == ()
 
 
@@ -540,9 +541,25 @@ def test_cli_selects_v41_executor_tp_ep_and_matching_cache_groups(case, monkeypa
     [
         (("--platform", "a2a3"), "platform a5"),
         (("--devices", "0,1", "--dp", "2", "--ep", "2"), "--dp 1"),
-        (("--num-speculative-tokens", "1"), "only supported"),
+        (("--num-speculative-tokens", "1"), "requires draft layers"),
     ],
 )
 def test_cli_rejects_unsupported_v41_modes(case, monkeypatch, options, message):
     with pytest.raises(ValueError, match=message):
         engine_config(case, monkeypatch, *options)
+
+
+def test_cli_accepts_v41_dspark_config_and_raw_confidence_policy(case, monkeypatch):
+    raw = json.loads(json.dumps(case.raw))
+    raw["text_config"].update(num_nextn_predict_layers=3, compress_ratios=[1, 0, 0, 0], dspark_noise_token_id=63,
+                               dspark_target_layer_ids=[0])
+    (case.root / "config.json").write_text(json.dumps(raw))
+    result = engine_config(case, monkeypatch, "--speculative-config",
+                           '{"method":"dspark","num_speculative_tokens":3}',
+                           "--v41-draft-confidence-threshold", "0.25")
+    assert result.runtime_config.num_speculative_tokens == 3
+    assert result.runtime_config.supports_chunked_prefill_with_speculation is True
+    assert result.executor_kwargs["draft_confidence_threshold"] == .25
+    with pytest.raises(ValueError, match="V4.1.*dspark"):
+        engine_config(case, monkeypatch, "--speculative-config",
+                      '{"method":"mtp","num_speculative_tokens":1}')

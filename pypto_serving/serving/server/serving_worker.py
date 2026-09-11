@@ -681,6 +681,7 @@ class WorkerProcess:
             seq_lens = [pr.num_computed_tokens + len(pr.chunk_tokens) for pr in scheduled]
             chunk_starts = [pr.num_computed_tokens for pr in scheduled]
             block_ids_list = [pr.block_ids for pr in scheduled]
+            multimodal = [getattr(self._req_cache.get(pr.request_id), "multimodal", None) for pr in scheduled]
             allow_device_greedy_sampling = self._allow_device_sampled_ids(scheduled)
             allow_device_topk_sampling = self._allow_device_topk_sampling(scheduled)
             embedding_lookup = None
@@ -703,6 +704,7 @@ class WorkerProcess:
                     block_ids=block_ids_list,
                     block_ids_by_group=[pr.block_ids_by_group for pr in scheduled],
                     cache_partitions=[pr.cache_partition for pr in scheduled],
+                    multimodal=multimodal if any(item is not None for item in multimodal) else (),
                 ),
             )
 

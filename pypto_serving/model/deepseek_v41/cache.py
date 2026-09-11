@@ -188,13 +188,15 @@ def configure_v41_runtime(config: DeepSeekV41Config, runtime: RuntimeConfig) -> 
     )
     if runtime.kv_cache_groups and runtime.kv_cache_groups != groups:
         raise ValueError("V4.1 runtime cache groups disagree with checkpoint topology")
-    if runtime.num_speculative_tokens:
-        raise ValueError("V4.1 speculative serving kernels are not implemented")
+    if not 0 <= runtime.num_speculative_tokens <= config.text_config["dspark_block_size"]:
+        raise ValueError("V4.1 speculative reservation exceeds the DSpark draft block")
+    if runtime.num_speculative_tokens and not config.text_config["num_nextn_predict_layers"]:
+        raise ValueError("V4.1 speculation requires draft layers in the checkpoint")
     return replace(
         runtime,
         kv_cache_groups=groups,
         max_prefill_tokens_per_request=chunk,
-        supports_chunked_prefill_with_speculation=False,
+        supports_chunked_prefill_with_speculation=True,
     )
 
 
@@ -209,10 +211,12 @@ class CacheLease:
 
 @dataclass(frozen=True)
 class CacheBindingSnapshot:
-    """Bindings before a dispatch, excluding tensor contents and committed positions."""
+    """Bindings and visibility before dispatch; physical bytes are owned by the backend."""
 
     lease: CacheLease
     pages: Mapping[str, tuple[int, ...]]
+    valid_length: int
+    retained_start: int
 
 
 @dataclass(frozen=True)
@@ -389,13 +393,17 @@ class V41CacheState:
         state = self._request(lease)
         if state.transaction is not None:
             raise CacheStateError("cannot snapshot bindings during a transaction")
-        return CacheBindingSnapshot(lease, MappingProxyType(dict(state.pages)))
+        return CacheBindingSnapshot(lease, MappingProxyType(dict(state.pages)),
+                                    state.valid_length, state.retained_start)
 
-    def restore_bindings_many(self, snapshots: Sequence[CacheBindingSnapshot]) -> None:
+    def restore_bindings_many(self, snapshots: Sequence[CacheBindingSnapshot], *,
+                              restore_visibility: bool = False) -> None:
         """Restore ownership atomically after abort, including pages released within a batch.
 
         Keep the conservative retained floor: pending SWA writes may have destroyed
         older rows even though the committed attention tail was protected.
+        ``restore_visibility=True`` is valid only after the backend has restored
+        every physical page from the same checkpoint, including overwritten tails.
         """
         states = [self._request(snapshot.lease) for snapshot in snapshots]
         if len({id(state) for state in states}) != len(states) or any(
@@ -420,6 +428,8 @@ class V41CacheState:
         self._owners.update(restored)
         for state, snapshot in zip(states, snapshots):
             state.pages = dict(snapshot.pages)
+            if restore_visibility:
+                state.valid_length, state.retained_start = snapshot.valid_length, snapshot.retained_start
 
     @property
     def active_request_count(self) -> int:

@@ -20,6 +20,15 @@ from pypto_serving.model.model_family import detect_model_family, read_model_con
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class PreparedPrompt:
+    """An already-tokenized prompt with optional model-owned IPC-safe input data."""
+
+    text: str
+    token_ids: list[int]
+    multimodal: dict | None = None
+
+
 class TokenizerAdapter:
     """Minimal tokenizer interface required by the generation engine."""
 

@@ -10,9 +10,8 @@
 
 The pinned V4.1 reference dba1be0a40aa45a94ad051997016db3960a90277, model.py:1137-1156,
 returns an anchor followed by draft tokens and raw linear confidence scores. It
-does not implement an acceptance scheduler. Here the caller explicitly selects
-the prefix to verify. No confidence threshold, stochastic rejection sampler,
-device draft execution, or end-to-end performance claim is provided.
+does not implement an acceptance scheduler. The operator may supply a raw-score
+threshold; no calibrated probability or performance claim is inferred from it.
 """
 
 from __future__ import annotations
@@ -29,6 +28,29 @@ def _tokens(values: Sequence[int], name: str) -> tuple[int, ...]:
     if any(type(token) is not int or token < 0 for token in result):
         raise ValueError(f"{name} must contain nonnegative integer token IDs")
     return result
+
+
+def choose_verification_count(confidence_scores: Sequence[float], capacity: int,
+                              minimum_score: float | None = None) -> int:
+    """Choose a bounded consecutive prefix using an optional explicit raw-score floor.
+
+    With no floor, verify the reserved capacity. With a floor, stop at the first
+    failing confidence, including zero candidates if the first score fails.
+    Threshold selection is an operator policy, not a checkpoint probability.
+    """
+    scores = tuple(confidence_scores)
+    if type(capacity) is not int or not 0 <= capacity <= len(scores):
+        raise ValueError("verification capacity must fit the generated confidence vector")
+    if any(isinstance(score, bool) or not isinstance(score, Real) or not math.isfinite(score) for score in scores):
+        raise ValueError("confidence scores must be finite real numbers")
+    if minimum_score is None:
+        return capacity
+    if isinstance(minimum_score, bool) or not isinstance(minimum_score, Real) or not math.isfinite(minimum_score):
+        raise ValueError("confidence threshold must be a finite raw score")
+    for index, score in enumerate(scores[:capacity]):
+        if score < minimum_score:
+            return index
+    return capacity
 
 
 @dataclass(frozen=True)

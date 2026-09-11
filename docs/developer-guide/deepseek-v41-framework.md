@@ -1,5 +1,9 @@
 # DeepSeek V4.1 host execution framework
 
+This is the historical framework report for `9080f6f`. For the subsequent
+arithmetic, packed cache, DSpark, vision and built-in backend implementation,
+see [V4.1 execution](deepseek-v41-execution.md).
+
 This increment implements host-side serving integration while A5 arithmetic
 kernels are unavailable. It does not establish checkpoint-to-text inference,
 model accuracy, an FP4 device cache, or performance acceptance. The earlier

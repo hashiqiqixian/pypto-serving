@@ -21,6 +21,7 @@ from typing import Callable
 
 from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, GenerateResult, RuntimeConfig
+from pypto_serving.model.tokenizer import PreparedPrompt
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.utils.env import (
     worker_init_timeout_seconds,
@@ -398,6 +399,7 @@ class ReplicaEngineCore:
         *,
         on_queued: Callable[[], None] | None = None,
         prompt_token_ids: Sequence[int] | None = None,
+        multimodal: dict | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Add a request and yield token outputs as they are generated."""
         with profile_span(
@@ -416,11 +418,12 @@ class ReplicaEngineCore:
                 top_p=config.top_p,
                 top_k=config.top_k,
                 seed=config.seed,
+                multimodal=multimodal,
             )
 
             ctx = _RequestContext(request=request, stream=getattr(config, "stream", True))
-            self._request_contexts[request_id] = ctx
             self.scheduler.add_request(request)
+            self._request_contexts[request_id] = ctx
             logger.info(
                 "request %s received: prompt=%d tokens, max_new_tokens=%d",
                 request_id, len(prompt_token_ids), config.max_new_tokens,
@@ -675,6 +678,7 @@ class ReplicaEngineCore:
                     top_p=req.top_p,
                     top_k=req.top_k,
                     seed=req.seed,
+                    multimodal=req.multimodal,
                 ))
                 self._worker_known_req_ids.add(req_id)
 
@@ -1125,6 +1129,8 @@ class AsyncLLMEngine:
     ) -> AsyncGenerator[TokenOutput, None]:
         replica_idx = self._select_replica()
         prompt_token_ids = self._tokenize_prompt(prompt)
+        multimodal = prompt.multimodal if isinstance(prompt, PreparedPrompt) else None
+        prompt_text = prompt.text if isinstance(prompt, PreparedPrompt) else prompt
         request_load = self._estimate_request_load(prompt_token_ids, config)
         self._route_extra_load[replica_idx] += request_load
         self._request_to_replica[request_id] = replica_idx
@@ -1144,10 +1150,11 @@ class AsyncLLMEngine:
             core = self._cores[replica_idx]
             async for output in core.add_request(
                 request_id,
-                prompt,
+                prompt_text,
                 config,
                 on_queued=clear_route_extra_load,
                 prompt_token_ids=prompt_token_ids,
+                **({"multimodal": multimodal} if multimodal is not None else {}),
             ):
                 yield output
         finally:
@@ -1182,12 +1189,25 @@ class AsyncLLMEngine:
         return self._cores[0]
 
     def _tokenize_prompt(self, prompt: str) -> Sequence[int] | None:
+        if isinstance(prompt, PreparedPrompt):
+            if not prompt.token_ids or any(type(token) is not int or token < 0 for token in prompt.token_ids):
+                raise ValueError("PreparedPrompt requires nonempty nonnegative token IDs")
+            if prompt.multimodal is not None and prompt.multimodal.get("tokens") != prompt.token_ids:
+                raise ValueError("PreparedPrompt token IDs must match the attached image spans")
+            return list(prompt.token_ids)
         prompt_token_ids = self.tokenizer.encode(prompt)
         if not prompt_token_ids and self.tokenizer.bos_token_id is not None:
             prompt_token_ids = [self.tokenizer.bos_token_id]
         if not prompt_token_ids:
             raise ValueError("Prompt tokenization produced no tokens.")
         return prompt_token_ids
+
+    def validate_prepared_prompt(self, prompt) -> None:
+        """Reject unsupported image chunk sizes before starting a streamed response."""
+        if isinstance(prompt, PreparedPrompt):
+            tokens = self._tokenize_prompt(prompt)
+            for core in self._cores:
+                core.scheduler.validate_multimodal(len(tokens), prompt.multimodal)
 
     def _estimate_request_load(self, prompt_token_ids: Sequence[int] | None, config) -> int:
         prompt_tokens = len(prompt_token_ids) if prompt_token_ids is not None else 0

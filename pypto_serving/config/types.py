@@ -294,6 +294,7 @@ class PrefillBatch:
     block_ids: list[list[int]] = field(default_factory=list)
     block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
     cache_partitions: list[int | None] = field(default_factory=list)
+    multimodal: list[dict | None] = field(default_factory=list)
 
 
 @dataclass

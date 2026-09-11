@@ -48,6 +48,7 @@ def encode_messages(
     thinking_mode: str = "chat",
     reasoning_effort: str | int | None = None,
     drop_thinking: bool = True,
+    _allow_image_placeholders: bool = False,
 ) -> str:
     """Render the supported pure-text subset byte-for-byte like the pinned reference."""
     if thinking_mode not in ("chat", "thinking") or type(drop_thinking) is not bool:
@@ -73,7 +74,10 @@ def encode_messages(
             raise ValueError("reasoning_content is supported only as an assistant string")
         if type(message.get("wo_eos", False)) is not bool:
             raise ValueError("wo_eos must be bool")
-        if any(marker in message["content"] for marker in (IMAGE_TOKEN, "<image>", "</image>")) or (
+        forbidden = (
+            ("<image>", "</image>") if _allow_image_placeholders else (IMAGE_TOKEN, "<image>", "</image>")
+        )
+        if any(marker in message["content"] for marker in forbidden) or (
             isinstance(reasoning, str) and IMAGE_TOKEN in reasoning
         ):
             raise ValueError("raw image special tokens require an implemented vision input path")

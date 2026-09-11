@@ -63,7 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--platform", default="a2a3", help="NPU platform (default: a2a3).")
     parser.add_argument(
         "--v41-kernel-factory", default=None, metavar="MODULE:CALLABLE",
-        help="Implemented V4.1 A5 kernel bundle factory. Required for V4.1 execution.",
+        help="Optional V4.1 A5 backend override; defaults to the bundled PyPTO implementation.",
+    )
+    parser.add_argument(
+        "--v41-draft-confidence-threshold", type=float, default=None,
+        help="Optional raw DSpark confidence floor for the consecutive verification prefix; no default calibration.",
     )
     parser.add_argument(
         "--use-compile-cache",
@@ -285,23 +289,31 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         args.long_prefill_token_threshold,
         variant=model_variant,
     )
-    num_speculative_tokens = _resolve_num_speculative_tokens(args)
+    num_speculative_tokens = _resolve_num_speculative_tokens(args, model_family=model_family)
     if model_family == "deepseek_v4":
         executor_kwargs["compile_kernels"] = True
         executor_kwargs["num_speculative_tokens"] = num_speculative_tokens
-    elif num_speculative_tokens or model_variant:
+    elif model_family != "deepseek_v41" and (num_speculative_tokens or model_variant):
         raise ValueError(
             "--speculative-config/--num-speculative-tokens is only supported for DeepSeek V4"
         )
     if model_family == "deepseek_v41":
+        if model_variant and model_variant != "dspark":
+            raise ValueError("V4.1 --speculative-config requires method='dspark'")
         if args.platform != "a5":
             raise ValueError("DeepSeek V4.1 requires --platform a5")
         factory = getattr(args, "v41_kernel_factory", None)
-        if not factory:
-            raise ValueError("V4.1 arithmetic kernels are pending; supply --v41-kernel-factory MODULE:CALLABLE")
         executor_kwargs["kernel_factory"] = factory
+        threshold = getattr(args, "v41_draft_confidence_threshold", None)
+        if threshold is not None:
+            import math
+            if not num_speculative_tokens or not math.isfinite(threshold):
+                raise ValueError("V4.1 confidence threshold requires speculation and a finite raw score")
+            executor_kwargs["draft_confidence_threshold"] = threshold
     elif getattr(args, "v41_kernel_factory", None):
         raise ValueError("--v41-kernel-factory applies only to DeepSeek V4.1")
+    elif getattr(args, "v41_draft_confidence_threshold", None) is not None:
+        raise ValueError("--v41-draft-confidence-threshold applies only to DeepSeek V4.1")
     executor_kwargs["use_compile_cache"] = args.use_compile_cache
     # The DSpark TP4/DP4 axes are internal to the kernels (TP groups hold
     # replicated caches; DP groups are the four scheduler cache partitions).
@@ -366,7 +378,7 @@ def _build_runtime_config(
     model_family: str = "qwen",
     config_data: dict[str, object] | None = None,
 ):
-    num_speculative_tokens = _resolve_num_speculative_tokens(args)
+    num_speculative_tokens = _resolve_num_speculative_tokens(args, model_family=model_family)
     kv_dtype = args.kv_cache_dtype
     if kv_dtype == "auto":
         kv_dtype = args.dtype
@@ -386,7 +398,11 @@ def _build_runtime_config(
             parsed, args.block_size, args.max_model_len,
             max_chunk_tokens=max_prefill_tokens_per_request,
         )
-        supports_chunked_prefill_with_speculation = False
+        if not 0 <= num_speculative_tokens <= parsed.text_config["dspark_block_size"]:
+            raise ValueError("V4.1 speculative token count exceeds the DSpark draft block")
+        if num_speculative_tokens and not parsed.text_config["num_nextn_predict_layers"]:
+            raise ValueError("V4.1 speculation requires draft layers in the checkpoint")
+        supports_chunked_prefill_with_speculation = True
     elif model_family == "deepseek_v4" and _resolve_model_variant(args) == "dspark":
         from pypto_serving.model.deepseek_dspark.npu_runner import (
             DSPARK_PREFILL_MAX_TOKENS,
@@ -469,7 +485,7 @@ def _resolve_model_variant(args: argparse.Namespace) -> str:
     )
 
 
-def _resolve_num_speculative_tokens(args: argparse.Namespace) -> int:
+def _resolve_num_speculative_tokens(args: argparse.Namespace, *, model_family: str = "deepseek_v4") -> int:
     """Resolve the vLLM-style config and deprecated standalone alias."""
     speculative_config = getattr(args, "speculative_config", None)
     configured = getattr(args, "num_speculative_tokens", None)
@@ -477,6 +493,11 @@ def _resolve_num_speculative_tokens(args: argparse.Namespace) -> int:
         if configured is not None:
             raise ValueError("--speculative-config cannot be combined with --num-speculative-tokens")
         method = speculative_config.get("method")
+        if model_family == "deepseek_v41" and method == "dspark":
+            configured = speculative_config.get("num_speculative_tokens")
+            if type(configured) is not int or configured < 1:
+                raise ValueError("V4.1 DSpark requires a positive integer num_speculative_tokens")
+            return configured
         if method == "dspark":
             from pypto_serving.model.deepseek_dspark.npu_runner import (  # noqa: PLC0415
                 DSPARK_SPECULATIVE_TOKENS,
