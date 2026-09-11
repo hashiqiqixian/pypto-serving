@@ -101,6 +101,20 @@ class EngineConfig:
     def resolve_runtime_config(self) -> RuntimeConfig:
         """Return runtime settings with executor requirements resolved."""
         runtime = self.runtime_config or RuntimeConfig()
+        if self.executor_cls == "PyptoDeepSeekV41Executor":
+            from pathlib import Path
+
+            from pypto_serving.model.deepseek_v41.cache import configure_v41_runtime
+            from pypto_serving.model.deepseek_v41.config import DeepSeekV41Config
+
+            if self.enable_prefix_cache:
+                raise ValueError("V4.1 requires enable_prefix_cache=False until auxiliary-state sharing is implemented")
+            if self.max_num_running_reqs > runtime.max_batch_size:
+                raise ValueError("V4.1 scheduler max_num_running_reqs exceeds runtime.max_batch_size")
+            if self.max_num_scheduled_tokens > runtime.max_num_batched_tokens:
+                raise ValueError("V4.1 scheduler token budget exceeds runtime.max_num_batched_tokens")
+            parsed = DeepSeekV41Config.from_json(Path(self.model_dir) / "config.json")
+            return configure_v41_runtime(parsed, runtime)
         is_deepseek_v4 = self.executor_cls == "PyptoDeepSeekV4Executor"
         homogeneous_prefill_decode = (
             runtime.requires_homogeneous_prefill_decode or is_deepseek_v4

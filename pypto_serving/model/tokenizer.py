@@ -155,11 +155,16 @@ class DeepSeekV4TokenizerAdapter(TransformersTokenizerAdapter):
 def load_tokenizer(model_dir: str | Path, *, trust_remote_code: bool = False) -> TokenizerAdapter:
     """Load a local tokenizer and select any model-specific chat encoding."""
     model_path = Path(model_dir)
+    family = detect_model_family(read_model_config(model_path))
     adapter_cls = (
         DeepSeekV4TokenizerAdapter
-        if detect_model_family(read_model_config(model_path)) == "deepseek_v4"
+        if family == "deepseek_v4"
         else TransformersTokenizerAdapter
     )
+    if family == "deepseek_v41":
+        from pypto_serving.model.deepseek_v41.tokenizer import DeepSeekV41TokenizerAdapter
+
+        adapter_cls = DeepSeekV41TokenizerAdapter
     if (model_path / "tokenizer.json").exists():
         return adapter_cls.from_tokenizer_file(str(model_path))
     return adapter_cls.from_pretrained(
