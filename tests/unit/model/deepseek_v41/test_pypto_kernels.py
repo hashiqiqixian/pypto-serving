@@ -9,6 +9,8 @@
 """A3/A5 compiler checks and explicitly opted-in bounded NPU correctness checks.
 
 The default tests run real IR/codegen without assembler or hardware execution.
+Each compiler case uses a fresh, bounded subprocess because the PyPTO backend
+is process-global: an initialized A3 backend cannot be replaced by A5 in place.
 Set PYPTO_V41_NPU_TESTS=1, TASK_DEVICE to the allocated single device, and
 PYPTO_V41_NPU_PLATFORM=a2a3 (default) or a5 to run the hardware cases. Hardware
 tests require existing CANN/PTO-ISA/ptoas installations; they do not fetch them.
@@ -19,6 +21,7 @@ import importlib.util
 import os
 import re
 import shutil
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -36,11 +39,51 @@ ROOT = Path(__file__).resolve().parents[4]
 
 @pytest.mark.parametrize("rows,columns,inner", [(16, 64, 64), (32, 128, 128)])
 @pytest.mark.parametrize("platform", ["a2a3", "a5"])
-def test_bf16_matmul_lowers_to_fp32_cube_with_out_parameter(
-    tmp_path, monkeypatch, rows, columns, inner, platform
-):
+def test_bf16_matmul_lowers_to_fp32_cube_with_out_parameter(tmp_path, rows, columns, inner, platform):
     if not RUN_NPU:
         pytest.importorskip("pypto.pypto_core", reason="real PyPTO compiler extension is required")
+    # Never reset the compiler singleton. Each subprocess selects exactly one
+    # backend, runs serially, and cannot invoke ptoas/C++ builds or a device.
+    environment = dict(os.environ)
+    environment.update(OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1")
+    child = (
+        "import runpy, sys; "
+        "case = runpy.run_path(sys.argv[1]); "
+        "case['_compile_and_check_ir'](sys.argv[2], "
+        "int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6])"
+    )
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                child,
+                str(Path(__file__).resolve()),
+                platform,
+                str(rows),
+                str(columns),
+                str(inner),
+                str(tmp_path),
+            ],
+            env=environment,
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"{platform} compiler subprocess exceeded 60s:\n{exc.stdout!r}\n{exc.stderr!r}")
+    assert completed.returncode == 0, (
+        f"{platform} compiler subprocess failed ({completed.returncode}):\n"
+        f"{completed.stdout}\n{completed.stderr}"
+    )
+    _assert_generated_cube(tmp_path, platform, inner)
+
+
+def _compile_and_check_ir(platform, rows, columns, inner, output_directory):
+    """Run only in a fresh child, retaining actual compiler/IR assertions."""
     from pypto import ir
     from pypto.pypto_core import DataType
     from pypto.runtime import RunConfig
@@ -48,21 +91,22 @@ def test_bf16_matmul_lowers_to_fp32_cube_with_out_parameter(
     decorator = importlib.import_module("pypto.jit.decorator")
     # Exercise the real specializer, parser, passes and selected code generator. Only
     # the external assembler is disabled, so this test cannot launch C++ builds.
-    monkeypatch.setattr(decorator, "_ptoas_available", lambda: False)
     spec = importlib.util.spec_from_file_location(
         "_v41_real_kernel_test", ROOT / "pypto_serving/model/deepseek_v41/kernels.py"
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     kernel = module.make_bf16_matmul_kernel()
-    compiled = kernel.compile(
-        torch.empty((rows, inner), dtype=torch.bfloat16),
-        torch.empty((inner, columns), dtype=torch.bfloat16),
-        torch.empty((rows, columns), dtype=torch.float32),
-        config=RunConfig(
-            platform=platform, codegen_only=True, save_kernels=True, save_kernels_dir=str(tmp_path)
-        ),
-    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(decorator, "_ptoas_available", lambda: False)
+        compiled = kernel.compile(
+            torch.empty((rows, inner), dtype=torch.bfloat16),
+            torch.empty((inner, columns), dtype=torch.bfloat16),
+            torch.empty((rows, columns), dtype=torch.float32),
+            config=RunConfig(
+                platform=platform, codegen_only=True, save_kernels=True, save_kernels_dir=output_directory
+            ),
+        )
     assert compiled.platform == platform
     assert compiled.output_indices == [2]
     program = compiled.program
@@ -98,6 +142,10 @@ def test_bf16_matmul_lowers_to_fp32_cube_with_out_parameter(
     for call in visitor.calls:
         assert call.type.dtype == DataType.FP32
         assert [argument.type.dtype for argument in call.args[-2:]] == [DataType.BF16, DataType.BF16]
+
+
+def _assert_generated_cube(tmp_path, platform, inner):
+    """Inspect the child's actual emitted artifacts in the parent process."""
     artifacts = list(tmp_path.rglob("*.pto"))
     assert artifacts, f"{platform} PTO codegen must emit kernel artifacts"
     emitted = "\n".join(path.read_text() for path in artifacts)
