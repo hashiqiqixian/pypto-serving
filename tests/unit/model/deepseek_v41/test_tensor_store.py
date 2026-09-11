@@ -192,6 +192,44 @@ def materialize_tiles(weights, name):
     return result
 
 
+@pytest.mark.parametrize("name", [
+    "layers.0.hc_attn_fn", "layers.0.attn.compressor.wkv.weight",
+    "layers.0.attn.wq_b.weight", "layers.0.attn.wq_b.scale",
+    "layers.0.ffn.experts.0.w1.weight",
+])
+def test_strided_column_slices_become_compact_owned_tensors(case, name):
+    weights = store(case)
+    source = case.tensors[name]
+    middle = source.shape[1] // 2
+    ranges = (slice(0, 2), slice(middle, source.shape[1]))
+    expected = source[ranges].contiguous()
+    selected = weights.store.load_slice(name, ranges)
+    assert selected.shape == expected.shape and not selected.is_contiguous()
+    assert selected.stride(0) > selected.shape[1]
+    actual = weights._read(name, ranges)
+    assert actual.is_contiguous() and actual.dtype == source.dtype
+    assert actual.untyped_storage().nbytes() == actual.numel() * actual.element_size()
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    actual.view(torch.uint8).zero_()
+    reread = weights._read(name, ranges)
+    assert torch.equal(reread.view(torch.uint8), expected.view(torch.uint8))
+    assert all(slices == ranges for tensor_name, slices in case.reads if tensor_name == name)
+
+
+def test_hyper_connection_projection_streams_all_strided_k_tiles(case):
+    name = "layers.0.hc_attn_fn"
+    shape = case.tensors[name].shape
+    expected = torch.arange(shape[0] * shape[1], dtype=torch.float32).reshape(shape) / 128
+    case.tensors[name] = expected
+    write_checkpoint(case.root, case.tensors)
+    weights = store(case, dense_k_tile=32)
+    actual = materialize_tiles(weights, name)
+    assert torch.equal(actual, expected)
+    slices = [ranges for source, ranges in case.reads if source == name]
+    assert len(slices) == shape[1] // 32
+    assert all(ranges[1].stop - ranges[1].start == 32 for ranges in slices)
+
+
 def test_fp8_tp_tiles_use_source_scale_offsets_and_never_materialize_full_source(case):
     weights = store(case, rank=1, world_size=2, out_tile_rows=32)
     name = "layers.0.attn.wq_b"

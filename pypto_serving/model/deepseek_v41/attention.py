@@ -213,6 +213,26 @@ def apply_rotary(x: torch.Tensor, positions: torch.Tensor, frequencies: torch.Te
     return torch.cat((x[..., :-dim], rotated.flatten(-2).to(x.dtype)), -1)
 
 
+def _topk_positions(scores: torch.Tensor, count: int) -> torch.Tensor:
+    """Select by score, breaking cutoff ties by the smallest absolute position.
+
+    Reference torch.topk leaves ties unspecified. ReLU creates exact zero ties;
+    its chosen positions can otherwise change when a prefill chunk adds masked
+    future columns. Find the cutoff with topk, then select ties without score
+    perturbations or sorting the full history. Return selected positions in order.
+    """
+    if scores.ndim != 1 or type(count) is not int or not 0 <= count <= len(scores):
+        raise ValueError("top-k requires a score vector and a valid selection count")
+    if not count:
+        return torch.empty(0, dtype=torch.long, device=scores.device)
+    if bool(torch.isnan(scores).any()):
+        raise ValueError("top-k scores cannot contain NaN")
+    cutoff = scores.topk(count, sorted=False).values.min()
+    greater = (scores > cutoff).nonzero().flatten()
+    tied = (scores == cutoff).nonzero().flatten()[:count - len(greater)]
+    return torch.cat((greater, tied)).sort().values
+
+
 def select_candidate_blocks(logits: torch.Tensor, reachable: int, topk_blocks: int,
                             block_size: int) -> torch.Tensor:
     """Return selected block IDs, including the newest reachable partial block."""
@@ -225,8 +245,8 @@ def select_candidate_blocks(logits: torch.Tensor, reachable: int, topk_blocks: i
     scores = scores.reshape(-1, block_size).amax(-1)
     if reachable:
         scores[(reachable - 1) // block_size] = torch.inf
-    top = scores.topk(min(topk_blocks, len(scores)))
-    return top.indices[top.values > -torch.inf]
+    selected = _topk_positions(scores, min(topk_blocks, len(scores)))
+    return selected[scores[selected] > -torch.inf]
 
 
 def sparse_attention(q: torch.Tensor, values: torch.Tensor, sink: torch.Tensor,
@@ -356,7 +376,7 @@ class Attention:
                                       dtype=torch.bool, device=x.device)
                 allowed[blocks] = True
                 scores = scores.masked_fill(~allowed[positions // cfg.candidate_block_size], -torch.inf)
-            chosen = scores.topk(topk, sorted=False).indices.sort().values
+            chosen = _topk_positions(scores, topk)
             # The published reference filters causal positions here, not all -inf
             # candidate scores. Keep that distinction for underfilled candidate sets.
             indexes.append(torch.where(chosen < reachable, chosen, -1).to(torch.int32))

@@ -10,6 +10,7 @@
 
 import importlib
 import importlib.util
+import re
 from pathlib import Path
 
 import pytest
@@ -59,20 +60,35 @@ def test_a5_bf16_matmul_lowers_to_fp32_cube_with_out_parameter(tmp_path, monkeyp
         [dimension.value for dimension in parameter.type.shape] for parameter in orchestration.params
     ] == [[rows, inner], [inner, columns], [rows, columns]]
 
-    class CubeVisitor(ir.IRVisitor):
+    # CompiledProgram.program retains the input tensor IR. The lowered Cube
+    # operations must be checked in the actual emitted PTO below.
+    class MatmulVisitor(ir.IRVisitor):
         def __init__(self):
             super().__init__()
             self.calls = []
 
         def visit_call(self, call):
-            if call.op.name in ("tile.matmul", "tile.matmul_acc"):
+            if call.op.name in ("tensor.matmul", "tensor.matmul_acc"):
                 self.calls.append(call)
             super().visit_call(call)
 
-    visitor = CubeVisitor()
+    visitor = MatmulVisitor()
     visitor.visit_program(program)
-    assert visitor.calls, "the compiled program must contain actual Cube matrix operations"
+    assert {call.op.name for call in visitor.calls} == {"tensor.matmul", "tensor.matmul_acc"}
     for call in visitor.calls:
         assert call.type.dtype == DataType.FP32
         assert [argument.type.dtype for argument in call.args[-2:]] == [DataType.BF16, DataType.BF16]
-    assert list(tmp_path.rglob("*.pto")), "A5 PTO codegen must emit kernel artifacts"
+    artifacts = list(tmp_path.rglob("*.pto"))
+    assert artifacts, "A5 PTO codegen must emit kernel artifacts"
+    emitted = "\n".join(path.read_text() for path in artifacts)
+    assert "#pto.kernel_kind<cube>" in emitted
+    cube_calls = re.findall(r"^\s*pto\.tmatmul(?:\.acc)?\s+.*$", emitted, re.MULTILINE)
+    assert cube_calls, "lowering must emit actual Cube matrix operations"
+    assert any("pto.tmatmul ins(" in call for call in cube_calls)
+    if inner > 64:
+        assert any("pto.tmatmul.acc ins(" in call for call in cube_calls)
+    for call in cube_calls:
+        inputs, outputs = call.split(" outs(", 1)
+        assert inputs.count("dtype=bf16") == 2
+        assert "loc=left, dtype=bf16" in inputs and "loc=right, dtype=bf16" in inputs
+        assert "loc=acc, dtype=f32" in outputs
