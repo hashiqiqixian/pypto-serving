@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""CPU numerics and dispatch-boundary tests; fake JIT is never A5 numerical evidence."""
+"""CPU numerics and dispatch-boundary tests; fake JIT is never NPU numerical evidence."""
 
 from __future__ import annotations
 
@@ -100,12 +100,13 @@ def test_torch_provider_uses_bf16_values_and_returns_fp32_without_aliasing(ops_m
 
 
 @pytest.mark.parametrize("m,n,k", [(1, 1, 1), (5, 7, 3), (17, 65, 33), (16, 64, 64), (32, 128, 128)])
-def test_pypto_bridge_padding_crop_and_runconfig(ops_module, fake_dispatch, tmp_path, m, n, k):
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_pypto_bridge_padding_crop_and_runconfig(ops_module, fake_dispatch, tmp_path, m, n, k, platform):
     # Strided inputs exercise layout normalization at the public bridge boundary.
     a = (torch.arange(m * k * 2).reshape(m, k * 2) % 9 - 4).to(torch.bfloat16)[:, ::2]
     b = (torch.arange(k * n).reshape(k, n) % 7 - 3).to(torch.bfloat16)
     before = a.clone(), b.clone()
-    ops = ops_module.PyptoMatmulOps(device_id=3, build_dir=tmp_path)
+    ops = ops_module.PyptoMatmulOps(platform=platform, device_id=3, build_dir=tmp_path)
     try:
         result = ops.matmul(a, b)
         assert result.shape == (m, n) and result.dtype == torch.float32 and result.is_contiguous()
@@ -117,7 +118,7 @@ def test_pypto_bridge_padding_crop_and_runconfig(ops_module, fake_dispatch, tmp_
         assert shape == (lhs.shape[0], rhs.shape[1])
         assert torch.count_nonzero(lhs[m:]) == torch.count_nonzero(lhs[:, k:]) == 0
         assert torch.count_nonzero(rhs[k:]) == torch.count_nonzero(rhs[:, n:]) == 0
-        assert config.platform == "a5" and config.device_id == 3 and config.save_kernels
+        assert config.platform == platform and config.device_id == 3 and config.save_kernels
         assert Path(config.save_kernels_dir).is_relative_to(tmp_path)
         result.zero_()
         assert torch.equal(a, before[0]) and torch.equal(b, before[1])
@@ -126,12 +127,13 @@ def test_pypto_bridge_padding_crop_and_runconfig(ops_module, fake_dispatch, tmp_
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
 def test_shape_cache_lru_reuses_hot_shape_evicts_cold_shape_and_preserves_user_files(
-    ops_module, fake_dispatch, tmp_path
+    ops_module, fake_dispatch, tmp_path, platform
 ):
     marker = tmp_path / "user-file.txt"
     marker.write_text("preserve")
-    ops = ops_module.PyptoMatmulOps(build_dir=tmp_path, max_cached_shapes=2)
+    ops = ops_module.PyptoMatmulOps(platform=platform, build_dir=tmp_path, max_cached_shapes=2)
 
     def run(rows):
         return ops.matmul(torch.ones(rows, 1, dtype=torch.bfloat16), torch.ones(1, 1, dtype=torch.bfloat16))
@@ -156,9 +158,16 @@ def test_shape_cache_lru_reuses_hot_shape_evicts_cold_shape_and_preserves_user_f
         run(1)
 
 
-@pytest.mark.parametrize("provider", ["TorchMatmulOps", "PyptoMatmulOps"])
+@pytest.mark.parametrize(
+    "provider,kwargs",
+    [
+        ("TorchMatmulOps", {}),
+        ("PyptoMatmulOps", {"platform": "a2a3"}),
+        ("PyptoMatmulOps", {"platform": "a5"}),
+    ],
+)
 @pytest.mark.parametrize("bad", ["dtype", "rank", "empty", "inner", "nan"])
-def test_provider_rejects_invalid_matrix_contract(ops_module, fake_dispatch, provider, bad):
+def test_provider_rejects_invalid_matrix_contract(ops_module, fake_dispatch, provider, kwargs, bad):
     a, b = torch.ones(2, 3, dtype=torch.bfloat16), torch.ones(3, 2, dtype=torch.bfloat16)
     if bad == "dtype":
         a = a.float()
@@ -170,7 +179,7 @@ def test_provider_rejects_invalid_matrix_contract(ops_module, fake_dispatch, pro
         b = b[:2]
     else:
         a[0, 0] = float("nan")
-    ops = getattr(ops_module, provider)()
+    ops = getattr(ops_module, provider)(**kwargs)
     try:
         with pytest.raises(ValueError, match="BF16 matrix|dimensions|finite"):
             ops.matmul(a, b)
@@ -179,9 +188,16 @@ def test_provider_rejects_invalid_matrix_contract(ops_module, fake_dispatch, pro
         ops.close()
 
 
-@pytest.mark.parametrize("provider", ["TorchMatmulOps", "PyptoMatmulOps"])
-def test_budget_rejects_before_padding_or_dispatch(ops_module, fake_dispatch, monkeypatch, provider):
-    ops = getattr(ops_module, provider)(max_buffer_bytes=1)
+@pytest.mark.parametrize(
+    "provider,kwargs",
+    [
+        ("TorchMatmulOps", {}),
+        ("PyptoMatmulOps", {"platform": "a2a3"}),
+        ("PyptoMatmulOps", {"platform": "a5"}),
+    ],
+)
+def test_budget_rejects_before_padding_or_dispatch(ops_module, fake_dispatch, monkeypatch, provider, kwargs):
+    ops = getattr(ops_module, provider)(max_buffer_bytes=1, **kwargs)
     a, b = torch.ones(1, 1, dtype=torch.bfloat16), torch.ones(1, 1, dtype=torch.bfloat16)
 
     def no_padding(*args, **kwargs):
@@ -197,11 +213,17 @@ def test_budget_rejects_before_padding_or_dispatch(ops_module, fake_dispatch, mo
 
 
 @pytest.mark.parametrize("failure", ["fail", "nonfinite"])
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
 def test_dispatch_error_propagates_and_owned_artifacts_are_cleaned(
-    ops_module, fake_dispatch, tmp_path, failure
+    ops_module, fake_dispatch, tmp_path, monkeypatch, failure, platform
 ):
     setattr(fake_dispatch, failure, True)
-    ops = ops_module.PyptoMatmulOps(build_dir=tmp_path)
+
+    def no_fallback(*args, **kwargs):
+        pytest.fail("hardware dispatch failures must never select the CPU reference provider")
+
+    monkeypatch.setattr(ops_module.TorchMatmulOps, "matmul", no_fallback)
+    ops = ops_module.PyptoMatmulOps(platform=platform, build_dir=tmp_path)
     try:
         with pytest.raises((ValueError, RuntimeError), match="finite|synthetic dispatch failure"):
             ops.matmul(torch.ones(1, 1, dtype=torch.bfloat16), torch.ones(1, 1, dtype=torch.bfloat16))
@@ -216,3 +238,38 @@ def test_dispatch_error_propagates_and_owned_artifacts_are_cleaned(
 def test_pypto_provider_rejects_invalid_resource_settings(ops_module, fake_dispatch, kwargs):
     with pytest.raises(ValueError):
         ops_module.PyptoMatmulOps(**kwargs)
+
+
+@pytest.mark.parametrize("platform", ["a3", "a2a3sim", "a5sim", "", None, 1])
+def test_pypto_provider_rejects_unsupported_platform_before_creating_artifacts(
+    ops_module, fake_dispatch, tmp_path, platform
+):
+    with pytest.raises(ValueError, match="platform"):
+        ops_module.PyptoMatmulOps(platform=platform, build_dir=tmp_path)
+    assert list(tmp_path.iterdir()) == [] and fake_dispatch.created == 0
+
+
+def test_pypto_provider_defaults_to_a3_hardware_backend(ops_module, fake_dispatch, tmp_path):
+    ops = ops_module.PyptoMatmulOps(build_dir=tmp_path)
+    try:
+        ops.matmul(torch.ones(1, 1, dtype=torch.bfloat16), torch.ones(1, 1, dtype=torch.bfloat16))
+        assert fake_dispatch.calls[-1][-1].platform == "a2a3"
+    finally:
+        ops.close()
+
+
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_pypto_provider_rejects_runtime_platform_substitution(
+    ops_module, fake_dispatch, tmp_path, monkeypatch, platform
+):
+    runtime = sys.modules["pypto.runtime"]
+    original = runtime.RunConfig
+
+    def substituted_config(**kwargs):
+        kwargs["platform"] = "a5" if platform == "a2a3" else "a2a3"
+        return original(**kwargs)
+
+    monkeypatch.setattr(runtime, "RunConfig", substituted_config)
+    with pytest.raises(RuntimeError, match="did not select the requested"):
+        ops_module.PyptoMatmulOps(platform=platform, build_dir=tmp_path)
+    assert list(tmp_path.iterdir()) == [] and fake_dispatch.created == 0

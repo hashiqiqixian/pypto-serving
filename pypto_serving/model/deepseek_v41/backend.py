@@ -6,9 +6,9 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Complete V4.1 arithmetic backend with explicit CPU and PyPTO A5 providers.
+"""Complete V4.1 arithmetic backend with explicit CPU and PyPTO Ascend providers.
 
-The initial A5 implementation streams checkpoint tiles and uses a real PyPTO
+The initial implementation streams checkpoint tiles and uses a real PyPTO
 BF16 Cube kernel for representable normalized products. Torch Ascend executes
 FP32-sensitive and vector arithmetic. Transfers are explicit; this implementation
 is intended for correctness bring-up, not a performance or HBM residency claim.
@@ -70,7 +70,7 @@ class DeepSeekV41Backend:
     """One tensor-parallel rank, including mandatory Engram and all backbone layers."""
 
     def __init__(self, config, runtime, cache_layouts, ops: TensorOps, *, vision_config=None,
-                 platform: str = "a5"):
+                 platform: str = "a2a3"):
         self.config, self.runtime, self.ops = config, runtime, ops
         self.math = ModelMath(config, ops)
         self.attention = [Attention(config, ops, i) for i in range(config.num_hidden_layers)]
@@ -307,13 +307,16 @@ class DeepSeekV41Backend:
             self._closed = True
 
 
-def create_backend(*, config, runtime, cache_layouts, weight_loader, device_ids,
+def create_backend(*, config, runtime, cache_layouts, weight_loader, device_ids, platform="a2a3",
                    pypto_build_dir=None, use_compile_cache=False):
-    """Built-in A5 backend factory. There is no CPU fallback for an A5 launch."""
+    """Built-in Ascend backend factory with explicit platform selection."""
+    if platform not in ("a2a3", "a5"):
+        raise ValueError("V4.1 Ascend backend requires platform='a2a3' or 'a5'")
     if len(device_ids) > 1:
         from .distributed import DistributedV41Backend
         return DistributedV41Backend(config=config, runtime=runtime, cache_layouts=cache_layouts,
                                      weight_loader=weight_loader, device_ids=device_ids,
+                                     platform=platform,
                                      pypto_build_dir=pypto_build_dir, use_compile_cache=use_compile_cache)
     import torch_npu  # noqa: F401 - registers the actual torch Ascend device
 
@@ -327,9 +330,10 @@ def create_backend(*, config, runtime, cache_layouts, weight_loader, device_ids,
     store = DeepSeekV41TensorStore(weight_loader.model_dir, raw, max_load_bytes=weight_loader.max_load_bytes)
     provider = None
     try:
-        provider = PyptoMatmulOps(device_id=device_id, build_dir=pypto_build_dir)
+        provider = PyptoMatmulOps(device_id=device_id, platform=platform, build_dir=pypto_build_dir)
         ops = TensorOps(store, device=f"npu:{device_id}", matmul_provider=provider)
-        return DeepSeekV41Backend(config, runtime, cache_layouts, ops, vision_config=VisionConfig.from_config(raw))
+        return DeepSeekV41Backend(config, runtime, cache_layouts, ops, platform=platform,
+                                 vision_config=VisionConfig.from_config(raw))
     except BaseException:
         if provider is not None:
             provider.close()

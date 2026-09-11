@@ -300,8 +300,8 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     if model_family == "deepseek_v41":
         if model_variant and model_variant != "dspark":
             raise ValueError("V4.1 --speculative-config requires method='dspark'")
-        if args.platform != "a5":
-            raise ValueError("DeepSeek V4.1 requires --platform a5")
+        if args.platform not in ("a2a3", "a5"):
+            raise ValueError("DeepSeek V4.1 requires --platform a2a3 or a5")
         factory = getattr(args, "v41_kernel_factory", None)
         executor_kwargs["kernel_factory"] = factory
         threshold = getattr(args, "v41_draft_confidence_threshold", None)

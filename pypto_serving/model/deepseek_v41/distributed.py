@@ -121,7 +121,7 @@ class TorchCollective:
         return torch.cat(result, dim=-1)
 
 
-def _a5_backend(settings: dict, rank: int, world_size: int):
+def _ascend_backend(settings: dict, rank: int, world_size: int):
     import torch_npu  # noqa: F401 - registers Ascend devices
 
     from .backend import DeepSeekV41Backend
@@ -138,11 +138,12 @@ def _a5_backend(settings: dict, rank: int, world_size: int):
                                   max_load_bytes=settings["max_load_bytes"])
     provider = None
     try:
-        provider = PyptoMatmulOps(device_id=device, build_dir=settings["build_dir"])
+        provider = PyptoMatmulOps(device_id=device, build_dir=settings["build_dir"],
+                                  platform=settings["platform"])
         ops = TensorOps(store, device=f"npu:{device}", rank=rank, world_size=world_size,
                         matmul_provider=provider, collective=TorchCollective())
         return DeepSeekV41Backend(config, settings["runtime"], settings["layouts"], ops,
-                                  vision_config=VisionConfig.from_config(raw))
+                                  vision_config=VisionConfig.from_config(raw), platform=settings["platform"])
     except BaseException:
         if provider is not None:
             provider.close()
@@ -346,12 +347,15 @@ class DistributedV41Backend:
     performed once in begin_batch by the same numerical backend on every rank.
     PYPTO_V41_INIT_TIMEOUT (300 s) and PYPTO_V41_RPC_TIMEOUT (600 s) must be positive.
     The private factory/backend overrides exist for explicit CPU collective tests;
-    the production factory always selects HCCL, Torch-NPU and real PyPTO kernels.
+    the production factory selects HCCL, Torch-NPU and real PyPTO kernels for the
+    requested Ascend platform. A2/A3 is the default; A5 remains explicit.
     """
 
     def __init__(self, *, config, runtime, cache_layouts, weight_loader, device_ids,
-                 pypto_build_dir=None, use_compile_cache=False, _rank_factory=None,
+                 platform: str = "a2a3", pypto_build_dir=None, use_compile_cache=False, _rank_factory=None,
                  _collective_backend="hccl") -> None:
+        if platform not in ("a2a3", "a5"):
+            raise ValueError("distributed V4.1 platform must be a2a3 or a5")
         ids = tuple(device_ids)
         if not 2 <= len(ids) <= 16 or len(set(ids)) != len(ids) or any(type(i) is not int or i < 0 for i in ids):
             raise ValueError("distributed V4.1 requires 2..16 distinct nonnegative device IDs")
@@ -367,7 +371,7 @@ class DistributedV41Backend:
         self._rendezvous = tempfile.TemporaryDirectory(prefix="pypto-v41-ranks-")
         settings = {"model_dir": str(weight_loader.model_dir), "max_load_bytes": weight_loader.max_load_bytes,
                     "runtime": runtime, "layouts": tuple(cache_layouts), "device_ids": ids,
-                    "build_dir": pypto_build_dir, "rpc_timeout": self._rpc_timeout}
+                    "build_dir": pypto_build_dir, "rpc_timeout": self._rpc_timeout, "platform": platform}
         context = mp.get_context("spawn")
         try:
             init_method = (Path(self._rendezvous.name) / "store").as_uri()
@@ -375,7 +379,7 @@ class DistributedV41Backend:
                 parent, child = context.Pipe()
                 process = context.Process(target=_rank_main,
                                           args=(child, settings, rank, init_method,
-                                                _rank_factory or _a5_backend, _collective_backend),
+                                                _rank_factory or _ascend_backend, _collective_backend),
                                           daemon=False)
                 self._connections.append(parent)
                 self._processes.append(process)
@@ -385,6 +389,8 @@ class DistributedV41Backend:
             self.capabilities, self.num_pages = records[0]
             if any(record != records[0] for record in records[1:]) or self.capabilities.world_size != len(ids):
                 raise RuntimeError("V4.1 ranks disagree on capabilities or physical page capacity")
+            if self.capabilities.platform != platform:
+                raise RuntimeError(f"V4.1 rank platform {self.capabilities.platform!r} differs from {platform!r}")
         except BaseException:
             self._terminate()
             raise

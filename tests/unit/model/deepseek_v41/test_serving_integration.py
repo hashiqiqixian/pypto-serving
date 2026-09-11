@@ -187,7 +187,7 @@ class RecordingBackend:
         self.closed = True
 
 
-def executor_case(case, *, capability_changes=None):
+def executor_case(case, *, capability_changes=None, platform="a2a3"):
     module = case.modules.executor
     caps = module.V41BackendCapabilities(
         world_size=1,
@@ -196,6 +196,7 @@ def executor_case(case, *, capability_changes=None):
         max_seq_len=8,
         num_layers=1,
         parallel_mode="reference_tp",
+        platform=platform,
     )
     if capability_changes:
         caps = dataclasses.replace(caps, **capability_changes)
@@ -206,7 +207,7 @@ def executor_case(case, *, capability_changes=None):
         factory_calls.append(kwargs)
         return backend
 
-    executor = module.DeepSeekV41PyptoExecutor(kernel_factory=factory, device_ids=(0,))
+    executor = module.DeepSeekV41PyptoExecutor(kernel_factory=factory, device_ids=(0,), platform=platform)
     return executor, backend, factory_calls
 
 
@@ -288,18 +289,21 @@ def test_executor_uses_bundled_factory_without_device_start(modules):
     executor = modules.executor.DeepSeekV41PyptoExecutor()
     assert executor._factory.__module__ == "pypto_serving.model.deepseek_v41.backend"
     assert executor._runner is None
-    with pytest.raises(ValueError, match="platform='a5'"):
-        modules.executor.DeepSeekV41PyptoExecutor(platform="a2a3", kernel_factory=lambda **kwargs: None)
+    assert executor._platform == "a2a3"
+    with pytest.raises(ValueError, match="platform='a2a3' or 'a5'"):
+        modules.executor.DeepSeekV41PyptoExecutor(platform="cuda", kernel_factory=lambda **kwargs: None)
 
 
-def test_executor_registers_lazy_loader_and_translates_prefill_decode_release(case):
-    executor, backend, calls = executor_case(case)
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_executor_registers_lazy_loader_and_translates_prefill_decode_release(case, platform):
+    executor, backend, calls = executor_case(case, platform=platform)
     try:
         assert executor.register_model("tiny-v41", case.record) == 4
         assert len(calls) == 1
         assert isinstance(calls[0]["weight_loader"], case.modules.executor.DeepSeekV41WeightLoader)
         assert calls[0]["weight_loader"].max_load_bytes == 256 << 20
         assert calls[0]["device_ids"] == (0,)
+        assert calls[0]["platform"] == platform == backend.capabilities.platform
         assert executor.supports_device_embedding
         batch = prefill(case)
         result = executor.run_prefill(case.loaded.runtime_model, batch)
@@ -404,6 +408,7 @@ def test_executor_rejects_physical_page_at_pool_upper_bound_before_dispatch(case
         {"transactional": False},
         {"max_chunk_tokens": 1},
         {"cache_format": "v4"},
+        {"platform": "a5"},
     ],
 )
 def test_executor_rejects_incomplete_backend_contract_and_closes_backend(case, changes):
@@ -500,8 +505,6 @@ def engine_config(case, monkeypatch, *extra):
         [
             "--model",
             str(case.root),
-            "--platform",
-            "a5",
             "--v41-kernel-factory",
             "test_backend:factory",
             "--max-model-len",
@@ -518,8 +521,11 @@ def engine_config(case, monkeypatch, *extra):
     return case.modules.cli.build_serving_engine_config(args)
 
 
-def test_cli_selects_v41_executor_tp_ep_and_matching_cache_groups(case, monkeypatch):
-    result = engine_config(case, monkeypatch, "--devices", "0,1", "--tp", "2", "--ep", "2")
+@pytest.mark.parametrize("platform", [None, "a2a3", "a5"])
+def test_cli_selects_v41_executor_tp_ep_and_matching_cache_groups(case, monkeypatch, platform):
+    selection = () if platform is None else ("--platform", platform)
+    result = engine_config(case, monkeypatch, "--devices", "0,1", "--tp", "2", "--ep", "2", *selection)
+    assert result.platform == (platform or "a2a3")
     assert result.executor_cls == "PyptoDeepSeekV41Executor"
     assert result.executor_kwargs["kernel_factory"] == "test_backend:factory"
     assert result.parallel_config.data_parallel_size == 1
@@ -539,7 +545,7 @@ def test_cli_selects_v41_executor_tp_ep_and_matching_cache_groups(case, monkeypa
 @pytest.mark.parametrize(
     "options,message",
     [
-        (("--platform", "a2a3"), "platform a5"),
+        (("--platform", "cuda"), "platform a2a3 or a5"),
         (("--devices", "0,1", "--dp", "2", "--ep", "2"), "--dp 1"),
         (("--num-speculative-tokens", "1"), "requires draft layers"),
     ],
