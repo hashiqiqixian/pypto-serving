@@ -15,6 +15,10 @@ requested and reported backend capabilities must match. Custom V4.1 kernel
 factories now receive the `platform` keyword. Their capabilities must report it.
 An unavailable backend fails instead of falling back to CPU.
 
+PyPTO fixes the compiler architecture for the lifetime of a process. Use separate
+workers for A3 and A5; changing an existing worker's architecture is unsupported.
+The dual-platform codegen checks therefore use separate, bounded subprocesses.
+
 FP8 dense and FP4 expert values are decoded to normalized BF16 values, with
 FP32 accumulation and explicit scale application. This works without assuming
 a native mixed FP8-by-FP4 instruction on A3. Native checkpoint float8 dtypes are
