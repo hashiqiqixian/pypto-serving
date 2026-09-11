@@ -1,5 +1,9 @@
 # DeepSeek V4.1 P0 progress
 
+This is the historical P0 report through commit `290213a`. See the subsequent
+[host execution framework](deepseek-v41-framework.md) for the loader, serving,
+cache, Engram and DSpark changes added after this report.
+
 P0 is **BLOCKED**, not complete. This change implements independent configuration,
 source weight specifications, bounded checkpoint inspection, and small CPU quantization
 references. It does not register an executable V4.1 model or implement NPU packing,

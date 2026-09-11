@@ -442,7 +442,11 @@ class ModelLoader:
 
     def __init__(self, format_loaders: list[ModelFormatLoader] | None = None) -> None:
         """Create a loader registry with optional custom format loaders."""
-        self._format_loaders = format_loaders or [DeepSeekV4W8A8DirectoryLoader(), HuggingFaceDirectoryLoader()]
+        from .deepseek_v41.format_loader import DeepSeekV41DirectoryLoader
+
+        self._format_loaders = format_loaders or [
+            DeepSeekV41DirectoryLoader(), DeepSeekV4W8A8DirectoryLoader(), HuggingFaceDirectoryLoader()
+        ]
 
     def register(self, format_loader: ModelFormatLoader) -> None:
         """Register an additional model format loader."""

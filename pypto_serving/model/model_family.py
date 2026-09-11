@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 
-ModelFamily = Literal["deepseek_v4", "qwen"]
+ModelFamily = Literal["deepseek_v4", "deepseek_v41", "qwen"]
 
 
 def read_model_config(model_dir: str | Path) -> dict[str, object]:
@@ -41,6 +41,19 @@ def is_deepseek_v4_config(config_data: dict[str, object]) -> bool:
     return model_type == "deepseek_v4" or "deepseekv4forcausallm" in architectures
 
 
+def is_deepseek_v41_config(config_data: dict[str, object]) -> bool:
+    """Recognize V4.1 independently, without broadening V4 checkpoint detection."""
+    architectures = config_data.get("architectures") or ()
+    return str(config_data.get("model_type", "")).lower() == "deepseek_v41" or (
+        isinstance(architectures, (list, tuple))
+        and "deepseekv41forcausallm" in {str(item).lower() for item in architectures}
+    )
+
+
 def detect_model_family(config_data: dict[str, object]) -> ModelFamily:
     """Return the serving model family inferred from config metadata."""
+    if is_deepseek_v41_config(config_data):
+        if is_deepseek_v4_config(config_data):
+            raise ValueError("Conflicting DeepSeek V4 and V4.1 model identifiers")
+        return "deepseek_v41"
     return "deepseek_v4" if is_deepseek_v4_config(config_data) else "qwen"
