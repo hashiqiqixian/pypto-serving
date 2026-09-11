@@ -24,11 +24,23 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+class SafeTensorSlice(Protocol):
+    """Header-only tensor metadata and bounded safetensors slicing."""
+
+    def get_shape(self) -> list[int]: ...
+
+    def __getitem__(self, index: tuple[slice, ...]) -> torch.Tensor: ...
+
+
 class SafeTensorReader(Protocol):
     """Minimal safetensors reader protocol used by the lazy weight store."""
 
     def get_tensor(self, name: str) -> torch.Tensor:
         """Return one tensor by name."""
+        raise NotImplementedError
+
+    def get_slice(self, name: str) -> SafeTensorSlice:
+        """Return a lazy slice handle without materializing the whole tensor."""
         raise NotImplementedError
 
 
@@ -109,6 +121,41 @@ class LazySafetensorsStore:
     def load_tensor(self, name: str) -> torch.Tensor:
         """Load one tensor by name, leaving all unrelated shard tensors untouched."""
         return self.load_many([name])[name]
+
+    def load_slice(self, name: str, ranges: tuple[slice, ...]) -> torch.Tensor:
+        """Read one rectangular slice through safetensors ``get_slice``.
+
+        Every dimension must have a unit-step, nonnegative slice within its
+        source extent; dimensions are retained. The family caller owns dtype,
+        expected shape, layout and resource-budget validation. This method
+        never falls back to ``get_tensor`` for readers lacking slicing support.
+        """
+        if (
+            not isinstance(ranges, tuple)
+            or not ranges
+            or any(
+                not isinstance(part, slice)
+                or (part.step is not None and (type(part.step) is not int or part.step != 1))
+                or any(
+                    value is not None and (type(value) is not int or value < 0)
+                    for value in (part.start, part.stop)
+                )
+                for part in ranges
+            )
+        ):
+            raise ValueError("ranges must contain one nonnegative, unit-step slice per dimension")
+        path = self.path_for(name)
+        if not path.exists():
+            raise FileNotFoundError(self.missing_shard_error.format(path=path))
+        with self._safe_open_fn(path, self.device) as reader:
+            sliced = reader.get_slice(name)
+            shape = sliced.get_shape()
+            if len(ranges) != len(shape) or any(
+                not 0 <= (part.start or 0) <= (size if part.stop is None else part.stop) <= size
+                for part, size in zip(ranges, shape)
+            ):
+                raise ValueError("slice rank or bounds disagree with source tensor shape")
+            return sliced[ranges]
 
     def load_many(self, names: Sequence[str]) -> dict[str, torch.Tensor]:
         """Load a set of named tensors grouped by shard file.

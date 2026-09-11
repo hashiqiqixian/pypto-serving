@@ -17,13 +17,14 @@ hc_pre, norm and output projection and returns the last token's vocabulary logit
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import RLock
 from typing import Any, Protocol
 
 from .cache import CacheLease, CacheTransaction, V41CacheState
 from .config import DeepSeekV41Config, LayerPlan
 from .engram import EngramHashState
+from .dspark import choose_verification_count
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class V41WorkItem:
     block_ids_by_group: Mapping[str, Sequence[int]]
     partition: int = 0
     mode: str = "prefill"
+    multimodal: Any = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,7 @@ class DeepSeekV41Runner:
         self._next_generation = 0
         self._lock = RLock()
         self._closed = False
+        self.speculation_stats = {name: 0 for name in ("rounds", "proposed", "verified", "accepted", "rejected")}
 
     def _check_open(self) -> None:
         if self._closed:
@@ -148,7 +151,13 @@ class DeepSeekV41Runner:
                     )
                     pending.append(tx)
                     snapshots.append((request, request.history.snapshot()))
-                    hashes = request.history.advance(item.token_ids, start_pos=item.start_pos)
+                    mask = None
+                    if item.multimodal is not None:
+                        mask = tuple(kind < 0 for kind in item.multimodal.token_types[
+                            item.start_pos: item.start_pos + len(item.token_ids)])
+                        if len(mask) != len(item.token_ids):
+                            raise ValueError("multimodal token types do not cover the prefill chunk")
+                    hashes = request.history.advance(item.token_ids, start_pos=item.start_pos, token_mask=mask)
                     contexts.append(V41ExecutionContext(item, request.generation, tx, hashes))
                 ticket = self.backend.begin_batch(tuple(contexts))
                 began = True
@@ -183,6 +192,75 @@ class DeepSeekV41Runner:
                     raise RuntimeError(
                         "V4.1 backend/state rollback failed; executor is unusable"
                     ) from recovery_error
+                raise
+
+    def speculate(self, items: Sequence[V41WorkItem], *, extra_tokens: int,
+                  validate_outputs: Callable[[list], Any],
+                  minimum_score: float | None = None) -> tuple[Any, list[list[int]]]:
+        """Greedy DSpark with sequential target verification and atomic batch recovery.
+
+        Only accepted prefix tokens are consumed by the target; the final
+        correction remains pending for the next dispatch. The initial path pays
+        for sequential verification and does not claim speculative acceleration.
+        """
+        with self._lock:
+            self._check_open()
+            if type(extra_tokens) is not int or not 1 <= extra_tokens <= self.config.text_config["dspark_block_size"]:
+                raise ValueError("DSpark extra tokens exceed the configured draft block")
+            if not items or any(item.mode != "decode" for item in items):
+                raise ValueError("DSpark requires existing decode requests")
+            if len({item.request_id for item in items}) != len(items):
+                raise ValueError("duplicate DSpark request IDs")
+            choose_verification_count((), 0, minimum_score)
+            stats = {name: 0 for name in self.speculation_stats}
+            snapshots = []
+            for item in items:
+                request = self._requests[item.request_id]
+                snapshots.append((request, request.history.snapshot(), self.cache.snapshot_bindings(request.lease)))
+            checkpoint = self.backend.checkpoint()
+            try:
+                logits = self.execute(items, validate_outputs=validate_outputs)
+                emitted = [[int(row.argmax().item())] for row in logits]
+                for index, item in enumerate(items):
+                    count = min(extra_tokens, self.cache.max_seq_len - item.start_pos - 1)
+                    # The proposal graph evaluates its entire bidirectional block.
+                    # At the sequence boundary keep the normal target prediction.
+                    if self.cache.max_seq_len - item.start_pos - 1 < self.config.text_config["dspark_block_size"]:
+                        continue
+                    request = self._requests[item.request_id]
+                    proposal = self.backend.propose(item.request_id, request.generation, emitted[index][0])
+                    ids = proposal.output_ids.reshape(-1).cpu().tolist()
+                    scores = proposal.confidence.reshape(-1).cpu().tolist()
+                    if (len(ids) != self.config.text_config["dspark_block_size"] + 1
+                            or len(scores) != len(ids) - 1 or ids[0] != emitted[index][0]
+                            or any(type(token) is not int or not 0 <= token < self.config.vocab_size for token in ids)):
+                        raise ValueError("DSpark proposal has invalid anchor, length or token IDs")
+                    count = choose_verification_count(scores, count, minimum_score)
+                    stats["rounds"] += 1
+                    stats["proposed"] += len(ids) - 1
+                    for offset in range(count):
+                        work = replace(item, token_ids=(emitted[index][-1],), start_pos=item.start_pos + offset + 1)
+                        target = self.execute([work], validate_outputs=validate_outputs)
+                        predicted = int(target[0].argmax().item())
+                        emitted[index].append(predicted)
+                        stats["verified"] += 1
+                        if predicted != ids[offset + 1]:
+                            stats["rejected"] += 1
+                            break
+                        stats["accepted"] += 1
+                self.backend.finish_checkpoint(checkpoint)
+                for name, value in stats.items():
+                    self.speculation_stats[name] += value
+                return logits, emitted
+            except BaseException:
+                try:
+                    self.backend.finish_checkpoint(checkpoint, restore=True)
+                    for request, history, bindings in snapshots:
+                        request.history.restore(history)
+                    self.cache.restore_bindings_many([entry[2] for entry in snapshots], restore_visibility=True)
+                except BaseException as recovery_error:
+                    self._closed = True
+                    raise RuntimeError("DSpark batch recovery failed; recreate executor") from recovery_error
                 raise
 
     def finalize_prefill(self, request_ids: Sequence[str]) -> None:

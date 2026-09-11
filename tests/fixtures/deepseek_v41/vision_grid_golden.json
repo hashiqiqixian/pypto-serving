@@ -1,0 +1,357 @@
+{
+  "revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+  "source_sha256": "482759e3bcc4e9bb5ee582b244cc563f5d0e163d8b48dda91ebb7106e62f9272",
+  "cases": [
+    {
+      "width": 1,
+      "height": 1,
+      "min_pixels": 295936,
+      "max_wh_ratio": null,
+      "max_image_tokens": 1024,
+      "expected": [
+        13,
+        13,
+        546,
+        546
+      ]
+    },
+    {
+      "width": 999,
+      "height": 100,
+      "min_pixels": 295936,
+      "max_wh_ratio": null,
+      "max_image_tokens": 1024,
+      "expected": [
+        5,
+        41,
+        182,
+        1722
+      ]
+    },
+    {
+      "width": 100,
+      "height": 999,
+      "min_pixels": 295936,
+      "max_wh_ratio": null,
+      "max_image_tokens": 1024,
+      "expected": [
+        41,
+        5,
+        1722,
+        182
+      ]
+    },
+    {
+      "width": 10000,
+      "height": 1,
+      "min_pixels": 295936,
+      "max_wh_ratio": null,
+      "max_image_tokens": 1024,
+      "expected": [
+        1,
+        1021,
+        42,
+        42882
+      ]
+    },
+    {
+      "width": 1,
+      "height": 10000,
+      "min_pixels": 295936,
+      "max_wh_ratio": null,
+      "max_image_tokens": 1024,
+      "expected": [
+        511,
+        1,
+        21462,
+        42
+      ]
+    },
+    {
+      "width": 1920,
+      "height": 1080,
+      "min_pixels": 295936,
+      "max_wh_ratio": null,
+      "max_image_tokens": 1024,
+      "expected": [
+        23,
+        41,
+        966,
+        1708
+      ]
+    },
+    {
+      "width": 1080,
+      "height": 1920,
+      "min_pixels": 295936,
+      "max_wh_ratio": null,
+      "max_image_tokens": 1024,
+      "expected": [
+        41,
+        23,
+        1708,
+        966
+      ]
+    },
+    {
+      "width": 544,
+      "height": 544,
+      "min_pixels": 295936,
+      "max_wh_ratio": null,
+      "max_image_tokens": 1024,
+      "expected": [
+        13,
+        13,
+        546,
+        546
+      ]
+    },
+    {
+      "width": 10000,
+      "height": 10000,
+      "min_pixels": 295936,
+      "max_wh_ratio": null,
+      "max_image_tokens": 1024,
+      "expected": [
+        31,
+        31,
+        1302,
+        1302
+      ]
+    },
+    {
+      "width": 1,
+      "height": 1,
+      "min_pixels": 0,
+      "max_wh_ratio": 2,
+      "max_image_tokens": 16,
+      "expected": [
+        1,
+        1,
+        14,
+        14
+      ]
+    },
+    {
+      "width": 999,
+      "height": 100,
+      "min_pixels": 0,
+      "max_wh_ratio": 2,
+      "max_image_tokens": 16,
+      "expected": [
+        2,
+        4,
+        84,
+        168
+      ]
+    },
+    {
+      "width": 100,
+      "height": 999,
+      "min_pixels": 0,
+      "max_wh_ratio": 2,
+      "max_image_tokens": 16,
+      "expected": [
+        7,
+        1,
+        294,
+        42
+      ]
+    },
+    {
+      "width": 10000,
+      "height": 1,
+      "min_pixels": 0,
+      "max_wh_ratio": 2,
+      "max_image_tokens": 16,
+      "expected": [
+        1,
+        1,
+        14,
+        14
+      ]
+    },
+    {
+      "width": 1,
+      "height": 10000,
+      "min_pixels": 0,
+      "max_wh_ratio": 2,
+      "max_image_tokens": 16,
+      "expected": [
+        7,
+        1,
+        294,
+        42
+      ]
+    },
+    {
+      "width": 1920,
+      "height": 1080,
+      "min_pixels": 0,
+      "max_wh_ratio": 2,
+      "max_image_tokens": 16,
+      "expected": [
+        2,
+        4,
+        84,
+        140
+      ]
+    },
+    {
+      "width": 1080,
+      "height": 1920,
+      "min_pixels": 0,
+      "max_wh_ratio": 2,
+      "max_image_tokens": 16,
+      "expected": [
+        4,
+        2,
+        140,
+        84
+      ]
+    },
+    {
+      "width": 544,
+      "height": 544,
+      "min_pixels": 0,
+      "max_wh_ratio": 2,
+      "max_image_tokens": 16,
+      "expected": [
+        3,
+        3,
+        126,
+        126
+      ]
+    },
+    {
+      "width": 10000,
+      "height": 10000,
+      "min_pixels": 0,
+      "max_wh_ratio": 2,
+      "max_image_tokens": 16,
+      "expected": [
+        3,
+        3,
+        126,
+        126
+      ]
+    },
+    {
+      "width": 1,
+      "height": 1,
+      "min_pixels": 0,
+      "max_wh_ratio": null,
+      "max_image_tokens": 4,
+      "expected": [
+        1,
+        1,
+        14,
+        14
+      ]
+    },
+    {
+      "width": 999,
+      "height": 100,
+      "min_pixels": 0,
+      "max_wh_ratio": null,
+      "max_image_tokens": 4,
+      "expected": [
+        1,
+        1,
+        42,
+        42
+      ]
+    },
+    {
+      "width": 100,
+      "height": 999,
+      "min_pixels": 0,
+      "max_wh_ratio": null,
+      "max_image_tokens": 4,
+      "expected": [
+        1,
+        1,
+        42,
+        42
+      ]
+    },
+    {
+      "width": 10000,
+      "height": 1,
+      "min_pixels": 0,
+      "max_wh_ratio": null,
+      "max_image_tokens": 4,
+      "expected": [
+        1,
+        1,
+        42,
+        42
+      ]
+    },
+    {
+      "width": 1,
+      "height": 10000,
+      "min_pixels": 0,
+      "max_wh_ratio": null,
+      "max_image_tokens": 4,
+      "expected": [
+        1,
+        1,
+        42,
+        42
+      ]
+    },
+    {
+      "width": 1920,
+      "height": 1080,
+      "min_pixels": 0,
+      "max_wh_ratio": null,
+      "max_image_tokens": 4,
+      "expected": [
+        1,
+        1,
+        42,
+        42
+      ]
+    },
+    {
+      "width": 1080,
+      "height": 1920,
+      "min_pixels": 0,
+      "max_wh_ratio": null,
+      "max_image_tokens": 4,
+      "expected": [
+        1,
+        1,
+        42,
+        42
+      ]
+    },
+    {
+      "width": 544,
+      "height": 544,
+      "min_pixels": 0,
+      "max_wh_ratio": null,
+      "max_image_tokens": 4,
+      "expected": [
+        1,
+        1,
+        42,
+        42
+      ]
+    },
+    {
+      "width": 10000,
+      "height": 10000,
+      "min_pixels": 0,
+      "max_wh_ratio": null,
+      "max_image_tokens": 4,
+      "expected": [
+        1,
+        1,
+        42,
+        42
+      ]
+    }
+  ]
+}

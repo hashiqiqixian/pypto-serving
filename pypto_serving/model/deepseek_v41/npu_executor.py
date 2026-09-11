@@ -6,11 +6,12 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Serving adapter for the V4.1 transactional runner and an explicit A5 kernel factory."""
+"""Serving adapter for the V4.1 transactional runner and built-in A5 arithmetic."""
 
 from __future__ import annotations
 
 import importlib
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -71,16 +72,16 @@ class V41BackendCapabilities:
 
 
 def _resolve_factory(factory: str | Callable[..., Any] | None) -> Callable[..., Any]:
+    if factory is None:
+        from .backend import create_backend
+        return create_backend
     if isinstance(factory, str):
         module, separator, name = factory.partition(":")
         if not separator or not module or not name or ":" in name:
             raise ValueError("V4.1 kernel factory must be MODULE:CALLABLE")
         factory = getattr(importlib.import_module(module), name)
     if not callable(factory):
-        raise RuntimeError(
-            "V4.1 A5 arithmetic kernels are not bundled yet. Supply an implemented "
-            "--v41-kernel-factory MODULE:CALLABLE; host framework tests do not provide model inference."
-        )
+        raise TypeError("V4.1 kernel factory must be callable or MODULE:CALLABLE")
     return factory
 
 
@@ -96,6 +97,7 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         kernel_factory: str | Callable[..., Any] | None = None,
         use_compile_cache: bool = False,
         max_load_bytes: int = 256 << 20,
+        draft_confidence_threshold: float | None = None,
     ) -> None:
         super().__init__()
         if platform != "a5":
@@ -108,6 +110,9 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
             raise ValueError("V4.1 device IDs must be unique")
         self._build_dir, self._use_compile_cache = pypto_build_dir, use_compile_cache
         self._max_load_bytes = max_load_bytes
+        if draft_confidence_threshold is not None and not math.isfinite(draft_confidence_threshold):
+            raise ValueError("DSpark confidence threshold must be finite")
+        self._draft_confidence_threshold = draft_confidence_threshold
         self._runner = self._model = None
 
     @property
@@ -120,9 +125,9 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         model, runtime = record.runtime_model, record.runtime
         if model.config.model_id != model_id or model.extra.get("family") != "deepseek_v41":
             raise ValueError("V4.1 executor/model registration mismatch")
-        if runtime.num_speculative_tokens:
-            raise ValueError("DSpark host verification is available separately; serving kernels are pending")
         config = model.extra["v41_config"]
+        if not 0 <= runtime.num_speculative_tokens <= config.text_config["dspark_block_size"]:
+            raise ValueError("DSpark token reservation exceeds the checkpoint draft block")
         world = len(self._device_ids)
         config.expert_ownership(world, 0)
         if (
@@ -155,6 +160,11 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         )
         try:
             caps = backend.capabilities
+            if runtime.num_speculative_tokens and any(
+                not callable(getattr(backend, name, None))
+                for name in ("checkpoint", "finish_checkpoint", "propose")
+            ):
+                raise ValueError("DSpark requires checkpoint, finish_checkpoint and propose backend methods")
             if not isinstance(caps, V41BackendCapabilities):
                 raise ValueError("kernel bundle must return V41BackendCapabilities")
             if (
@@ -260,6 +270,9 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         ):
             raise ValueError("inconsistent packed prefill metadata")
         tokens = batch.token_ids.reshape(-1).tolist()
+        multimodal = getattr(batch, "multimodal", None) or [None] * count
+        if len(multimodal) != count:
+            raise ValueError("prefill multimodal metadata must match the request batch")
         cursor, items = 0, []
         for i in range(count):
             size, start = batch.chunk_lens[i], batch.chunk_starts[i]
@@ -272,12 +285,24 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
                 or batch.seq_lens[i] != start + size
             ):
                 raise ValueError("invalid prefill chunk offsets, lengths or positions")
+            images = None
+            if multimodal[i] is None and model.extra["config_data"].get("image_token_id", 129264) in tokens[cursor:cursor + size]:
+                raise ValueError("image placeholder tokens require multimodal image metadata")
+            if multimodal[i] is not None:
+                from .vision import VisionConfig, from_wire
+                images = from_wire(multimodal[i], VisionConfig.from_config(model.extra["config_data"]))
+                if images.tokens[start:start + size] != tuple(tokens[cursor:cursor + size]):
+                    raise ValueError("multimodal prompt tokens disagree with scheduler input tokens")
+                boundary = max(image.start + len(image.types) for image in images.images)
+                if boundary > (size if start == 0 else start):
+                    raise ValueError("all image spans must fit the first prefill chunk")
             items.append(
                 V41WorkItem(
                     batch.request_ids[i],
                     tuple(tokens[cursor : cursor + size]),
                     start,
                     batch.block_ids_by_group[i],
+                    multimodal=images,
                 )
             )
             cursor += size
@@ -314,11 +339,24 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
                 batch.block_ids_by_group,
             )
         ]
+        extra = model.runtime.num_speculative_tokens
+        if extra and len(batch.sampling_params) == count and all(
+            params.temperature == 0 for params in batch.sampling_params
+        ):
+            logits, emitted = runner.speculate(items, extra_tokens=extra, validate_outputs=self._logits,
+                                                minimum_score=self._draft_confidence_threshold)
+            return DecodeResult(None, logits, accepted_token_ids=emitted)
         return DecodeResult(None, runner.execute(items, validate_outputs=self._logits))
 
     def release_finished_requests(self, request_ids: list[str]) -> None:
         if self._runner is not None:
             self._runner.release(request_ids)
+
+    def diagnostics(self) -> dict:
+        """Return actual host counters; memory values are exposed by the owning backend."""
+        runner = self._require_model(self._model)
+        return {"speculation": dict(runner.speculation_stats),
+                "backend": runner.backend.diagnostics() if hasattr(runner.backend, "diagnostics") else {}}
 
     def close(self) -> None:
         if self._runner is not None:

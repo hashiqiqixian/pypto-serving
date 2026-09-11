@@ -115,6 +115,7 @@ class Request:
     # prefill result.  This is a per-request barrier, so unrelated ready requests
     # can continue to use the depth-2 pipeline.
     terminal_prefill_in_flight: bool = False
+    multimodal: dict | None = None
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -201,6 +202,7 @@ class Scheduler:
     def add_request(self, request: Request) -> None:
         prompt_len = len(request.prompt_token_ids)
         max_seq_len = self.config.max_seq_len
+        self.validate_multimodal(prompt_len, request.multimodal)
         if prompt_len > max_seq_len:
             # vLLM-style: reject rather than silently truncate. A prompt that
             # cannot fit max_seq_len can never be served, so failing loudly is
@@ -244,6 +246,20 @@ class Scheduler:
         request.status = RequestStatus.WAITING
         self.waiting.append(request)
         self.requests[request.request_id] = request
+
+    def validate_multimodal(self, prompt_len: int, payload: dict | None) -> None:
+        """Validate image admission before a streaming HTTP response is opened."""
+        if payload is None:
+            return
+        boundary = payload.get("first_chunk_end")
+        if type(boundary) is not int or not 0 < boundary <= prompt_len:
+            raise ValueError("multimodal first_chunk_end must identify a position inside the prompt")
+        if prompt_len >= self.config.max_seq_len:
+            raise ValueError("multimodal prompt must leave room for generation within max_seq_len")
+        if boundary > self._single_prefill_dispatch_limit():
+            raise ValueError("all image spans must fit in the first prefill chunk; increase the prefill token limit")
+        if self.config.enable_prefix_cache:
+            raise ValueError("image requests require prefix caching to be disabled")
 
     def abort_request(self, request_id: str) -> None:
         request = self.requests.get(request_id)
@@ -567,6 +583,9 @@ class Scheduler:
                 limit = min(limit, chunk_limit)
             if self._requires_single_prefill_dispatch() and needed > limit:
                 return 0
+            if request.num_computed_tokens == 0 and request.multimodal is not None:
+                if limit < request.multimodal["first_chunk_end"]:
+                    return 0
         return min(needed, limit)
 
     def _grouped_cache_phase(self) -> str | None:

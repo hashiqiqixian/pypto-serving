@@ -21,6 +21,7 @@ Issues = "https://github.com/hw-native-sys/pypto-serving/issues"
 [project.scripts]
 pypto-serving = "pypto_serving.cli.main:main"
 pypto-prepack-deepseek-v4 = "pypto_serving.tools.prepack_deepseek_v4:main"
+pypto-benchmark-http = "pypto_serving.tools.benchmark_http:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

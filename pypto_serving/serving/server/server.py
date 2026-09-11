@@ -60,7 +60,7 @@ class CompletionRequest(BaseModel):
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: str | list[dict]
 
 
 class ChatCompletionRequest(BaseModel):
@@ -272,6 +272,9 @@ class ServingServer:
             request.chat_template_kwargs,
             reasoning_effort=request.reasoning_effort,
         )
+        validate_prompt = getattr(self.engine, "validate_prepared_prompt", None)
+        if callable(validate_prompt):
+            validate_prompt(prompt)
         # The OpenAI chat schema has no ignore_eos field, so the server-wide
         # config decides it (the completions endpoint keeps its historic
         # always-ignore-EOS override).

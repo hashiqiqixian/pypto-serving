@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import json
+from pathlib import Path
 
 from pypto_serving.model.tokenizer import TransformersTokenizerAdapter
 
@@ -20,7 +22,32 @@ from .encoding import encode_messages
 class DeepSeekV41TokenizerAdapter(TransformersTokenizerAdapter):
     """Pure-text generation adapter; the checkpoint has no Jinja chat_template."""
 
-    def apply_chat_template(self, messages: Sequence[Mapping[str, object]], **kwargs) -> str | list[int]:
+    def __init__(self, tokenizer, *, raw_config=None):
+        super().__init__(tokenizer)
+        self.raw_config = raw_config
+
+    @classmethod
+    def from_tokenizer_file(cls, model_dir):
+        adapter = super().from_tokenizer_file(model_dir)
+        adapter.raw_config = json.loads((Path(model_dir) / "config.json").read_text())
+        return adapter
+
+    @classmethod
+    def from_pretrained(cls, model_dir, trust_remote_code=False):
+        adapter = super().from_pretrained(model_dir, trust_remote_code=trust_remote_code)
+        adapter.raw_config = json.loads((Path(model_dir) / "config.json").read_text())
+        return adapter
+
+    def apply_chat_template(self, messages: Sequence[Mapping[str, object]], **kwargs):
+        if any(
+            isinstance(message, Mapping) and isinstance(message.get("content"), list) for message in messages
+        ):
+            from .vision_chat import prepare_chat_prompt
+
+            return prepare_chat_prompt(self, messages, **kwargs)
+        return self._render_text(messages, False, **kwargs)
+
+    def _render_text(self, messages, allow_images, /, **kwargs):
         allowed = {
             "thinking",
             "enable_thinking",
@@ -54,5 +81,6 @@ class DeepSeekV41TokenizerAdapter(TransformersTokenizerAdapter):
             thinking_mode=mode,
             reasoning_effort=effort,
             drop_thinking=kwargs.get("drop_thinking", True),
+            _allow_image_placeholders=allow_images,
         )
         return self.encode(prompt) if kwargs.get("tokenize", False) else prompt
