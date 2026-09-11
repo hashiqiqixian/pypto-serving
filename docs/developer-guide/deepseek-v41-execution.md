@@ -1,5 +1,13 @@
 # DeepSeek V4.1 execution implementation
 
+The subsequent A3/A5 branch supports both `--platform a2a3` (the default,
+including A3) and explicit `--platform a5`. Platform selection is passed through
+the executor, single-rank or distributed backend, and PyPTO RunConfig; a backend
+reporting another platform is rejected. Both targets use the same checkpoint
+and packed-cache contracts. The A5-only descriptions and validation snapshot
+below record the earlier `9a73a7a` implementation. For current bring-up commands
+and evidence, see [Ascend platform validation](deepseek-v41-ascend.md).
+
 The V4.1 integration now includes arithmetic, streamed weight access, packed
 cache storage, a built-in A5 backend, TP/EP rank execution, DSpark and image
 requests. This is a correctness-oriented implementation prepared without an

@@ -9,13 +9,17 @@
 """Independent dtype goldens and arithmetic-order tests; no real-model acceptance claim."""
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-torch = pytest.importorskip("torch")
+if os.environ.get("PYPTO_V41_NPU_TESTS") == "1":
+    import torch
+else:
+    torch = pytest.importorskip("torch")
 
 
 @pytest.fixture
@@ -109,3 +113,101 @@ def test_fp32_inputs_are_preserved_for_routing_and_head(module):
     ops = module.TensorOps(Weights())
     x = torch.tensor([[1.003, 1.]])
     torch.testing.assert_close(ops.linear(x, "head"), x @ torch.tensor([[1.001], [-1.]]), rtol=0, atol=0)
+
+
+@pytest.fixture
+def npu_device():
+    """Use only the explicitly allocated card; opt-in setup failures are errors."""
+    if os.environ.get("PYPTO_V41_NPU_TESTS") != "1":
+        pytest.skip("set PYPTO_V41_NPU_TESTS=1 and TASK_DEVICE to run real Ascend numerics")
+    raw_device = os.environ.get("TASK_DEVICE")
+    if raw_device is None or not raw_device.isdecimal():
+        pytest.fail("TASK_DEVICE must explicitly select one nonnegative integer NPU device")
+    importlib.import_module("torch_npu")
+    assert torch.npu.is_available(), "explicit NPU numerical tests require an available device"
+    device = torch.device(f"npu:{int(raw_device)}")
+    torch.npu.set_device(device)
+    return device
+
+
+@pytest.mark.parametrize("fmt,block", [("fp8_e4m3_ue8m0", 32), ("fp4_e2m1_ue8m0", 32),
+                                      ("fp4_e2m1_e4m3", 16)])
+def test_real_npu_quantization_bytes_scales_and_dequantization_match_cpu(module, npu_device, fmt, block):
+    # Tiny deterministic rows include signed zero, FP4 midpoint ties and several
+    # scale exponents. Native checkpoint float8 tensors never move onto the NPU.
+    values = torch.linspace(-6, 6, 256).reshape(4, 64)
+    values[0, :16] = torch.tensor([0., -0., .25, -.25, .75, -.75, 1.25, -1.25,
+                                   1.75, -1.75, 2.5, -2.5, 3.5, -3.5, 5., -5.])
+    values *= torch.tensor([1., .03125, 8., .00390625])[:, None]
+    values = values.to(torch.bfloat16)
+    expected = module.quantize_rows(values, fmt, block)
+    with torch.inference_mode():
+        actual = module.quantize_rows(values.to(npu_device), fmt, block)
+        decoded = actual.dequantize()
+    assert actual.values.device == actual.scales.device == decoded.device == npu_device
+    assert actual.values.dtype == actual.scales.dtype == torch.uint8
+    assert torch.equal(actual.values.cpu(), expected.values)
+    assert torch.equal(actual.scales.cpu(), expected.scales)
+    # Comparing BF16 storage catches signed-zero differences as well as values.
+    assert torch.equal(decoded.cpu().view(torch.int16), expected.dequantize().view(torch.int16))
+
+
+def test_real_npu_rms_norm_and_hc_pre_post_match_independent_cpu_formulas(module, npu_device):
+    x = torch.tensor([[[1., -2., .5, 3.], [-.5, 4., -1., 2.]],
+                      [[2., 1., -3., .25], [1., -2., 2., -4.]]], dtype=torch.bfloat16)
+    pre = torch.tensor([[.25, .75], [.5, .125]])
+    post = torch.tensor([[.5, 1.5], [.25, .75]])
+    comb = torch.tensor([[[.1, .2], [.3, .4]], [[.5, .25], [.125, .75]]])
+    update = torch.tensor([[1., -.5, 2., 3.], [-1., 2., .5, -.25]], dtype=torch.bfloat16)
+    weight = torch.tensor([.5, 1., 1.5, 2.], dtype=torch.bfloat16)
+    eps = 1e-6
+    normalized = update.float() / (update.float().square().mean(-1, keepdim=True) + eps).sqrt()
+    expected_norm = (normalized * weight.float()).to(torch.bfloat16)
+    expected_pre = torch.einsum("bhd,bh->bd", x.float(), pre).to(torch.bfloat16)
+    expected_post = (torch.einsum("bij,bid->bjd", comb, x.float()) +
+                     post[..., None] * update.float()[:, None]).to(torch.bfloat16)
+    with torch.inference_mode():
+        actual_norm = module.rms_norm(update.to(npu_device), weight.to(npu_device), eps)
+        actual_pre = module.ModelMath.hc_pre(x.to(npu_device), pre.to(npu_device))
+        actual_post = module.ModelMath.hc_post(update.to(npu_device), x.to(npu_device),
+                                              post.to(npu_device), comb.to(npu_device))
+    for actual, expected in ((actual_norm, expected_norm), (actual_pre, expected_pre),
+                             (actual_post, expected_post)):
+        assert actual.device == npu_device and actual.dtype == torch.bfloat16
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+def test_real_npu_hc_mixes_match_independent_cpu_formula(module, npu_device):
+    x = torch.tensor([[[.25, -.5, 1., 2.], [1.5, .75, -1., .5]],
+                      [[-1., 2., .5, .25], [.75, -.5, 1.25, 1.]]])
+    projection = torch.arange(64).reshape(8, 8).float() / 128 - .25
+    scale = torch.tensor([.3, -.2, .4])
+    base = torch.linspace(-.2, .3, 8)
+    eps, hc_eps, iterations = 1e-6, 1e-5, 3
+
+    class DeviceWeights:
+        def linear(self, value, name):
+            assert name == "hc_fn" and value.device == npu_device
+            return torch.nn.functional.linear(value, projection.to(npu_device))
+
+        def weight(self, name):
+            return {"hc_scale": scale, "hc_base": base}[name].to(npu_device)
+
+    config = SimpleNamespace(text_config={"hc_mult": 2, "rms_norm_eps": eps,
+                                          "hc_eps": hc_eps, "hc_sinkhorn_iters": iterations})
+    flat = x.flatten(-2)
+    logits = (flat @ projection.T) / (flat.square().mean(-1, keepdim=True) + eps).sqrt()
+    expected_pre = (logits[:, :2] * scale[0] + base[:2]).sigmoid() + hc_eps
+    expected_post = 2 * (logits[:, 2:4] * scale[1] + base[2:4]).sigmoid()
+    mixed = (logits[:, 4:] * scale[2] + base[4:]).reshape(2, 2, 2)
+    exponentials = (mixed - mixed.amax(-1, keepdim=True)).exp()
+    expected_comb = exponentials / exponentials.sum(-1, keepdim=True) + hc_eps
+    expected_comb /= expected_comb.sum(-2, keepdim=True) + hc_eps
+    for _ in range(iterations - 1):
+        expected_comb /= expected_comb.sum(-1, keepdim=True) + hc_eps
+        expected_comb /= expected_comb.sum(-2, keepdim=True) + hc_eps
+    with torch.inference_mode():
+        actual = module.ModelMath(config, DeviceWeights()).hc_mixes(x.to(npu_device), "hc")
+    for observed, expected in zip(actual, (expected_pre, expected_post, expected_comb)):
+        assert observed.device == npu_device and observed.dtype == torch.float32
+        torch.testing.assert_close(observed.cpu(), expected, rtol=2e-5, atol=2e-6)

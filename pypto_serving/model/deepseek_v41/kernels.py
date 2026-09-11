@@ -11,6 +11,7 @@
 The bridge supplies BF16 inputs padded to M=16, N=64, K=64 multiples and an
 FP32 output. Every output element is written. Quantization decoding and scaling
 are upstream operations; this kernel never interprets FP4 bytes as another dtype.
+RunConfig selects A3 (a2a3) or A5 compilation for the same BF16/FP32 contract.
 """
 
 import pypto.language as pl

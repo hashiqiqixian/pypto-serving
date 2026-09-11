@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Explicit BF16 matrix providers with an actual PyPTO A5 dispatch path.
+"""Explicit BF16 matrix providers with actual PyPTO A3 and A5 dispatch paths.
 
 Both accept CPU BF16 [M,K], [K,N] and return owned CPU FP32 [M,N]. The Torch
 provider is a CPU reference. The PyPTO provider runs the Cube kernel, including
@@ -99,10 +99,11 @@ class TorchMatmulOps:
 
 
 class PyptoMatmulOps:
-    """Synchronous A5 JIT dispatch with bounded, instance-owned shape caching.
+    """Synchronous Ascend JIT dispatch with bounded, instance-owned shape caching.
 
     Args:
-        device_id: Nonnegative A5 device index, passed to PyPTO RunConfig.
+        platform: PyPTO hardware backend, "a2a3" (default, including A3) or "a5".
+        device_id: Nonnegative device index, passed to PyPTO RunConfig.
         build_dir: Optional existing parent for the private temporary artifact directory.
         max_buffer_bytes: Positive tensor-buffer budget checked before padding/allocation.
         max_cached_shapes: Maximum cached padded shapes; least-recently-used entries are evicted.
@@ -115,11 +116,14 @@ class PyptoMatmulOps:
     def __init__(
         self,
         *,
+        platform: str = "a2a3",
         device_id: int = 0,
         build_dir: str | Path | None = None,
         max_buffer_bytes: int = DEFAULT_MAX_BUFFER_BYTES,
         max_cached_shapes: int = 64,
     ) -> None:
+        if type(platform) is not str or platform not in ("a2a3", "a5"):
+            raise ValueError("platform must be 'a2a3' or 'a5'")
         if type(device_id) is not int or device_id < 0:
             raise ValueError("device_id must be a nonnegative integer")
         self.max_buffer_bytes = _positive(max_buffer_bytes, "max_buffer_bytes")
@@ -129,10 +133,12 @@ class PyptoMatmulOps:
 
             from .kernels import make_bf16_matmul_kernel
         except ImportError as exc:
-            raise RuntimeError("PyptoMatmulOps requires an installed PyPTO compiler and A5 runtime") from exc
-        self._config = RunConfig(platform="a5", device_id=device_id, save_kernels=True)
-        if self._config.platform != "a5":
-            raise RuntimeError("PyPTO did not select the requested A5 backend")
+            raise RuntimeError(
+                "PyptoMatmulOps requires an installed PyPTO compiler and Ascend runtime"
+            ) from exc
+        self._config = RunConfig(platform=platform, device_id=device_id, save_kernels=True)
+        if self._config.platform != platform:
+            raise RuntimeError(f"PyPTO did not select the requested {platform!r} backend")
         self._make_kernel = make_bf16_matmul_kernel
         self._artifacts = tempfile.TemporaryDirectory(prefix="v41-matmul-", dir=build_dir)
         self._cache: OrderedDict[tuple[int, int, int], tuple[object, tempfile.TemporaryDirectory]] = (

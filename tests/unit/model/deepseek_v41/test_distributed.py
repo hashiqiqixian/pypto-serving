@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Rank transport and mirrored transaction tests; CPU/Gloo is not A5 acceptance.
+"""Rank transport and mirrored transaction tests; CPU/Gloo is not Ascend acceptance.
 
 The miniature rank backend isolates IPC/collectives and transaction ordering from
 model arithmetic, which is covered by test_backend.py and per-operation goldens.
@@ -147,7 +147,11 @@ def cpu_rank_factory(settings, rank, world_size):
     """Top-level spawn-pickleable factory, never selected by production callers."""
     from pypto_serving.model.deepseek_v41.config import DeepSeekV41Config
     config = DeepSeekV41Config.from_json(Path(settings["model_dir"]) / "config.json")
-    return ArithmeticRank(config, rank, world_size, collectives=True)
+    backend = ArithmeticRank(config, rank, world_size, collectives=True)
+    # This records requested-platform propagation through IPC, while the test
+    # factory still executes explicit CPU arithmetic and Gloo collectives only.
+    backend.capabilities.platform = settings["platform"]
+    return backend
 
 
 def record(settings, *, rid="a", generation=1, start=0, tokens=(1, 2), slot=0):
@@ -281,6 +285,7 @@ def distributed(modules, settings, monkeypatch):
 
 def test_two_gloo_ranks_execute_collectives_commit_abort_checkpoint_and_release(distributed, modules, settings):
     backend = distributed
+    assert backend.capabilities.platform == "a2a3"
     assert backend.diagnostics() == {"ranks": [{"rank": 0, "requests": 0}, {"rank": 1, "requests": 0}]}
     first = context(modules, settings)
     ticket = backend.begin_batch((first,))
@@ -339,3 +344,110 @@ def test_device_validation_precedes_any_spawn(modules, settings, ids):
             config=settings.config, runtime=settings.runtime, cache_layouts=settings.cache.groups,
             weight_loader=None, device_ids=ids,
         )
+
+
+@pytest.mark.parametrize("platform", ["cpu", "a3", "auto", "", None])
+def test_platform_validation_precedes_any_spawn(modules, settings, monkeypatch, platform):
+    monkeypatch.setattr(modules.distributed.mp, "get_context", lambda *_: pytest.fail("must reject before spawn"))
+    with pytest.raises(ValueError, match="platform must be a2a3 or a5"):
+        modules.distributed.DistributedV41Backend(
+            config=settings.config, runtime=settings.runtime, cache_layouts=settings.cache.groups,
+            weight_loader=None, device_ids=[0, 1], platform=platform,
+        )
+
+
+@pytest.fixture
+def recorded_spawn(modules, monkeypatch):
+    """Record only process-construction arguments; actual Gloo execution is tested above."""
+    calls, state = [], SimpleNamespace(reported_platform=None)
+
+    def process(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(pid=None, start=lambda: None)
+
+    factory = SimpleNamespace(Pipe=lambda: (SimpleNamespace(close=lambda: None),
+                                           SimpleNamespace(close=lambda: None)), Process=process)
+    monkeypatch.setattr(modules.distributed.mp, "get_context", lambda *_: factory)
+
+    def receive(self, sequence, deadline):
+        platform = state.reported_platform or calls[0]["args"][1]["platform"]
+        return [(SimpleNamespace(world_size=2, platform=platform), 32)] * 2
+
+    monkeypatch.setattr(modules.distributed.DistributedV41Backend, "_receive", receive)
+    return calls, state
+
+
+@pytest.mark.parametrize("options,expected", [({}, "a2a3"), ({"platform": "a2a3"}, "a2a3"),
+                                             ({"platform": "a5"}, "a5")])
+def test_distributed_platform_default_and_explicit_values_reach_every_rank(modules, settings, recorded_spawn,
+                                                                         options, expected):
+    calls, _ = recorded_spawn
+    backend = modules.distributed.DistributedV41Backend(
+        config=settings.config, runtime=settings.runtime, cache_layouts=settings.cache.groups,
+        weight_loader=SimpleNamespace(model_dir=settings.path, max_load_bytes=1 << 20),
+        device_ids=[2, 5], **options,
+    )
+    try:
+        assert backend.capabilities.platform == expected
+        assert len(calls) == 2
+        for rank, call in enumerate(calls):
+            _, rank_settings, actual_rank, _, factory, collective = call["args"]
+            assert rank_settings["platform"] == expected and actual_rank == rank
+            assert rank_settings["device_ids"] == (2, 5)
+            assert factory is modules.distributed._ascend_backend and collective == "hccl"
+    finally:
+        backend._terminate()
+
+
+@pytest.mark.parametrize("requested,reported", [("a2a3", "a5"), ("a5", "a2a3"), ("a2a3", "cpu")])
+def test_distributed_rejects_rank_platform_mismatch(modules, settings, recorded_spawn, requested, reported):
+    _, state = recorded_spawn
+    state.reported_platform = reported
+    with pytest.raises(RuntimeError, match="rank platform.*differs"):
+        modules.distributed.DistributedV41Backend(
+            config=settings.config, runtime=settings.runtime, cache_layouts=settings.cache.groups,
+            weight_loader=SimpleNamespace(model_dir=settings.path, max_load_bytes=1 << 20),
+            device_ids=[0, 1], platform=requested,
+        )
+
+
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_ascend_factory_passes_platform_to_provider_and_tensor_backend(modules, settings, monkeypatch, platform):
+    """Validate device factory wiring without constructing a runtime or numerical model."""
+    captured = {}
+
+    def provider(**kwargs):
+        captured["provider"] = kwargs
+        return SimpleNamespace(close=lambda: None)
+
+    def tensor_backend(config, runtime, layouts, ops, **kwargs):
+        captured["backend"] = kwargs
+        return SimpleNamespace(platform=kwargs["platform"])
+
+    def tensor_ops(store, **kwargs):
+        captured["ops"] = kwargs
+        return SimpleNamespace(**kwargs)
+
+    replacements = {
+        "backend": {"DeepSeekV41Backend": tensor_backend},
+        "numerics": {"TensorOps": tensor_ops},
+        "pypto_ops": {"PyptoMatmulOps": provider},
+        "tensor_store": {"DeepSeekV41TensorStore": lambda *args, **kwargs: SimpleNamespace(close=lambda: None)},
+        "vision": {"VisionConfig": SimpleNamespace(from_config=lambda raw: "vision-config")},
+    }
+    for suffix, attributes in replacements.items():
+        module = ModuleType("pypto_serving.model.deepseek_v41." + suffix)
+        module.__dict__.update(attributes)
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(set_device=lambda device: captured.update(device=device)),
+                        raising=False)
+    backend = modules.distributed._ascend_backend(
+        {"model_dir": str(settings.path), "device_ids": [2, 5], "max_load_bytes": 1 << 20,
+         "build_dir": None, "runtime": settings.runtime, "layouts": settings.cache.groups, "platform": platform},
+        rank=1, world_size=2,
+    )
+    assert captured["device"] == 5 and backend.platform == platform
+    assert captured["provider"] == {"device_id": 5, "build_dir": None, "platform": platform}
+    assert captured["backend"] == {"vision_config": "vision-config", "platform": platform}
+    assert captured["ops"]["device"] == "npu:5" and captured["ops"]["rank"] == 1

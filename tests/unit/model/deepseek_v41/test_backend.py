@@ -6,17 +6,19 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Complete miniature checkpoint numerical/transaction tests, not A5 acceptance.
+"""Complete miniature checkpoint tests, not real-checkpoint or Ascend acceptance.
 
 The CPU matrix provider evaluates real randomly initialized FP8/FP4/BF16 weights.
 The same target graph is exercised through different scheduling and storage paths;
 these invariance checks supplement the independent per-operation reference goldens.
+One explicit opt-in test executes that same miniature graph through real PyPTO kernels on Ascend.
 """
 
 from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -25,10 +27,18 @@ from types import SimpleNamespace
 import pytest
 
 
-torch = pytest.importorskip("torch", reason="backend numerical tests require CPU Torch")
-serialization = pytest.importorskip("safetensors.torch")
-pytest.importorskip("numpy")
+NPU_TESTS = os.environ.get("PYPTO_V41_NPU_TESTS") == "1"
+torch = importlib.import_module("torch") if NPU_TESTS else pytest.importorskip(
+    "torch", reason="backend numerical tests require CPU Torch")
+serialization = importlib.import_module("safetensors.torch") if NPU_TESTS else pytest.importorskip(
+    "safetensors.torch")
+if NPU_TESTS:
+    importlib.import_module("numpy")
+else:
+    pytest.importorskip("numpy")
 if not hasattr(torch, "float8_e8m0fnu"):
+    if NPU_TESTS:
+        pytest.fail("enabled miniature NPU test requires native UE8M0 Torch dtype", pytrace=False)
     pytest.skip("native UE8M0 dtype is required", allow_module_level=True)
 ROOT = Path(__file__).resolve().parents[4]
 TOKENS = (3, 9, 12, 4, 18, 23, 8, 17, 11)
@@ -115,7 +125,9 @@ def factory(modules, checkpoint):
     path, raw = checkpoint
     created = []
 
-    def make(*, max_seq_len=32, max_chunk=16, speculative=True):
+    def make(*, max_seq_len=32, max_chunk=16, speculative=True, platform="cpu", device_id=0):
+        if platform not in ("cpu", "a2a3", "a5"):
+            raise ValueError("miniature backend platform must be cpu, a2a3 or a5")
         config = modules.config.DeepSeekV41Config.from_dict(raw)
         cache = modules.cache.V41CacheState(config, page_size=2, max_seq_len=max_seq_len,
                                             max_chunk_tokens=max_chunk)
@@ -123,14 +135,33 @@ def factory(modules, checkpoint):
             path, raw, max_load_bytes=8 << 20, row_cache_bytes=4096, prefetch_rows=4,
             out_tile_rows=32, dense_k_tile=32,
         )
-        provider = modules.pypto_ops.TorchMatmulOps(max_buffer_bytes=8 << 20)
-        ops = modules.numerics.TensorOps(weights, matmul_provider=provider)
         runtime = SimpleNamespace(
             max_seq_len=max_seq_len, max_batch_size=2, total_kv_pages=cache.groups[0].max_blocks_per_seq * 2,
             max_prefill_tokens_per_request=max_chunk, max_num_batched_tokens=max_chunk * 2,
             num_speculative_tokens=3 if speculative else 0,
         )
-        backend = modules.backend.DeepSeekV41Backend(config, runtime, cache.groups, ops, platform="cpu")
+        provider = None
+        try:
+            if platform == "cpu":
+                device = "cpu"
+                provider = modules.pypto_ops.TorchMatmulOps(max_buffer_bytes=8 << 20)
+            else:
+                import torch_npu  # noqa: F401 - register the actual Ascend device
+
+                torch.npu.set_device(device_id)
+                device = f"npu:{device_id}"
+                provider = modules.pypto_ops.PyptoMatmulOps(
+                    platform=platform, device_id=device_id, max_buffer_bytes=8 << 20,
+                )
+            ops = modules.numerics.TensorOps(weights, device=device, matmul_provider=provider)
+            backend = modules.backend.DeepSeekV41Backend(config, runtime, cache.groups, ops, platform=platform)
+        except BaseException:
+            try:
+                if provider is not None:
+                    provider.close()
+            finally:
+                weights.close()
+            raise
         layout = modules.engram.EngramLayout.from_config(raw)
 
         def history():
@@ -472,3 +503,49 @@ def test_cpu_diagnostics_report_only_actual_allocations(factory):
     assert 0 < report["weight_row_cache_bytes"] <= 4096 and report["weight_placement"] == "cpu"
     assert all(report[name] is None for name in ("npu_memory_allocated", "npu_memory_reserved",
                                                "npu_max_memory_allocated"))
+
+
+@pytest.mark.skipif(not NPU_TESTS, reason="set PYPTO_V41_NPU_TESTS=1 for the bounded real-NPU test")
+def test_real_npu_miniature_model_prefill_decode(factory):
+    """Two-token prefill and one decode through real five-layer Ascend arithmetic.
+
+    TASK_DEVICE must identify exactly one task-owned device. This uses a tiny
+    random checkpoint with two Engram layers, without DSpark, and establishes
+    only miniature functional behavior rather than real-model acceptance.
+    """
+    task_device = os.environ.get("TASK_DEVICE", "")
+    if not task_device.isascii() or not task_device.isdecimal():
+        pytest.fail("enabled NPU test requires TASK_DEVICE to contain one nonnegative integer")
+    platform = os.environ.get("PYPTO_V41_NPU_PLATFORM", "a2a3")
+    if platform not in ("a2a3", "a5"):
+        pytest.fail("PYPTO_V41_NPU_PLATFORM must be a2a3 or a5")
+    device_id = int(task_device)
+    cpu = factory(max_seq_len=8, max_chunk=2, speculative=False)
+    npu = factory(max_seq_len=8, max_chunk=2, speculative=False, platform=platform, device_id=device_id)
+    assert npu.backend.capabilities.platform == platform
+    assert len(npu.config.layer_plan) == 5 and len(npu.config.engram_layer_ids) == 2
+    assert npu.backend.drafter is None
+
+    expected = cpu.execute(cpu.work(tokens=TOKENS[:2]))[0]
+    actual = npu.execute(npu.work(tokens=TOKENS[:2]))[0]
+    assert actual.device.type == "npu" and actual.device.index == device_id
+    assert_logits(actual.cpu(), expected)
+    pending = int(expected.argmax().item())
+    cpu.runner.finalize_prefill(["a"])
+    npu.runner.finalize_prefill(["a"])
+    expected = cpu.execute(cpu.work(tokens=(pending,), start=2, mode="decode"))[0]
+    actual = npu.execute(npu.work(tokens=(pending,), start=2, mode="decode"))[0]
+    assert_logits(actual.cpu(), expected)
+    assert npu.runner.position("a") == cpu.runner.position("a") == 3
+    assert npu.ops.matmul_provider._cache  # Actual PyPTO shape specializations were dispatched.
+
+    pages = npu.backend.pool.pages
+    assert pages and all(page.dtype == torch.uint8 and page.device.type == "npu"
+                         and page.device.index == device_id for page in pages.values())
+    report = npu.backend.diagnostics()
+    assert report["device"] == f"npu:{device_id}" and report["active_requests"] == 1
+    assert report["cache_bytes"] == sum(page.numel() * page.element_size() for page in pages.values())
+    assert 0 < report["cache_bytes"] <= report["logical_cache_capacity_bytes"]
+    npu.runner.release(["a"])
+    assert npu.cache.active_request_count == 0 and not npu.backend.requests
+    assert npu.backend.diagnostics()["active_requests"] == 0

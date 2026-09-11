@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Serving adapter for the V4.1 transactional runner and built-in A5 arithmetic."""
+"""Serving adapter for the V4.1 transactional runner and Ascend arithmetic."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ class V41BackendCapabilities:
     max_seq_len: int
     num_layers: int
     abi_version: int = 1
-    platform: str = "a5"
+    platform: str = "a2a3"
     cache_format: str = "v41_packed_v1"
     parallel_mode: str = "reference_tp"
     supports_engram: bool = True
@@ -91,7 +91,7 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
     def __init__(
         self,
         *,
-        platform: str = "a5",
+        platform: str = "a2a3",
         device_ids: Sequence[int] = (0,),
         pypto_build_dir: str | None = None,
         kernel_factory: str | Callable[..., Any] | None = None,
@@ -100,8 +100,9 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         draft_confidence_threshold: float | None = None,
     ) -> None:
         super().__init__()
-        if platform != "a5":
-            raise ValueError("DeepSeek V4.1 execution requires platform='a5'")
+        if platform not in ("a2a3", "a5"):
+            raise ValueError("DeepSeek V4.1 execution requires platform='a2a3' or 'a5'")
+        self._platform = platform
         self._factory = _resolve_factory(kernel_factory)
         self._device_ids = tuple(device_ids)
         if not self._device_ids or any(type(d) is not int or d < 0 for d in self._device_ids):
@@ -155,6 +156,7 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
             cache_layouts=cache.groups,
             weight_loader=loader,
             device_ids=self._device_ids,
+            platform=self._platform,
             pypto_build_dir=self._build_dir,
             use_compile_cache=self._use_compile_cache,
         )
@@ -169,7 +171,7 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
                 raise ValueError("kernel bundle must return V41BackendCapabilities")
             if (
                 caps.abi_version != 1
-                or caps.platform != "a5"
+                or caps.platform != self._platform
                 or caps.cache_format != "v41_packed_v1"
                 or caps.parallel_mode != "reference_tp"
                 or not caps.supports_engram
