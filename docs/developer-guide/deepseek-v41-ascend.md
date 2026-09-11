@@ -25,6 +25,11 @@ a native mixed FP8-by-FP4 instruction on A3. Native checkpoint float8 dtypes are
 used on the CPU weight-reading side; device caches store uint8 payloads and
 scales. The initial bridge still copies matrix inputs/results through the host.
 
+Quantization reads IEEE sign bits to preserve negative zero and constructs exact
+FP32 powers of two. Scale rounding follows the pinned reference's FP32 reciprocal
+multiply and exponent/mantissa extraction. These operations avoid the observed
+A3 `signbit(-0)` and approximate `pow` differences without moving tensors to CPU.
+
 ## Functional validation
 
 The CPU suite includes both platform selections, rank capability checks and
@@ -39,6 +44,8 @@ The first hardware scope is one allocated A3 card:
   dispatch checks output ownership and reuse with changed inputs.
 - Three packed quantization formats compared byte for byte with CPU, plus
   RMSNorm and Hyper-Connections against independent CPU formulas.
+- All UE8M0 scale encodings, FP8/FP4 midpoint neighbors and signed zero,
+  including non-power-of-two main-KV scales and subnormal FP32 scale values.
 - A miniature random checkpoint with five backbone layers and two Engram
   layers: two-token prefill, one decode step, NPU packed pages and request release.
 
@@ -92,3 +99,32 @@ Use `PYPTO_V41_NPU_PLATFORM=a5` only on an allocated A5 device. For subsequent
 real-model serving, use the launch parameters in the execution guide and select
 `--platform a2a3` for A3 or `--platform a5` for A5. Full checkpoint provisioning,
 real-layer goldens and model-scale acceptance remain required.
+
+## Validation on 2026-09-11
+
+Revision `6166bea` was checked on machine 69 using one allocated device, reported
+as `Ascend910_9362`, with the `a2a3` backend. The environment used Python 3.10.9,
+Torch/TorchNPU 2.10.0, CANN 9.0.0, ptoas 0.59, PyPTO `c9af905` and runtime
+`77fa017`. Existing runtime binaries were reused; the tests compiled only their
+small kernels and orchestration.
+
+| Check | Result |
+|---|---|
+| Full V4.1 CPU suite, including both platforms' actual codegen | 580 passed, 16 skipped |
+| Shared CLI regression (`06736ab`; CLI unchanged afterward) | 9 passed |
+| A3 matrix and numerical primitives | 14 passed |
+| A3 five-layer miniature model, including two Engram layers | 1 passed |
+
+The CPU skips comprise 15 explicitly opted-in NPU cases and one optional
+checkpoint-index test. Primitive job `task_20260911_114935_333431424306` exited
+with status 0. Miniature job `task_20260911_115027_34316829463` also exited with
+status 0, covering two-token prefill, one decode, CPU logit tolerance and identical
+argmax, NPU packed pages and request release. Logs are under
+`artifacts/deepseek-v41-a3/` as `cpu-6166bea.log`, `cli-06736ab.log`,
+`npu-primitives-6166bea.log` and `npu-miniature-6166bea.log`.
+
+An earlier run on `06736ab` hit AICPU error 507018 on its first GEMM; the runtime
+reported device recovery. The same case passed unchanged in a separate job, and
+all four GEMMs passed in the final primitive run. The initial error remains in
+`npu-primitives-06736ab.log`; its cause has not been established, and these
+results do not establish long-running runtime reliability.
