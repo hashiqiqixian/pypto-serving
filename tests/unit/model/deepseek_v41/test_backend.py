@@ -443,11 +443,15 @@ def test_nested_page_journal_preserves_outer_snapshot_after_inner_abort_retry(fa
     key = next(iter(before))
     checkpoint = pool.checkpoint()
     pool.begin()
-    pool.page(*key, write=True).fill_(91)
+    # Production cache writes run in the backend's inference-mode layer call;
+    # preserve that context when injecting byte mutations directly into pages.
+    with torch.inference_mode():
+        pool.page(*key, write=True).fill_(91)
     pool.abort()
     assert_pages(run.backend, before)
     pool.begin()
-    pool.page(*key, write=True).fill_(173)
+    with torch.inference_mode():
+        pool.page(*key, write=True).fill_(173)
     pool.finish_checkpoint(checkpoint, restore=True)
     assert_pages(run.backend, before)
 
