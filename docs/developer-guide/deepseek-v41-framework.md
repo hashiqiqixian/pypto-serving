@@ -180,3 +180,18 @@ paths. Skipped dependency tests are not passing numerical validation. Full-weigh
 real logits, generated-token comparisons, A5 kernels, EP collectives, HTTP model
 acceptance, million-token memory validation and performance measurements remain
 separate acceptance gates.
+
+### Recorded validation for `9080f6f` (2026-09-11)
+
+- Windows bounded host suite: **266 passed, 4 skipped** for unavailable Torch-related paths.
+- `ci-69`, Python 3.10.9 / Torch 2.10.0 CPU, serial execution: **328 passed, no skips**.
+- Existing CLI, tokenizer, Engine and V4 component regression: **132 passed, 1 failed**.
+  The failing `test_deepseek_mtp_prefill_reads_only_selected_owner_outputs` reports
+  `FakeWorker.copy_from()` rejecting `src_offset`; the exact same failure was
+  reproduced at the pre-change `290213a` revision. It was not repaired in this scope.
+- Local review, Ruff, copyright headers, documentation navigation and diff checks passed.
+
+The remote checkout was restored to `9080f6f`, and its pre-existing `pypto-lib`
+modification was preserved. No NPU allocation, full-weight loading, HTTP inference,
+or performance run was performed. Detailed logs and account usage snapshots are
+stored locally under `artifacts/deepseek-v41-framework/` and are not source files.
