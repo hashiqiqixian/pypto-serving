@@ -9,7 +9,9 @@
 """Independent dtype goldens and arithmetic-order tests; no real-model acceptance claim."""
 
 import importlib.util
+import math
 import os
+import struct
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,6 +55,132 @@ def test_e2m1_low_nibble_signed_zero_and_ties(module):
     midpoints = torch.tensor([.25, .75, 1.25, 1.75, 2.5, 3.5, 5., 100.])
     torch.testing.assert_close(module.decode_e2m1(module.encode_e2m1(midpoints)),
                                torch.tensor([0., 1., 1., 2., 2., 4., 4., 6.]), rtol=0, atol=0)
+
+
+def _fp4_golden(values):
+    """Scalar nearest-distance oracle, independent of tensor threshold encoding."""
+    table = (0., .5, 1., 1.5, 2., 3., 4., 6.)
+    codes = []
+    for value in values:
+        code = min(range(8), key=lambda index: (abs(abs(value) - table[index]), index % 2))
+        codes.append(code | (8 if math.copysign(1., value) < 0 else 0))
+    return [low | (high << 4) for low, high in zip(codes[::2], codes[1::2])]
+
+
+def _assert_ieee_encoding_boundaries(module, device):
+    # Native CPU FP8 is the independent oracle; no native FP8 tensor is sent to A3.
+    raw = torch.arange(256, dtype=torch.uint8)
+    native = raw.view(torch.float8_e4m3fn).float()
+    finite = (raw & 127) != 127
+    decoded = module.decode_e4m3(raw.to(device)).cpu()
+    assert torch.equal(decoded[finite].view(torch.int32), native[finite].view(torch.int32))
+    assert torch.isnan(decoded[~finite]).all()
+    midpoint = (native[:126] + native[1:127]) * .5
+    neighbors = torch.cat((torch.nextafter(midpoint, torch.full_like(midpoint, -float("inf"))),
+                           midpoint, torch.nextafter(midpoint, torch.full_like(midpoint, float("inf")))))
+    values = torch.cat((native[finite], neighbors, -neighbors, torch.tensor([1000., -1000.])))
+    # A stride exercises the bit reinterpretation's explicit contiguous boundary.
+    strided = torch.stack((values, values), -1).to(device)[:, 0]
+    actual = module.encode_e4m3(strided)
+    assert actual.device == device
+    expected = values.clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
+    assert torch.equal(actual.cpu(), expected)
+
+    midpoint = torch.tensor([.25, .75, 1.25, 1.75, 2.5, 3.5, 5.])
+    positive = torch.cat((torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6., 1000.]),
+                          torch.nextafter(midpoint, torch.zeros_like(midpoint)), midpoint,
+                          torch.nextafter(midpoint, torch.full_like(midpoint, float("inf")))))
+    values = torch.cat((positive, -positive))
+    actual = module.encode_e2m1(values.to(device))
+    assert actual.device == device
+    assert torch.equal(actual.cpu(), torch.tensor(_fp4_golden(values.tolist()), dtype=torch.uint8))
+    fp4_bytes = torch.tensor([0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE], dtype=torch.uint8)
+    expected = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6., -0., -.5, -1., -1.5, -2., -3., -4., -6.])
+    decoded = module.decode_e2m1(fp4_bytes.to(device)).cpu()
+    assert torch.equal(decoded.view(torch.int32), expected.view(torch.int32))
+
+
+def _assert_ue8m0_scale_bits(module, device):
+    raw = torch.arange(256, dtype=torch.uint8)
+    actual = module.decode_ue8m0(raw.to(device))
+    expected = torch.tensor([math.ldexp(1., code - 127) for code in range(255)], dtype=torch.float32)
+    assert actual.device == device
+    assert torch.equal(actual.cpu()[:255].view(torch.int32), expected.view(torch.int32))
+    assert torch.isnan(actual.cpu()[255])
+
+
+def _assert_power_scale_midpoints(module, device, fmt):
+    fp8 = fmt.startswith("fp8")
+    maximum = 448 if fp8 else 6
+    exponents = (-22, -8, 0, 7, 118) if fp8 else (-126, -8, 0, 7, 124)
+    # -336 at scale=1 is the FP8 0xfa/0xfb midpoint seen failing on A3;
+    # the FP4 5.0 midpoint similarly must choose magnitude code 6, not 7.
+    midpoint = [0., -0., 1.0625, -1.0625, 336., -336., 432., -432.] if fp8 else [
+        0., -0., .25, -.25, .75, -.75, 1.25, -1.25, 1.75, -1.75, 2.5, -2.5, 3.5, -3.5, 5., -5.]
+    row = midpoint + [float(maximum)] + [0.] * (31 - len(midpoint))
+    values = torch.tensor([[math.ldexp(value, exponent) for value in row] for exponent in exponents],
+                          dtype=torch.bfloat16)
+    expected_scales = torch.tensor([[exponent + 127] for exponent in exponents], dtype=torch.uint8)
+    expected_powers = torch.tensor([math.ldexp(1., exponent) for exponent in exponents])[:, None]
+    normalized = values.float() / expected_powers
+    if fp8:
+        expected_bytes = normalized.to(torch.float8_e4m3fn).view(torch.uint8)
+    else:
+        expected_bytes = torch.tensor([_fp4_golden(row) for row in normalized.tolist()], dtype=torch.uint8)
+    packed = module.quantize_rows(values.to(device), fmt, 32)
+    assert packed.values.device == packed.scales.device == device
+    assert torch.equal(packed.scales.cpu(), expected_scales)
+    assert torch.equal(packed.values.cpu(), expected_bytes)
+
+
+def _assert_nonpower_main_kv_midpoints(module, device):
+    scales = torch.tensor([1.375, 1.75, 3.5])
+    midpoints = (.25, .75, 1.25, 1.75, 2.5, 3.5, 5.)
+    normalized = [value for midpoint in midpoints for value in (midpoint, -midpoint)] + [6., -0.]
+    values = (scales[:, None] * torch.tensor(normalized)[None, :]).to(torch.bfloat16)
+    packed = module.quantize_rows(values.to(device), "fp4_e2m1_e4m3", 16)
+    expected = torch.tensor([_fp4_golden(normalized)] * len(scales), dtype=torch.uint8)
+    expected_scales = scales.to(torch.float8_e4m3fn).view(torch.uint8)[:, None]
+    assert packed.values.device == packed.scales.device == device
+    assert torch.equal(packed.scales.cpu(), expected_scales)
+    assert torch.equal(packed.values.cpu(), expected)
+
+
+def test_ieee_encoders_match_independent_cpu_oracles_at_all_rounding_boundaries(module):
+    _assert_ieee_encoding_boundaries(module, torch.device("cpu"))
+
+
+def test_all_ue8m0_scales_have_exact_fp32_bits_including_subnormal_and_nan(module):
+    _assert_ue8m0_scale_bits(module, torch.device("cpu"))
+
+
+@pytest.mark.parametrize("fmt", ["fp8_e4m3_ue8m0", "fp4_e2m1_ue8m0"])
+def test_power_scale_quantization_preserves_midpoint_ties_and_negative_zero(module, fmt):
+    _assert_power_scale_midpoints(module, torch.device("cpu"), fmt)
+
+
+def test_main_kv_nonpower_scales_preserve_midpoints_and_negative_zero(module):
+    _assert_nonpower_main_kv_midpoints(module, torch.device("cpu"))
+
+
+@pytest.mark.parametrize("maximum,fmt", [(448, "fp8_e4m3_ue8m0"), (6, "fp4_e2m1_ue8m0")])
+def test_scale_rounding_matches_pinned_fp32_multiply_and_ieee_ceil(module, maximum, fmt):
+    boundaries = torch.tensor([maximum * 2. ** exponent for exponent in (-8, 0, 7)])
+    maxima = torch.cat((torch.nextafter(boundaries, torch.zeros_like(boundaries)), boundaries,
+                        torch.nextafter(boundaries, torch.full_like(boundaries, float("inf")))))
+
+    def f32(value):
+        return struct.unpack("<f", struct.pack("<f", value))[0]
+
+    expected = []
+    for amax in maxima.tolist():
+        # kernel.py fast_round_scale uses an FP32 reciprocal multiply, followed
+        # by exponent/mantissa extraction, not approximate log2 or FP64 math.
+        required = f32(amax * f32(1. / maximum))
+        bits = struct.unpack("<I", struct.pack("<f", required))[0]
+        expected.append((bits >> 23) + bool(bits & 0x7fffff))
+    packed = module.quantize_rows(maxima[:, None].expand(-1, 32), fmt, 32)
+    assert torch.equal(packed.scales[:, 0], torch.tensor(expected, dtype=torch.uint8))
 
 
 @pytest.mark.parametrize("fmt,block", [("fp8_e4m3_ue8m0", 32), ("fp4_e2m1_ue8m0", 32),
@@ -128,6 +256,23 @@ def npu_device():
     device = torch.device(f"npu:{int(raw_device)}")
     torch.npu.set_device(device)
     return device
+
+
+def test_real_npu_ieee_encoding_boundaries_match_cpu(module, npu_device):
+    _assert_ieee_encoding_boundaries(module, npu_device)
+
+
+def test_real_npu_all_ue8m0_scale_bits_match_cpu(module, npu_device):
+    _assert_ue8m0_scale_bits(module, npu_device)
+
+
+@pytest.mark.parametrize("fmt", ["fp8_e4m3_ue8m0", "fp4_e2m1_ue8m0"])
+def test_real_npu_power_scale_midpoints_and_signed_zero_match_cpu(module, npu_device, fmt):
+    _assert_power_scale_midpoints(module, npu_device, fmt)
+
+
+def test_real_npu_nonpower_main_kv_midpoints_match_cpu(module, npu_device):
+    _assert_nonpower_main_kv_midpoints(module, npu_device)
 
 
 @pytest.mark.parametrize("fmt,block", [("fp8_e4m3_ue8m0", 32), ("fp4_e2m1_ue8m0", 32),

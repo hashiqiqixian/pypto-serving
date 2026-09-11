@@ -22,11 +22,28 @@ import torch
 import torch.nn.functional as F
 
 
+def _float_bits(value: torch.Tensor) -> torch.Tensor:
+    return value.float().contiguous().view(torch.int32)
+
+
+def _pow2(exponents: torch.Tensor) -> torch.Tensor:
+    """Exact FP32 powers for integer exponents [-127, 127], including UE8M0 byte 0."""
+    exponents = exponents.to(torch.int32)
+    bits = (exponents + 127) << 23
+    bits = torch.where(exponents == -127, 1 << 22, bits)
+    return bits.contiguous().view(torch.float32)
+
+
+def _sign_bit(value: torch.Tensor) -> torch.Tensor:
+    # Ascend's comparison-based signbit loses -0. Read the IEEE sign directly.
+    return ((_float_bits(value) >> 31) & 1).to(torch.uint8)
+
+
 def decode_e4m3(raw: torch.Tensor) -> torch.Tensor:
     bits = raw.to(torch.int32)
     exponent, mantissa = (bits >> 3) & 15, bits & 7
     value = torch.where(exponent == 0, mantissa.float() * (2.0 ** -9),
-                        (1 + mantissa.float() / 8) * torch.pow(2.0, exponent.float() - 7))
+                        (1 + mantissa.float() * .125) * _pow2(exponent - 7))
     value = torch.where((bits & 128) != 0, -value, value)
     return value.masked_fill((bits & 127) == 127, float("nan"))
 
@@ -35,10 +52,10 @@ def encode_e4m3(value: torch.Tensor) -> torch.Tensor:
     if not bool(torch.isfinite(value).all()):
         raise ValueError("E4M3 quantization requires finite inputs")
     magnitude = value.float().abs().clamp_max(448)
-    exponent = torch.floor(torch.log2(magnitude.clamp_min(2.0 ** -6)))
-    normal = (exponent + 6) * 8 + torch.round(magnitude / torch.pow(2.0, exponent - 3))
+    exponent = ((_float_bits(magnitude.clamp_min(2.0 ** -6)) >> 23) & 255) - 127
+    normal = (exponent + 6) * 8 + torch.round(magnitude * _pow2(3 - exponent))
     bits = torch.where(magnitude < 2.0 ** -6, torch.round(magnitude * 512), normal).to(torch.uint8)
-    return bits | (torch.signbit(value).to(torch.uint8) << 7)
+    return bits | (_sign_bit(value) << 7)
 
 
 def decode_e2m1(raw: torch.Tensor) -> torch.Tensor:
@@ -56,12 +73,12 @@ def encode_e2m1(value: torch.Tensor) -> torch.Tensor:
     codes = torch.zeros_like(magnitude, dtype=torch.uint8)
     for index, midpoint in enumerate((.25, .75, 1.25, 1.75, 2.5, 3.5, 5.0)):
         codes += ((magnitude > midpoint) | ((magnitude == midpoint) & bool(index % 2))).to(torch.uint8)
-    codes |= torch.signbit(value).to(torch.uint8) << 3
+    codes |= _sign_bit(value) << 3
     return codes[..., ::2] | (codes[..., 1::2] << 4)
 
 
 def decode_ue8m0(raw: torch.Tensor) -> torch.Tensor:
-    return torch.pow(2.0, raw.float() - 127).masked_fill(raw == 255, float("nan"))
+    return _pow2(raw.to(torch.int32) - 127).masked_fill(raw == 255, float("nan"))
 
 
 @dataclass(frozen=True)
@@ -99,7 +116,10 @@ def quantize_rows(x: torch.Tensor, fmt: str, block_size: int) -> QuantizedRows:
     else:
         maximum = 448 if fmt.startswith("fp8") else 6
         floor = 1e-4 if maximum == 448 else 6 * 2.0 ** -126
-        exponents = torch.ceil(torch.log2(amax.clamp_min(floor) / maximum))
+        # Match pinned fast_round_scale: multiply in FP32, then ceil-log2 by
+        # exponent/mantissa bits. log2/pow approximations can cross rounding ties.
+        required = _float_bits(amax.clamp_min(floor) * (1.0 / maximum))
+        exponents = ((required >> 23) & 255) - 127 + ((required & 0x7fffff) != 0).to(torch.int32)
         if bool(((exponents < -127) | (exponents > 127)).any()):
             raise ValueError("activation scale is outside finite UE8M0 range")
         scale_bits = (exponents + 127).to(torch.uint8)
