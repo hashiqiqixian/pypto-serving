@@ -205,6 +205,14 @@ class DeepSeekV41TensorStore:
                     raise ValueError(f"checkpoint header shape/dtype mismatch: {source}")
             self._validated_shards.add(filename)
         value = self.store.load_slice(name, ranges)
+        if not isinstance(value, torch.Tensor) or value.device.type != "cpu":
+            raise ValueError(f"source tensor must be a CPU tensor: {name}")
+        if tuple(value.shape) != shape:
+            raise ValueError(f"source tensor contract mismatch: {name}, expected {shape}/{spec.dtype}")
+        # A safetensors column slice can retain the full source row stride.
+        # Compact only this metadata-budgeted selection before applying the
+        # whole-tensor validator and making the independently owned byte copy.
+        value = value.contiguous()
         DeepSeekV41WeightLoader._validate_tensor(name, value, replace(spec, shape=shape))
         # Own only the requested bytes: no mmap backing or larger row batch can
         # accidentally remain alive through a returned tensor/cache view.

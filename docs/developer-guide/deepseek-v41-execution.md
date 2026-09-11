@@ -35,6 +35,12 @@ adaptation plan's phase boundaries.
 
 ## Precision and implementation limits
 
+The reference leaves equal-score `torch.topk` ordering unspecified. This adapter
+breaks cutoff ties by the smallest absolute position or candidate-block ID so
+masked future columns cannot change an earlier token's selection across prefill
+chunks. Scores are not perturbed. Equal-score selected indices may therefore
+differ from a particular reference device's unspecified tie ordering.
+
 Dense weights remain FP8 with 32x32 UE8M0 scales; routed experts remain packed
 FP4 E2M1 with one UE8M0 scale per row/K32 block. FP4 uses the low nibble first.
 The normalized values are representable in BF16, so the initial PyPTO kernel

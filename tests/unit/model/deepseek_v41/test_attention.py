@@ -180,6 +180,38 @@ def test_full_reindex_reuse_are_numerical_and_chunk_contiguous(modules, config, 
     assert any(a == torch.Size([2, 32]) and b == torch.Size([32, 3]) for a, b in ops.matmul_shapes)
 
 
+@pytest.mark.parametrize("padding", [0, 1, 7, 64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_topk_cutoff_ties_use_absolute_position_independent_of_future_padding(modules, padding, dtype):
+    select = modules["attention"]._topk_positions
+    # The observed position-3 failure chose different pairs from four exact
+    # ReLU zero scores when torch.topk saw width 4 versus width 11.
+    scores = torch.tensor([0, 0, 0, 0] + [-torch.inf] * padding, dtype=dtype)
+    assert select(scores, 2).tolist() == [0, 1]
+    # Strictly greater scores keep priority; only the cutoff tie is ordered.
+    mixed = torch.tensor([1, 7, 1, 4, 1] + [-torch.inf] * padding, dtype=dtype)
+    assert select(mixed, 3).tolist() == [0, 1, 3]
+
+
+@pytest.mark.parametrize("padding", [0, 2, 18])
+def test_candidate_block_cutoff_ties_keep_latest_and_earliest_absolute_block(modules, padding):
+    select = modules["attention"].select_candidate_blocks
+    # Three reachable zero-score blocks; the newest is pinned and the remaining
+    # slot deterministically selects block zero, including with masked future blocks.
+    scores = torch.tensor([0.0] * 6 + [-torch.inf] * padding)
+    assert select(scores, reachable=6, topk_blocks=2, block_size=2).tolist() == [0, 2]
+    # Underfilled candidate sets still discard the reference's -inf filler picks.
+    assert select(scores.masked_fill(torch.arange(len(scores)) >= 1, -torch.inf),
+                  reachable=1, topk_blocks=2, block_size=2).tolist() == [0]
+
+
+def test_topk_position_selection_handles_empty_and_rejects_nan(modules):
+    select = modules["attention"]._topk_positions
+    assert select(torch.empty(0), 0).numel() == 0
+    with pytest.raises(ValueError, match="NaN"):
+        select(torch.tensor([0.0, torch.nan]), 1)
+
+
 def test_compressor_pooling_carries_the_actual_partial_group(modules, config):
     module, ops = modules["attention"], NumericalOps(config)
     layer = module.Attention(config, ops, 0)

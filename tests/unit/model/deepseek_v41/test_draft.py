@@ -177,7 +177,7 @@ def test_three_real_stages_seed_then_draft_without_committing_noise_tokens(model
     assert state.position == 4
     assert all(layer.window.shape == (4, 32) for layer in state.attention)
     for stage in range(3):
-        assert f"mtp.{stage}.attn.wq_a" in model.ops.calls
+        assert f"mtp.{stage}.attn.wq_a.weight" in model.ops.calls
         assert f"mtp.{stage}.ffn.shared_experts.w2" in model.ops.calls
     assert all(torch.isfinite(value).all() for value in (output.logits, output.confidence))
 
@@ -193,7 +193,8 @@ def test_seed_chunks_equal_full_prefill_and_run_only_main_projections(model):
     assert first.position == second.position == 6
     for left, right in zip(first.attention, second.attention):
         torch.testing.assert_close(left.window, right.window, atol=0, rtol=0)
-    assert all(name == "mtp.0.main_proj" or name.endswith(".attn.wkv") for name in model.ops.calls)
+    expected_seed_calls = ["mtp.0.main_proj", *(f"mtp.{stage}.attn.wkv.weight" for stage in range(3))]
+    assert model.ops.calls == expected_seed_calls * 3
     with pytest.raises(ValueError, match="boundary|bounded"):
         second.rollback(3)
 
