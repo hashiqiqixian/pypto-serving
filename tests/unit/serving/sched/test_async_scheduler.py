@@ -79,6 +79,34 @@ def test_scheduler_speculative_output_counts_only_tokens_retained_before_eos():
     assert [(output.new_token_id, output.finished) for output in outputs] == [(7, True)]
 
 
+def test_prefix_cache_metrics_count_cacheable_and_hit_tokens_once():
+    manager = KvCacheManager(num_blocks=16, block_size=2, enable_prefix_cache=True)
+    scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=True), manager)
+    cold = Request(
+        request_id="cold",
+        prompt_token_ids=[1, 2, 3, 4],
+        max_new_tokens=1,
+    )
+    scheduler.add_request(cold)
+
+    cold_output = scheduler.schedule()
+    assert cold_output.prefix_cache_queries == 4
+    assert cold_output.prefix_cache_hits == 0
+    scheduler.update_from_output(cold_output, {"cold": 9})
+
+    warm = Request(
+        request_id="warm",
+        prompt_token_ids=[1, 2, 3, 4],
+        max_new_tokens=1,
+    )
+    scheduler.add_request(warm)
+    warm_output = scheduler.schedule()
+
+    assert warm_output.prefix_cache_queries == 4
+    # The last prompt block is recomputed to produce the first output token.
+    assert warm_output.prefix_cache_hits == 2
+
+
 def _running_decode_request(req_id="r", prompt=(1, 2), first_output=99):
     """A RUNNING request that finished prefill and has one decoded token, i.e.
     ready to schedule its next decode step (num_new_tokens_needed == 1)."""
@@ -985,3 +1013,24 @@ def test_grouped_prefix_hit_falls_back_to_an_idle_partition_when_suffix_does_not
     assert output.scheduled_requests[0].num_computed_tokens == 0
     assert output.scheduled_requests[0].num_new_tokens == len(prompt)
     assert request.cache_partition == 1
+    assert output.prefix_cache_hits == 0
+
+
+def test_grouped_prefix_metrics_count_reused_tokens():
+    manager = KvCacheManager(block_size=2, enable_prefix_cache=True)
+    manager.init_groups((KVCacheGroupSpec(
+        name="primary", layer_indices=(0,),
+        spec=KVCacheSpec(block_size=2, page_size_bytes=1),
+        max_blocks_per_seq=4, num_blocks=8,
+    ),), max_batch_size=1)
+    prompt = [1, 2, 3, 4, 5]
+    hashes = manager.compute_group_block_hashes(prompt)
+    manager.ensure_group_blocks("warm", len(prompt), partition=0)
+    manager.cache_group_blocks("warm", hashes, len(prompt), {})
+    manager.release_all_group_requests("warm")
+    scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=True), manager)
+    scheduler.add_request(Request("hit", prompt, max_new_tokens=2))
+    output = scheduler.schedule()
+    assert output.prefix_cache_queries == 4
+    assert output.prefix_cache_hits == 4
+    assert output.prefix_cache_query_tokens == 5

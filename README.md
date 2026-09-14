@@ -121,6 +121,15 @@ Requests that omit sampling fields use the server-wide `GenerateConfig`
 defaults for every model: `temperature=0.0` (greedy decoding) and `top_p=1.0`.
 Override them per request or with `--generate-config` when starting the server.
 
+## Metrics
+
+The serving process exposes cumulative engine metrics at `/metrics` in
+Prometheus text format, including `vllm:` families for existing vLLM dashboards,
+and at `/metrics/json` as structured JSON. Metrics cover
+request latency, token traffic and throughput inputs, scheduler queues, KV cache
+usage, prefix-cache hits, request outcomes, and MTP/DSpark draft acceptance,
+acceptance length, and speculation fallbacks.
+
 ## Notes
 
 - All model/device/runtime options are passed via CLI arguments. Run `pypto-serving --help` for the exact arguments available in the installed package. See `docs/cli-reference/pypto-serving.md` for the documented reference.

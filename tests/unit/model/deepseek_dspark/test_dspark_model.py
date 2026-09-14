@@ -858,6 +858,39 @@ def test_prefix_cache_drafter_seeding_requires_replayed_window(monkeypatch, tail
     assert bool((slots >= 0).all())
 
 
+@pytest.mark.parametrize(
+    "anchor,drafts,accepted,expected",
+    [(504, 7, 3, 7), (505, 7, 1, 0), (64, 0, 1, 0)],
+)
+def test_fused_reclaim_reports_consumed_drafts(monkeypatch, anchor, drafts, accepted, expected):
+    runner = _runner(speculative=True)
+    state = runner._reserve_drafter_state("spec", group=0, prompt_len=64)
+    state.committed_count = anchor
+    state.pending_draft_tokens = list(range(drafts))
+    layout = runner._compiled.layout
+    counts = torch.zeros((layout.ranks, layout.decode_local_batch), dtype=torch.int32)
+    counts[0, 0] = accepted
+    tokens = torch.zeros((layout.ranks, layout.decode_local_batch, layout.decode_seq), dtype=torch.long)
+    tokens[0, 0, :accepted] = torch.arange(accepted) + 100
+    runner._dspark_state_buffers = [SimpleNamespace(accepted_counts=counts, accepted_token_ids=tokens)]
+    inputs = SimpleNamespace(
+        request_ids=("spec",), speculative_flags=(True,), owner_ranks=(0,), owner_rows=(0,), buffer_slot=0,
+    )
+    pending = runner_module._DSparkPendingDecode(
+        dispatch=SimpleNamespace(wait=lambda: None), inputs=inputs, sampled_ids=torch.empty(0),
+    )
+    # Redrafting replaces the consumed drafts, including on a fallback step.
+    # Metrics must use the pre-acceptance state and the actual position ceiling.
+    def collect(rows, *, buffer_slot):
+        state.pending_draft_tokens = list(range(7))
+
+    monkeypatch.setattr(runner, "_collect_fused_decode_drafts", collect)
+    result = runner.reclaim_prepared_decode(pending)
+    assert result.accepted_token_ids == [list(range(100, 100 + accepted))]
+    assert result.num_draft_tokens == [expected]
+    assert state.committed_count == anchor + accepted
+
+
 def test_run_decode_accepts_and_redrafts(monkeypatch) -> None:
     """Acceptance drives state updates and the next drafter context rows."""
     runner = _runner(speculative=True)
@@ -942,6 +975,7 @@ def test_run_decode_accepts_and_redrafts(monkeypatch) -> None:
 
     # Drafts [501, 502, 999, ...] match the first two predictions.
     assert result.accepted_token_ids == [[501, 502, 8]]
+    assert result.num_draft_tokens == [7]
     assert state.matched_drafts == 2
     assert state.committed_count == 63 + 3
     assert state.pending_draft_tokens == [700, 701, 702, 703, 704, 705, 706]
@@ -962,3 +996,12 @@ def test_run_decode_accepts_and_redrafts(monkeypatch) -> None:
     summary = runner.dspark_speculation_summary()
     assert summary["verify_steps"] == 1.0
     assert summary["matched_drafts"] == 2.0
+
+    state.pending_draft_tokens = []
+    fallback = runner.run_decode(SimpleNamespace(), decode)
+    assert fallback.num_draft_tokens == [0]
+    assert len(fallback.accepted_token_ids[0]) == 1
+
+    runner._compiled.num_speculative_tokens = 0
+    plain = runner.run_decode(SimpleNamespace(), decode)
+    assert plain.num_draft_tokens is None

@@ -11,6 +11,9 @@ import asyncio
 from collections import deque
 from types import SimpleNamespace
 
+import pytest
+
+from pypto_serving.observability import InMemoryStatLogger
 from pypto_serving.serving.engine.async_engine import (
     ReplicaEngineCore,
 )
@@ -109,6 +112,57 @@ def _async_pipeline_core(*, num_speculative_tokens: int = 0):
     core._input_queue = SimpleNamespace(put=_put_cmd)
     core._output_queue = SimpleNamespace(get=_get_result)
     return core, dispatched
+
+
+@pytest.mark.parametrize("drafts,tokens,error", [
+    (1, [51, 52], None), (7, [51, 52, 53], None),
+    (1, [51], None), (0, [51], None), (7, [51, 52], "failed"),
+])
+def test_pipeline_records_actual_drafts_before_length_truncation(monkeypatch, drafts, tokens, error):
+    async def run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    core, commands = _async_pipeline_core(num_speculative_tokens=max(1, drafts))
+    metrics = InMemoryStatLogger("test-model", [0])
+    core.set_stat_logger(metrics, 0)
+    request = _running_decode_request(first_output=50)
+    request.max_new_tokens = 2
+    core.scheduler.running.append(request)
+    core.scheduler.requests[request.request_id] = request
+    assert core._try_dispatch_step()
+    result = StepResult(
+        new_tokens={"r": tokens}, num_draft_tokens={"r": drafts},
+        step_id=commands[0].step_id, error=error,
+    )
+    core._output_queue = SimpleNamespace(get=lambda timeout=None: encode_result(result))
+    assert asyncio.run(core._await_and_apply_oldest()) is (error is None)
+    counters = metrics.snapshot()["replicas"][0]["counters"]
+    assert counters["draft_tokens"] == (drafts if error is None else 0)
+    assert counters["accepted_tokens"] == (len(tokens) - 1 if error is None and drafts else 0)
+    assert counters["speculative_drafts"] == int(error is None and drafts > 0)
+    assert counters["speculative_fallbacks"] == int(error is None and drafts == 0)
+    positions = metrics.snapshot()["replicas"][0]["accepted_tokens_per_pos"]
+    if error is None and drafts:
+        assert positions == [1] * (len(tokens) - 1) + [0] * (drafts - len(tokens) + 1)
+    assert metrics.snapshot()["replicas"][0]["gauges"]["running"] == 0
+    if error is None:
+        assert request.output_token_ids == [50, 51]
+
+
+def test_speculation_metrics_ignore_results_for_already_aborted_requests():
+    core, _ = _async_pipeline_core(num_speculative_tokens=7)
+    metrics = InMemoryStatLogger("model", [0], num_speculative_tokens=7)
+    core.set_stat_logger(metrics, 0)
+    request = _running_decode_request()
+    core.scheduler.running.append(request)
+    core.scheduler.requests[request.request_id] = request
+    scheduled = core.scheduler.schedule()
+    core.scheduler.abort_request(request.request_id)
+    core._process_step_output(scheduled, {request.request_id: [1, 2, 3]}, {request.request_id: 7})
+    counters = metrics.snapshot()["replicas"][0]["counters"]
+    assert counters["draft_tokens"] == 0
+    assert counters["accepted_tokens"] == 0
 
 
 def test_async_pipeline_dispatches_two_steps_before_applying_first(monkeypatch):

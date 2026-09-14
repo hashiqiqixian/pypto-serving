@@ -2886,6 +2886,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     f"(actual_batch={len(batch.request_ids)})"
                 ) from exc
             sampled = task_args.tensors["sampled_ids"]
+            num_draft_tokens = self._verified_draft_counts(inputs)
             if fused_device_state:
                 accepted, rows_by_rank = self._accept_decode_outputs_on_device(
                     inputs, sampled, dispatch=False
@@ -2902,7 +2903,26 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 hidden_states=None,
                 logits=None,
                 accepted_token_ids=accepted,
+                num_draft_tokens=num_draft_tokens,
             )
+
+    def _verified_draft_counts(self, inputs: DSparkPreparedDecodeInputs) -> list[int] | None:
+        """Count consumed drafts before acceptance or redrafting mutates Host state."""
+        if not self.speculative:
+            return None
+        max_position = self._require_rope_tables().max_position
+        counts: list[int] = []
+        for request_id, speculative in zip(inputs.request_ids, inputs.speculative_flags, strict=True):
+            state = self._drafter_state(request_id)
+            count = len(state.pending_draft_tokens)
+            # Fused prepare runs ahead of acceptance and marks every row as
+            # speculative. FIFO reclaim provides the previous step's Host
+            # mirror; committed_count is the current device anchor. Apply the
+            # same position limit as device acceptance without a device read.
+            if not speculative or state.committed_count + count >= max_position:
+                count = 0
+            counts.append(count)
+        return counts
 
     def _bind_fused_decode_args(
         self,
@@ -2970,6 +2990,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 pending.dispatch,
             )
         with profile_span("DSparkModelRunner.decode.reclaim", cat="executor"):
+            num_draft_tokens = self._verified_draft_counts(pending.inputs)
             accepted, rows_by_rank = self._accept_decode_outputs_on_device(
                 pending.inputs,
                 pending.sampled_ids,
@@ -2983,6 +3004,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             hidden_states=None,
             logits=None,
             accepted_token_ids=accepted,
+            num_draft_tokens=num_draft_tokens,
         )
 
     def _fused_decode_device_state_args(self, buffer_slot: int) -> tuple[Any, ...]:

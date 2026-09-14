@@ -276,8 +276,16 @@ def test_process_step_output_contains_parser_failure_to_one_request() -> None:
     good_ctx = _RequestContext(request=good_request, stream=True)
     core._request_contexts = {"bad": bad_ctx, "good": good_ctx}
 
+    finished_metrics = []
+    core._stat_logger = SimpleNamespace(
+        record_iteration=lambda *args: None,
+        record_output=lambda *args, **kwargs: None,
+        finish_request=lambda engine, request_id, reason: finished_metrics.append((request_id, reason)),
+    )
+    core._record_scheduler_stats = lambda *args: None
     core._process_step_output(SchedulerOutput(scheduled_requests=[]), {})
 
+    assert finished_metrics == [("bad", "error"), ("good", "FINISHED_LENGTH")]
     failure = bad_ctx.queue.get_nowait()
     assert isinstance(failure, ValueError)
     assert str(failure) == "malformed terminal tail"
