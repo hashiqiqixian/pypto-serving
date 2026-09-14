@@ -93,9 +93,12 @@ DEEPSEEK_V4_MAX_IN_FLIGHT_PREFILL_TOKENS = 2 * DEEPSEEK_V4_PREFILL_SEQ
 DEEPSEEK_V4_MAX_SEQ_LEN = 16384
 # Prefill and decode share scheduler-owned rank-local physical pools. Group
 # block IDs are local to each DP rank and address worker-resident cache shards.
-DEEPSEEK_V4_PREFILL_ORI_MAX_BLOCKS = 128
+# pypto-lib compiles every absolute logical table for its 1M position ceiling:
+# 1048576 / 128 source-token blocks. Decode compressed and state tables are
+# runtime-width, so serving keeps them at the depth its max_seq_len needs.
+DEEPSEEK_V4_PREFILL_ORI_MAX_BLOCKS = 8192
 DEEPSEEK_V4_DECODE_ORI_MAX_BLOCKS = 128
-DEEPSEEK_V4_ORI_TABLE_MAX_BLOCKS = 128
+DEEPSEEK_V4_ORI_TABLE_MAX_BLOCKS = 8192
 DEEPSEEK_V4_SLIDING_WINDOW = 128
 DEEPSEEK_V4_CMP_MAX_BLOCKS = 128
 DEEPSEEK_V4_IDX_MAX_BLOCKS = 128
@@ -104,11 +107,15 @@ DEEPSEEK_V4_CSA_STATE_MAX_BLOCKS = 65
 DEEPSEEK_V4_CSA_INNER_STATE_MAX_BLOCKS = 65
 DEEPSEEK_V4_C128_STATE_BLOCK_SIZE = 8
 DEEPSEEK_V4_C4_STATE_BLOCK_SIZE = 4
-DEEPSEEK_V4_PREFILL_CMP_MAX_BLOCKS = DEEPSEEK_V4_CMP_MAX_BLOCKS
-DEEPSEEK_V4_PREFILL_IDX_MAX_BLOCKS = DEEPSEEK_V4_IDX_MAX_BLOCKS
-DEEPSEEK_V4_PREFILL_HCA_STATE_MAX_BLOCKS = 2048
-DEEPSEEK_V4_PREFILL_CSA_STATE_MAX_BLOCKS = 4096
-DEEPSEEK_V4_PREFILL_CSA_INNER_STATE_MAX_BLOCKS = 4096
+DEEPSEEK_V4_PREFILL_CMP_MAX_BLOCKS = 8192
+DEEPSEEK_V4_PREFILL_IDX_MAX_BLOCKS = 8192
+DEEPSEEK_V4_PREFILL_HCA_STATE_MAX_BLOCKS = 131072
+DEEPSEEK_V4_PREFILL_CSA_STATE_MAX_BLOCKS = 262144
+DEEPSEEK_V4_PREFILL_CSA_INNER_STATE_MAX_BLOCKS = 262144
+# Decode state ring tables cover DEEPSEEK_V4_MAX_SEQ_LEN logical positions.
+DEEPSEEK_V4_DECODE_HCA_STATE_TABLE_BLOCKS = DEEPSEEK_V4_MAX_SEQ_LEN // DEEPSEEK_V4_C128_STATE_BLOCK_SIZE
+DEEPSEEK_V4_DECODE_CSA_STATE_TABLE_BLOCKS = DEEPSEEK_V4_MAX_SEQ_LEN // DEEPSEEK_V4_C4_STATE_BLOCK_SIZE
+DEEPSEEK_V4_DECODE_CSA_INNER_STATE_TABLE_BLOCKS = DEEPSEEK_V4_MAX_SEQ_LEN // DEEPSEEK_V4_C4_STATE_BLOCK_SIZE
 DEEPSEEK_V4_HEAD_DIM = 512
 DEEPSEEK_V4_IDX_HEAD_DIM = 128
 DEEPSEEK_V4_HCA_MAIN_OUT_DIM = 512
@@ -422,6 +429,9 @@ class DeepSeekV4CacheLayout:
     prefill_hca_state_max_blocks: int = DEEPSEEK_V4_PREFILL_HCA_STATE_MAX_BLOCKS
     prefill_csa_state_max_blocks: int = DEEPSEEK_V4_PREFILL_CSA_STATE_MAX_BLOCKS
     prefill_csa_inner_state_max_blocks: int = DEEPSEEK_V4_PREFILL_CSA_INNER_STATE_MAX_BLOCKS
+    decode_hca_state_table_blocks: int = DEEPSEEK_V4_DECODE_HCA_STATE_TABLE_BLOCKS
+    decode_csa_state_table_blocks: int = DEEPSEEK_V4_DECODE_CSA_STATE_TABLE_BLOCKS
+    decode_csa_inner_state_table_blocks: int = DEEPSEEK_V4_DECODE_CSA_INNER_STATE_TABLE_BLOCKS
 
     def validate_runtime(self, config: ModelConfig, runtime: RuntimeConfig, device_ids: Sequence[int]) -> None:
         """Validate serving/runtime options against kernel-fixed dimensions."""
@@ -436,7 +446,7 @@ class DeepSeekV4CacheLayout:
                 f"({self.decode_batch} per rank x {self.ranks} ranks), "
                 f"got max_batch_size={runtime.max_batch_size}"
             )
-        decode_state_capacity = self.prefill_csa_state_max_blocks * self.c4_state_block_size
+        decode_state_capacity = self.decode_csa_state_table_blocks * self.c4_state_block_size
         if runtime.max_seq_len > decode_state_capacity:
             raise ValueError(
                 "DeepSeekV4 pypto-lib decode CSA state tables currently support at most "
@@ -2057,19 +2067,19 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             (
                 "hca_state",
                 "hca_compress_state_block_table",
-                layout.prefill_hca_state_max_blocks,
+                layout.decode_hca_state_table_blocks,
                 True,
             ),
             (
                 "csa_state",
                 "csa_compress_state_block_table",
-                layout.prefill_csa_state_max_blocks,
+                layout.decode_csa_state_table_blocks,
                 True,
             ),
             (
                 "csa_inner_state",
                 "csa_inner_compress_state_block_table",
-                layout.prefill_csa_inner_state_max_blocks,
+                layout.decode_csa_inner_state_table_blocks,
                 True,
             ),
         )
@@ -2291,16 +2301,16 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 ),
                 "hca_compress_state_block_table": self.cache_metadata.ring_block_table_from_ids(
                     padded_group_ids["hca_state"],
-                    max_blocks=layout.prefill_hca_state_max_blocks,
+                    max_blocks=layout.decode_hca_state_table_blocks,
                 ),
                 "csa_compress_state_block_table": self.cache_metadata.ring_block_table_from_ids(
                     padded_group_ids["csa_state"],
-                    max_blocks=layout.prefill_csa_state_max_blocks,
+                    max_blocks=layout.decode_csa_state_table_blocks,
                 ),
                 "csa_inner_compress_state_block_table": (
                     self.cache_metadata.ring_block_table_from_ids(
                         padded_group_ids["csa_inner_state"],
-                        max_blocks=layout.prefill_csa_inner_state_max_blocks,
+                        max_blocks=layout.decode_csa_inner_state_table_blocks,
                     )
                 ),
             }

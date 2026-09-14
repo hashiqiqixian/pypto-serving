@@ -689,7 +689,7 @@ def _validate_model_topology(
             "DeepSeekV4 decode kernels support at most "
             f"--max-num-seqs {max_global_batch} ({layout.decode_batch} per rank)"
         )
-    max_model_len = layout.prefill_csa_state_max_blocks * layout.c4_state_block_size
+    max_model_len = layout.decode_csa_state_table_blocks * layout.c4_state_block_size
     if args.max_model_len > max_model_len:
         raise ValueError(
             "DeepSeekV4 pypto-lib decode CSA state tables currently support at most "

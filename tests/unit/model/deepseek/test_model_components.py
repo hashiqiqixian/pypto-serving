@@ -1989,7 +1989,7 @@ def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
     assert prepared.kernel_tokens == 128
     assert prepared.x_hc.shape == (8, 128, 4, 4)
     assert prepared.x_hc.dtype == torch.float32
-    assert prepared.ori_block_table.shape == (8, 128)
+    assert prepared.ori_block_table.shape == (layout.ranks, layout.prefill_ori_max_blocks)
     assert prepared.ori_block_table[0, :4].tolist() == [0, 0, 0, 0]
     assert prepared.hca_cmp_block_table.shape == (layout.ranks, layout.prefill_cmp_max_blocks)
     assert prepared.csa_cmp_block_table.shape == (layout.ranks, layout.prefill_cmp_max_blocks)
