@@ -65,9 +65,10 @@ class DSparkCase:
 
     case_id: str
     prompt: str
-    prompt_tokens: int
+    prompt_tokens: int | None
     max_new_tokens: int
     num_speculative_tokens: int = 0
+    enable_prefix_caching: bool = False
 
 
 # One DSpark server parks tens of GiB of pooled arenas per card, and the
@@ -152,6 +153,18 @@ GREEDY_CASES = (
         max_new_tokens=_MTP_64_128.max_new_tokens,
         num_speculative_tokens=7,
     ),
+    *(
+        DSparkCase(
+            case_id=f"prefix-cache-k{k}",
+            # Cover a 128-token grouped page plus the drafter replay window.
+            prompt=_MTP_64_128.prompt * 6,
+            prompt_tokens=None,
+            max_new_tokens=16,
+            num_speculative_tokens=k,
+            enable_prefix_caching=True,
+        )
+        for k in (0, 7)
+    ),
 )
 
 
@@ -181,8 +194,9 @@ def _server_command(
     port: int,
     *,
     num_speculative_tokens: int = 0,
+    enable_prefix_caching: bool = False,
 ) -> list[str]:
-    # Keep these serving options aligned with docs/dev/model/deepseek-v4-dspark.md.
+    # Keep these options aligned with docs/developer-guide/deepseek-v4-dspark.md.
     return [
         sys.executable,
         "-m",
@@ -206,7 +220,7 @@ def _server_command(
         "--block-size",
         "32",
         "--max-model-len",
-        "1024",
+        "8192" if enable_prefix_caching else "1024",
         "--max-num-seqs",
         "8",
         "--max-num-batched-tokens",
@@ -217,7 +231,7 @@ def _server_command(
         json.dumps(
             {"method": "dspark", "num_speculative_tokens": num_speculative_tokens}
         ),
-        "--no-enable-prefix-caching",
+        "--enable-prefix-caching" if enable_prefix_caching else "--no-enable-prefix-caching",
         "--ring-heap",
         DSPARK_RING_HEAP,
         "--port",
@@ -248,6 +262,7 @@ def test_dspark_http_greedy_generation(tmp_path: Path, case: DSparkCase) -> None
                     devices,
                     port,
                     num_speculative_tokens=case.num_speculative_tokens,
+                    enable_prefix_caching=case.enable_prefix_caching,
                 ),
                 cwd=ROOT,
                 stdout=server_log,
@@ -271,13 +286,30 @@ def test_dspark_http_greedy_generation(tmp_path: Path, case: DSparkCase) -> None
                 assert isinstance(choices, list) and len(choices) == 1
                 assert choices[0].get("finish_reason") == "length"
                 usage = response.get("usage", {})
-                assert usage.get("prompt_tokens") == case.prompt_tokens
+                if case.prompt_tokens is not None:
+                    assert usage.get("prompt_tokens") == case.prompt_tokens
                 assert usage.get("completion_tokens") == case.max_new_tokens
+                if case.enable_prefix_caching:
+                    assert 256 <= usage.get("prompt_tokens", 0) < 4096
+                    repeated = _request_completion(
+                        process, port, deadline, prompt=case.prompt,
+                        max_new_tokens=case.max_new_tokens, model=MODEL_ID,
+                    )
+                    assert repeated["usage"] == usage
+                    assert repeated["choices"][0]["finish_reason"] == "length"
+                    assert repeated["choices"][0]["text"] == choices[0]["text"]
             finally:
                 _stop_process_group(process)
         # A following case boots a fresh 16-card server that needs nearly
         # the whole card; wait out the previous server's async HBM reclaim.
         _wait_for_device_reclaim(devices)
+        if case.enable_prefix_caching:
+            log_text = log_path.read_text(encoding="utf-8")
+            hits = [int(value) for value in re.findall(r"prefix_cache_hit_tokens=(\d+)", log_text)]
+            assert hits and max(hits) >= 128, "no grouped prefix-cache hit in the server log"
+            assert all(hit % 128 == 0 for hit in hits)
+            if case.num_speculative_tokens:
+                assert max(hits) <= usage["prompt_tokens"] - 128
         if case.num_speculative_tokens:
             # The K=7 run must compile the fused one-L2 entry and really
             # dispatch its drafter/markov chain.  The runner logs acceptance
@@ -316,3 +348,10 @@ def test_server_command_pins_the_dspark_contract(tmp_path) -> None:
         "method": "dspark",
         "num_speculative_tokens": 7,
     }
+    cached = _server_command(
+        tmp_path, tuple(range(DSPARK_EP_SIZE)), 12345,
+        num_speculative_tokens=7, enable_prefix_caching=True,
+    )
+    assert "--enable-prefix-caching" in cached
+    assert "--no-enable-prefix-caching" not in cached
+    assert cached[cached.index("--max-model-len") + 1] == "8192"

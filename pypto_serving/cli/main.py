@@ -314,12 +314,11 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     )
     first_group = parallel_config.replica_device_groups[0]
     worker_device_ids = first_group if parallel_config.num_replicas == 1 else ()
-    # DeepSeek prefix caching currently covers autoregressive decoding and the
-    # one-token MTP path.  Keep the newer arbitrary-depth MTP implementation
-    # available, but do not advertise prefix-cache compatibility for it yet.
+    # DSpark rebuilds its private drafter context from a prefilled suffix.
+    # Arbitrary-depth MTP still lacks a grouped prefix-cache contract.
     enable_prefix_cache = args.enable_prefix_caching
     if model_family == "deepseek_v4" and (
-        num_speculative_tokens > 1 or model_variant == "dspark"
+        num_speculative_tokens > 1 and model_variant != "dspark"
     ):
         enable_prefix_cache = False
     return EngineConfig(
@@ -360,10 +359,12 @@ def _build_runtime_config(
     max_prefill_tokens_per_request = None
     prefill_chunk_size_choices = ()
     supports_chunked_prefill_with_speculation = True
+    speculative_prefix_cache_replay_tokens = 0
     requires_homogeneous_prefill_decode = False
     if model_family == "deepseek_v4" and _resolve_model_variant(args) == "dspark":
         from pypto_serving.model.deepseek_dspark.npu_runner import (
             DSPARK_PREFILL_MAX_TOKENS,
+            DSPARK_SLIDING_WINDOW,
             build_dspark_cache_group_specs,
         )
 
@@ -372,12 +373,19 @@ def _build_runtime_config(
         if not isinstance(compress_ratios, list):
             compress_ratios = None
         num_hidden_layers = int(config_data.get("num_hidden_layers", 43))
+        max_prefill_tokens_per_request = min(DSPARK_PREFILL_MAX_TOKENS, args.max_num_batched_tokens)
+        if args.enable_chunked_prefill and args.long_prefill_token_threshold > 0:
+            max_prefill_tokens_per_request = min(
+                max_prefill_tokens_per_request, args.long_prefill_token_threshold,
+            )
         kv_cache_groups = build_dspark_cache_group_specs(
             num_hidden_layers,
             compress_ratios,
             max_seq_len=args.max_model_len,
+            max_prefill_tokens=max_prefill_tokens_per_request,
         )
-        max_prefill_tokens_per_request = DSPARK_PREFILL_MAX_TOKENS
+        if num_speculative_tokens:
+            speculative_prefix_cache_replay_tokens = DSPARK_SLIDING_WINDOW
     elif model_family == "deepseek_v4":
         from pypto_serving.model.deepseek.npu_executor import (
             load_deepseek_v4_serving_contract,
@@ -421,6 +429,7 @@ def _build_runtime_config(
         max_prefill_tokens_per_request=max_prefill_tokens_per_request,
         prefill_chunk_size_choices=prefill_chunk_size_choices,
         supports_chunked_prefill_with_speculation=supports_chunked_prefill_with_speculation,
+        speculative_prefix_cache_replay_tokens=speculative_prefix_cache_replay_tokens,
         requires_homogeneous_prefill_decode=requires_homogeneous_prefill_decode,
         num_speculative_tokens=num_speculative_tokens,
         kv_cache_groups=kv_cache_groups,

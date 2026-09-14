@@ -549,6 +549,11 @@ class KvCacheManager:
         """Return cache group names in stable allocation order."""
         return tuple(self._group_pools)
 
+    @property
+    def group_specs(self) -> tuple[KVCacheGroupSpec, ...]:
+        """Return the immutable contracts for the configured cache groups."""
+        return tuple(pool.spec for pool in self._group_pools.values())
+
     def init_groups(
         self,
         group_specs: tuple[KVCacheGroupSpec, ...],
