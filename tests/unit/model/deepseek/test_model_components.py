@@ -153,6 +153,29 @@ def test_deepseek_kernel_import_respecializes_sample_module(tmp_path, monkeypatc
     assert sys.modules["sample"] is stale_sample
 
 
+@pytest.mark.parametrize("module_name", ["decode_moe", "prefill_moe"])
+def test_deepseek_kernel_import_respecializes_moe_modules(tmp_path, monkeypatch, module_name):
+    kernel_dir = tmp_path / "models" / "deepseek_v4_flash_mtp"
+    kernel_dir.mkdir(parents=True)
+    module_file = kernel_dir / f"{module_name}.py"
+    module_file.write_text("N_RANKS = 8\n", encoding="utf-8")
+    stale_module = ModuleType(module_name)
+    stale_module.__file__ = str(module_file)
+    stale_module.N_RANKS = 2
+    monkeypatch.setitem(sys.modules, module_name, stale_module)
+
+    with npu_executor._deepseek_v4_import_context(
+        kernel_dir,
+        pypto_lib_root=tmp_path,
+        ep=8,
+    ):
+        reloaded_module = importlib.import_module(module_name)
+        assert reloaded_module is not stale_module
+        assert reloaded_module.N_RANKS == 8
+
+    assert sys.modules[module_name] is stale_module
+
+
 def _pypto_lib_l3_arg_names(module_name: str, function_name: str) -> tuple[str, ...]:
     kernel_file = (
         Path(__file__).resolve().parents[4]
