@@ -46,6 +46,8 @@ _DEEPSEEK_V4_IMPORT_MODULES = (
     "serving_contract",
     "config",
     "moe",
+    "decode_moe",
+    "prefill_moe",
     "combine",
     "decode_csa",
     "decode_hca",
