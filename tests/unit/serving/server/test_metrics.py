@@ -75,3 +75,28 @@ def test_legacy_step_result_defaults_to_no_speculation():
 
     result = decode_result(msgspec.msgpack.encode({"new_tokens": {"r": [1]}, "step_id": 9}))
     assert result.num_draft_tokens == {}
+
+
+def test_metric_serialization_preserves_labels_and_distinct_latency_semantics():
+    from prometheus_client.parser import text_string_to_metric_families
+
+    model = 'model"with\\slashes\nand-newline'
+    logger = InMemoryStatLogger(model, [0])
+    logger.start_request(0, "r", arrival_monotonic=0, num_prompt_tokens=4)
+    logger.record_output(0, "r", completion_tokens=1, timestamp=1)
+    logger.record_output(0, "r", completion_tokens=4, timestamp=4)
+    logger.finish_request(0, "r", "finished_length", timestamp=4)
+    logger.start_request(0, "single", arrival_monotonic=5, num_prompt_tokens=1)
+    logger.record_output(0, "single", completion_tokens=1, timestamp=6)
+    logger.finish_request(0, "single", "finished_length", timestamp=6)
+    samples = {
+        item.name: item for family in text_string_to_metric_families(logger.render_prometheus())
+        for item in family.samples if "le" not in item.labels
+    }
+    assert samples["pypto:generation_tokens_total"].value == 5
+    assert samples["pypto:generation_tokens_total"].labels["model_name"] == model
+    assert samples["vllm:generation_tokens_total"].value == 5
+    assert samples["pypto:inter_token_latency_seconds_count"].value == 3
+    assert samples["vllm:inter_token_latency_seconds_count"].value == 1
+    assert samples["pypto:request_time_per_output_token_seconds_count"].value == 1
+    assert samples["vllm:request_time_per_output_token_seconds_count"].value == 2

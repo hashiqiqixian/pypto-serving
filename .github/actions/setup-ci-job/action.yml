@@ -660,9 +660,9 @@ runs:
         source activate.sh
         # torch is installed in the build step above, before pypto is resolved.
         # 'nanobind<3': same cap as the build step above.
-        pip install 'nanobind<3' transformers safetensors numpy fastapi uvicorn pytest msgspec
-        # --no-deps: pyproject declares none, and the runtime stack above is
-        # deliberately assembled by hand (CPU torch, from-source pypto).
+        pip install 'nanobind<3' pytest -r pypto_serving/requirements-runtime.txt
+        # Runtime requirements are shared with local installs. Keep CPU torch
+        # and from-source pypto/simpler under the build steps above.
         pip install --no-deps -e .
 
     - name: Show ccache stats (after)

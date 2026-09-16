@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-from .logger import InMemoryStatLogger, StatLoggerBase
+from .logger import InMemoryStatLogger
 from .stats import FinishedRequestStats, IterationStats, SchedulerStats
 
 __all__ = [
@@ -15,5 +15,4 @@ __all__ = [
     "InMemoryStatLogger",
     "IterationStats",
     "SchedulerStats",
-    "StatLoggerBase",
 ]

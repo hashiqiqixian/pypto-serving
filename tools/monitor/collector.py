@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 import urllib.error
 import urllib.request
@@ -144,6 +145,7 @@ class MetricsCollector:
             snapshot = await asyncio.to_thread(self.fetch)
             current = aggregate_snapshot(snapshot)
             current["timestamp"] = time.time()
+            current["target"] = self.target
             interval = snapshot_delta(current, self._previous)
             await asyncio.to_thread(self.store.record, interval)
             self._previous = current
@@ -151,19 +153,37 @@ class MetricsCollector:
             self.status.last_collected_at = current["timestamp"]
             self.status.last_error = ""
             self.status.model_name = current["model_name"]
-        except (OSError, ValueError, KeyError, urllib.error.URLError) as exc:
-            self.status.connected = False
-            self.status.last_error = str(exc)
+        except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
+            self.fail(exc)
+
+    def fail(self, error: BaseException) -> None:
+        self.status.connected = False
+        self.status.last_error = f"{type(error).__name__}: {error}"
+
+    def status_snapshot(self) -> dict:
+        return {
+            "target": self.target,
+            "connected": self.status.connected,
+            "last_collected_at": self.status.last_collected_at,
+            "last_error": self.status.last_error,
+            "model_name": self.status.model_name,
+        }
 
     async def run(self) -> None:
-        while not self._stop_event.is_set():
-            started = time.monotonic()
-            await self.collect_once()
-            delay = max(0.0, self.interval - (time.monotonic() - started))
-            try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
-            except asyncio.TimeoutError:
-                pass
+        try:
+            while not self._stop_event.is_set():
+                started = time.monotonic()
+                await self.collect_once()
+                delay = max(0.0, self.interval - (time.monotonic() - started))
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
+        except Exception as exc:
+            self.fail(exc)
+            raise
+        finally:
+            self.status.connected = False
 
     def stop(self) -> None:
         self._stop_event.set()

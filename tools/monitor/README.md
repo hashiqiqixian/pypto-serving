@@ -17,7 +17,10 @@ Open <http://127.0.0.1:9090>. The dashboard listener defaults to
 `127.0.0.1`, so it is not reachable from other hosts unless `--host` is changed.
 
 The default database is
-`~/.local/state/pypto-serving/monitor.sqlite3`. Override it when running in a
+`~/.local/state/pypto-serving/monitor-<target-sha256>.sqlite3`, isolated per target URL.
+Each database is bound to its target and model on the first sample. Switching models
+at the same URL requires a new `--database`; mismatched samples are rejected.
+Override the path when running in a
 container or when history needs to live on a persistent volume:
 
 ```bash
@@ -119,9 +122,16 @@ The dashboard uses summed counter deltas over the last five minutes:
 
 Ratios with no observations are shown as `--`. History buckets and daily totals
 use the same weighted calculation across replicas, rather than averaging rates.
-Existing SQLite databases gain the new columns automatically; older samples
-have zero counters and do not contribute observations. The first scrape after
+Unidentified databases from preview revisions are not migrated; choose a new
+`--database` and retain the old file separately if needed. The first scrape after
 collector startup or a serving restart establishes a baseline.
 
 The monitor records only aggregate operational metrics. It does not store
 prompts, generated text, request IDs, or API credentials.
+
+## Collector Health
+
+Temporary HTTP or SQLite failures mark the collector disconnected and retry on the
+next polling interval. Deltas resume from the last successfully stored sample.
+Unexpected background task failures remain visible through `/api/status`, which
+works independently of SQLite. `/api/summary` includes the same collector status.

@@ -119,8 +119,16 @@ class _SnapshotCollector:
             yield metric
 
 
-def render_vllm(snapshot: dict) -> str:
+def render_metric_families(families) -> str:
+    class Collector:
+        def collect(self):
+            yield from families
+
     # A private registry avoids global collectors and multiprocess environment state.
     registry = CollectorRegistry()
-    registry.register(_SnapshotCollector(snapshot))
+    registry.register(Collector())
     return generate_latest(registry).decode("utf-8")
+
+
+def render_vllm(snapshot: dict) -> str:
+    return render_metric_families(_SnapshotCollector(snapshot).collect())

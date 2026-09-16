@@ -303,3 +303,49 @@ class _StartupCore(_FakeCore):
 
     async def stop(self) -> None:
         self.stopped = True
+
+
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize("with_parser", [False, True])
+def test_metrics_have_one_owner_with_custom_core_fallback(bound, with_parser):
+    from unittest.mock import Mock
+    from pypto_serving.serving.reasoning import OutputParserSpec
+
+    parser_spec = OutputParserSpec("deepseek_v4", "reasoning") if with_parser else None
+
+    class ParserCore(_ResultCore):
+        async def add_request(self, request_id, *args, **kwargs):
+            if parser_spec is None:
+                assert "output_parser_spec" not in kwargs
+            else:
+                assert kwargs.pop("output_parser_spec") is parser_spec
+            async for output in super().add_request(request_id, *args, **kwargs):
+                yield output
+
+    class BoundCore(ParserCore):
+        def set_stat_logger(self, logger, index):
+            self.logger, self.index = logger, index
+
+        async def add_request(self, request_id, *args, **kwargs):
+            async for output in super().add_request(request_id, *args, **kwargs):
+                self.logger.record_output(self.index, request_id, completion_tokens=output.completion_tokens)
+                self.logger.finish_request(self.index, request_id, output.finish_reason)
+                yield output
+
+    async def check():
+        engine = AsyncLLMEngine(
+            EngineConfig(model_id="model", model_dir="/tmp/model",
+                         parallel_config=ParallelConfig(devices=(0,))),
+            tokenizer=_Tokenizer(), core_factory=BoundCore if bound else ParserCore,
+        )
+        engine.metrics.record_output = Mock(wraps=engine.metrics.record_output)
+        engine.metrics.finish_request = Mock(wraps=engine.metrics.finish_request)
+        await _collect_outputs(engine.add_request(
+            "r", "hello", GenerateConfig(max_new_tokens=2), output_parser_spec=parser_spec,
+        ))
+        assert engine.metrics.record_output.call_count == 1
+        assert engine.metrics.finish_request.call_count == 1
+        counters = engine.metrics.snapshot()["replicas"][0]["counters"]
+        assert counters["generation_tokens"] == 2
+        assert counters["requests_finished"] == 1
+    asyncio.run(check())

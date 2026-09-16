@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import sqlite3
@@ -77,7 +78,11 @@ class MonitorStore:
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(self.path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
-        self._initialize()
+        try:
+            self._initialize()
+        except BaseException:
+            self._connection.close()
+            raise
 
     @staticmethod
     def _resolve_timezone(name: str):
@@ -96,6 +101,11 @@ class MonitorStore:
         with self._connection:
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.execute("PRAGMA synchronous=NORMAL")
+            existing = {row[0] for row in self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )}
+            if "samples" in existing and "identity" not in existing:
+                raise ValueError("Unidentified preview database is unsupported; use a new --database")
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS samples (
@@ -115,7 +125,11 @@ class MonitorStore:
                     aborted_delta INTEGER NOT NULL,
                     elapsed REAL NOT NULL,
                     ttft_histogram TEXT NOT NULL,
-                    tpot_histogram TEXT NOT NULL
+                    tpot_histogram TEXT NOT NULL,
+                    speculative_drafts INTEGER NOT NULL DEFAULT 0,
+                    draft_tokens INTEGER NOT NULL DEFAULT 0,
+                    accepted_tokens INTEGER NOT NULL DEFAULT 0,
+                    speculative_fallbacks INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -130,19 +144,31 @@ class MonitorStore:
                     errors INTEGER NOT NULL,
                     aborted INTEGER NOT NULL,
                     cache_queries INTEGER NOT NULL,
-                    cache_hits INTEGER NOT NULL
+                    cache_hits INTEGER NOT NULL,
+                    speculative_drafts INTEGER NOT NULL DEFAULT 0,
+                    draft_tokens INTEGER NOT NULL DEFAULT 0,
+                    accepted_tokens INTEGER NOT NULL DEFAULT 0,
+                    speculative_fallbacks INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
 
-            # Existing monitor databases retain their samples and daily totals.
-            for table in ("samples", "daily_totals"):
-                columns = {row["name"] for row in self._connection.execute(f"PRAGMA table_info({table})")}
-                for column in _SPECULATIVE_COUNTERS:
-                    if column not in columns:
-                        self._connection.execute(
-                            f"ALTER TABLE {table} ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
-                        )
+            self._connection.execute(
+                "CREATE TABLE IF NOT EXISTS identity (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), "
+                "target TEXT NOT NULL, model_name TEXT NOT NULL)"
+            )
+
+    def _check_identity(self, target: str, model_name: str) -> None:
+        # Persist only a digest: target URLs may contain credentials.
+        target = hashlib.sha256(target.rstrip("/").encode("utf-8")).hexdigest()
+        # Called inside the write transaction, so competing collectors cannot
+        # claim an empty database for different targets.
+        self._connection.execute(
+            "INSERT OR IGNORE INTO identity VALUES (1, ?, ?)", (target, model_name)
+        )
+        identity = self._connection.execute("SELECT target, model_name FROM identity").fetchone()
+        if tuple(identity) != (target, model_name):
+            raise ValueError("Monitor database belongs to a different target or model; use a new --database")
 
     def close(self) -> None:
         with self._lock:
@@ -166,6 +192,7 @@ class MonitorStore:
             "aborted_delta": int(counters.get("requests_aborted", 0)),
         }
         with self._lock, self._connection:
+            self._check_identity(sample["target"], sample["model_name"])
             cursor = self._connection.execute(
                 """
                 INSERT OR IGNORE INTO samples (

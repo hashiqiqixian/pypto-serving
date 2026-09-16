@@ -1235,6 +1235,7 @@ class AsyncLLMEngine:
         self._request_to_replica: dict[str, int] = {}
         self._route_extra_load = [0 for _ in parallel.replica_device_groups]
         self._cores: list[ReplicaEngineCore] = []
+        self._core_records_metrics: list[bool] = []
         self.metrics = InMemoryStatLogger(
             config.model_id,
             list(range(len(parallel.replica_device_groups))),
@@ -1254,7 +1255,9 @@ class AsyncLLMEngine:
                 config=replica_config,
                 tokenizer=tokenizer,
             )
-            if hasattr(core, "set_stat_logger"):
+            records_metrics = callable(getattr(core, "set_stat_logger", None))
+            self._core_records_metrics.append(records_metrics)
+            if records_metrics:
                 core.set_stat_logger(self.metrics, dp_rank)
             self._cores.append(core)
 
@@ -1423,18 +1426,14 @@ class AsyncLLMEngine:
                     output_parser_spec=output_parser_spec,
                 )
             async for output in outputs:
-                self.metrics.record_output(
-                    replica_idx,
-                    request_id,
-                    completion_tokens=output.completion_tokens,
-                )
+                if not self._core_records_metrics[replica_idx]:
+                    self.metrics.record_output(
+                        replica_idx, request_id, completion_tokens=output.completion_tokens,
+                    )
                 if output.finished:
                     terminal_output_seen = True
-                    self.metrics.finish_request(
-                        replica_idx,
-                        request_id,
-                        output.finish_reason,
-                    )
+                    if not self._core_records_metrics[replica_idx]:
+                        self.metrics.finish_request(replica_idx, request_id, output.finish_reason)
                 yield output
         except asyncio.CancelledError:
             if not terminal_output_seen:

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 try:
@@ -30,17 +31,25 @@ def create_app(collector: MetricsCollector, store: MonitorStore) -> FastAPI:
     static_dir = Path(__file__).resolve().parent / "static"
     app.mount("/assets", StaticFiles(directory=static_dir), name="assets")
 
+    def collector_done(task: asyncio.Task) -> None:
+        if not task.cancelled() and (error := task.exception()) is not None:
+            collector.fail(error)
+            logging.getLogger(__name__).error("Metrics collector stopped: %s", error)
+
     @app.on_event("startup")
     async def startup() -> None:
         app.state.collector_task = asyncio.create_task(collector.run())
+        app.state.collector_task.add_done_callback(collector_done)
 
     @app.on_event("shutdown")
     async def shutdown() -> None:
         collector.stop()
         task = getattr(app.state, "collector_task", None)
-        if task is not None:
-            await task
-        store.close()
+        try:
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
+        finally:
+            store.close()
 
     @app.get("/", include_in_schema=False)
     async def dashboard() -> FileResponse:
@@ -48,23 +57,12 @@ def create_app(collector: MetricsCollector, store: MonitorStore) -> FastAPI:
 
     @app.get("/api/status")
     async def status() -> dict:
-        return {
-            "target": collector.target,
-            "connected": collector.status.connected,
-            "last_collected_at": collector.status.last_collected_at,
-            "last_error": collector.status.last_error,
-            "model_name": collector.status.model_name,
-        }
+        return collector.status_snapshot()
 
     @app.get("/api/summary")
     async def summary(window: int = Query(default=300, ge=10, le=86400)) -> dict:
         data = await asyncio.to_thread(store.summary, window)
-        data["collector"] = {
-            "target": collector.target,
-            "connected": collector.status.connected,
-            "last_collected_at": collector.status.last_collected_at,
-            "last_error": collector.status.last_error,
-        }
+        data["collector"] = collector.status_snapshot()
         return data
 
     @app.get("/api/history")

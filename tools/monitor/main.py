@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
 
 from .app import create_app
@@ -27,12 +28,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--database",
         type=Path,
-        default=Path("~/.local/state/pypto-serving/monitor.sqlite3").expanduser(),
-        help="SQLite history database",
+        default=None,
+        help="SQLite history database (default: a separate file per target)",
     )
     parser.add_argument("--timezone", default="local", help="IANA timezone or 'local'")
     parser.add_argument("--retention-hours", type=int, default=24, help="Detailed history retention")
     return parser
+
+
+def default_database(target: str) -> Path:
+    target_id = hashlib.sha256(target.rstrip("/").encode("utf-8")).hexdigest()
+    return Path("~/.local/state/pypto-serving").expanduser() / f"monitor-{target_id}.sqlite3"
 
 
 def main() -> None:
@@ -43,7 +49,7 @@ def main() -> None:
         raise ImportError("PyPTO Monitor requires uvicorn") from exc
 
     store = MonitorStore(
-        args.database,
+        args.database or default_database(args.target),
         timezone_name=args.timezone,
         retention_seconds=args.retention_hours * 3600,
     )

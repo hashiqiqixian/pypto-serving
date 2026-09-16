@@ -9,15 +9,15 @@
 
 from __future__ import annotations
 
-import math
 import threading
 import time
 import uuid
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
+from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, HistogramMetricFamily
+
 from .stats import FinishedRequestStats, IterationStats, SchedulerStats
-from .vllm import histogram_buckets, render_vllm
+from .vllm import histogram_buckets, render_metric_families, render_vllm
 
 _LATENCY_BUCKETS = (
     0.001,
@@ -66,18 +66,6 @@ _TPOT_BUCKETS = (
     40.0,
     80.0,
 )
-
-
-class StatLoggerBase(ABC):
-    """Publisher interface modeled after vLLM's stat logger boundary."""
-
-    @abstractmethod
-    def record_scheduler(self, engine_index: int, stats: SchedulerStats) -> None:
-        pass
-
-    @abstractmethod
-    def record_iteration(self, engine_index: int, stats: IterationStats) -> None:
-        pass
 
 
 @dataclass
@@ -140,6 +128,7 @@ class _EngineMetrics:
     accepted_tokens: int = 0
     speculative_fallbacks: int = 0
     accepted_tokens_per_pos: list[int] = field(default_factory=list)
+    # Compatibility histograms retain different buckets and ITL/TPOT semantics.
     vllm_histograms: dict[str, _Histogram] = field(default_factory=dict)
     finish_reasons: dict[str, int] = field(default_factory=dict)
     ttft: _Histogram = field(default_factory=lambda: _Histogram(_LATENCY_BUCKETS))
@@ -148,7 +137,7 @@ class _EngineMetrics:
     e2e: _Histogram = field(default_factory=lambda: _Histogram(_LATENCY_BUCKETS))
 
 
-class InMemoryStatLogger(StatLoggerBase):
+class InMemoryStatLogger:
     """Thread-safe cumulative metrics registry for one API server process."""
 
     def __init__(
@@ -356,37 +345,37 @@ class InMemoryStatLogger(StatLoggerBase):
 
     def render_prometheus(self) -> str:
         snapshot = self.snapshot()
-        lines: list[str] = []
-        self._render_gauge(lines, snapshot, "num_requests_running", "Requests in execution batches", "running")
-        self._render_gauge(lines, snapshot, "num_requests_waiting", "Requests waiting to be processed", "waiting")
-        self._render_gauge(lines, snapshot, "kv_cache_usage_perc", "KV cache usage from zero to one", "kv_cache_usage")
+        families: list = []
+        self._render_gauge(families, snapshot, "num_requests_running", "Requests in execution batches", "running")
+        self._render_gauge(families, snapshot, "num_requests_waiting", "Requests waiting to be processed", "waiting")
+        self._render_gauge(families, snapshot, "kv_cache_usage_perc", "KV cache usage from zero to one", "kv_cache_usage")
         self._render_gauge(
-            lines, snapshot, "draft_acceptance_rate", "Cumulative accepted fraction of verified drafts",
+            families, snapshot, "draft_acceptance_rate", "Cumulative accepted fraction of verified drafts",
             "draft_acceptance_rate",
         )
         self._render_gauge(
-            lines, snapshot, "mean_acceptance_length", "Cumulative tokens per speculative verification round",
+            families, snapshot, "mean_acceptance_length", "Cumulative tokens per speculative verification round",
             "mean_acceptance_length",
         )
-        self._render_counter(lines, snapshot, "prompt_tokens", "Prompt tokens received", "prompt_tokens")
-        self._render_counter(lines, snapshot, "prefill_tokens", "Prefill tokens computed", "prefill_tokens")
-        self._render_counter(lines, snapshot, "generation_tokens", "Generation tokens produced", "generation_tokens")
-        self._render_counter(lines, snapshot, "prefix_cache_queries", "Prefix cache queried tokens", "prefix_cache_queries")
-        self._render_counter(lines, snapshot, "prefix_cache_hits", "Prefix cache hit tokens", "prefix_cache_hits")
-        self._render_counter(lines, snapshot, "num_preemptions", "Cumulative scheduler preemptions", "preemptions")
-        self._render_finish_reasons(lines, snapshot)
+        self._render_counter(families, snapshot, "prompt_tokens", "Prompt tokens received", "prompt_tokens")
+        self._render_counter(families, snapshot, "prefill_tokens", "Prefill tokens computed", "prefill_tokens")
+        self._render_counter(families, snapshot, "generation_tokens", "Generation tokens produced", "generation_tokens")
+        self._render_counter(families, snapshot, "prefix_cache_queries", "Prefix cache queried tokens", "prefix_cache_queries")
+        self._render_counter(families, snapshot, "prefix_cache_hits", "Prefix cache hit tokens", "prefix_cache_hits")
+        self._render_counter(families, snapshot, "num_preemptions", "Cumulative scheduler preemptions", "preemptions")
+        self._render_finish_reasons(families, snapshot)
         for key, description in (
             ("speculative_drafts", "Request rounds verifying at least one draft"),
             ("draft_tokens", "Draft tokens submitted for verification"),
             ("accepted_tokens", "Accepted draft tokens excluding the bonus token"),
             ("speculative_fallbacks", "Speculative request rounds with no drafts"),
         ):
-            self._render_counter(lines, snapshot, key, description, key)
-        self._render_histogram(lines, snapshot, "time_to_first_token_seconds", "Time to first token", "ttft")
-        self._render_histogram(lines, snapshot, "inter_token_latency_seconds", "Inter-token latency", "itl")
-        self._render_histogram(lines, snapshot, "request_time_per_output_token_seconds", "Mean time per output token per request", "tpot")
-        self._render_histogram(lines, snapshot, "e2e_request_latency_seconds", "End-to-end request latency", "e2e")
-        return render_vllm(snapshot) + "\n".join(lines) + "\n"
+            self._render_counter(families, snapshot, key, description, key)
+        self._render_histogram(families, snapshot, "time_to_first_token_seconds", "Time to first token", "ttft")
+        self._render_histogram(families, snapshot, "inter_token_latency_seconds", "Inter-token latency", "itl")
+        self._render_histogram(families, snapshot, "request_time_per_output_token_seconds", "Mean time per output token per request", "tpot")
+        self._render_histogram(families, snapshot, "e2e_request_latency_seconds", "End-to-end request latency", "e2e")
+        return render_vllm(snapshot) + render_metric_families(families)
 
     def _engine(self, engine_index: int) -> _EngineMetrics:
         if engine_index not in self._engines:
@@ -440,66 +429,37 @@ class InMemoryStatLogger(StatLoggerBase):
             },
         }
 
-    def _labels(self, engine_index: int, extra: dict[str, str] | None = None) -> str:
-        values = {
-            "model_name": self.model_name,
-            "engine": str(engine_index),
-        }
-        if extra:
-            values.update(extra)
-        encoded = ",".join(
-            f'{key}="{self._escape_label(value)}"' for key, value in values.items()
-        )
-        return "{" + encoded + "}"
-
     @staticmethod
-    def _escape_label(value: str) -> str:
-        return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
-
-    def _render_gauge(self, lines: list[str], snapshot: dict, name: str, help_text: str, key: str) -> None:
-        metric = f"pypto:{name}"
-        lines.extend((f"# HELP {metric} {help_text}.", f"# TYPE {metric} gauge"))
+    def _render_gauge(families: list, snapshot: dict, name: str, help_text: str, key: str) -> None:
+        metric = GaugeMetricFamily(f"pypto:{name}", help_text, labels=["model_name", "engine"])
         for replica in snapshot["replicas"]:
             value = replica["gauges"][key]
-            lines.append(f"{metric}{self._labels(replica['engine'])} {value if value is not None else 'NaN'}")
-
-    def _render_counter(self, lines: list[str], snapshot: dict, name: str, help_text: str, key: str) -> None:
-        metric = f"pypto:{name}_total"
-        lines.extend((f"# HELP {metric} {help_text}.", f"# TYPE {metric} counter"))
-        for replica in snapshot["replicas"]:
-            lines.append(f"{metric}{self._labels(replica['engine'])} {replica['counters'][key]}")
-
-    def _render_finish_reasons(self, lines: list[str], snapshot: dict) -> None:
-        metric = "pypto:request_success_total"
-        lines.extend((f"# HELP {metric} Count of terminated requests.", f"# TYPE {metric} counter"))
-        for replica in snapshot["replicas"]:
-            for reason, count in replica["finish_reasons"].items():
-                labels = self._labels(replica["engine"], {"finished_reason": reason})
-                lines.append(f"{metric}{labels} {count}")
-
-    def _render_histogram(
-        self,
-        lines: list[str],
-        snapshot: dict,
-        name: str,
-        help_text: str,
-        key: str,
-    ) -> None:
-        metric = f"pypto:{name}"
-        lines.extend((f"# HELP {metric} {help_text} in seconds.", f"# TYPE {metric} histogram"))
-        for replica in snapshot["replicas"]:
-            histogram = replica["histograms"][key]
-            for bucket in histogram["buckets"]:
-                labels = self._labels(replica["engine"], {"le": self._format_float(bucket["le"])})
-                lines.append(f"{metric}_bucket{labels} {bucket['count']}")
-            labels = self._labels(replica["engine"], {"le": "+Inf"})
-            lines.append(f"{metric}_bucket{labels} {histogram['count']}")
-            base_labels = self._labels(replica["engine"])
-            lines.append(f"{metric}_sum{base_labels} {histogram['sum']}")
-            lines.append(f"{metric}_count{base_labels} {histogram['count']}")
+            metric.add_metric([snapshot["model_name"], str(replica["engine"])],
+                              value if value is not None else float("nan"))
+        families.append(metric)
 
     @staticmethod
-    def _format_float(value: float) -> str:
-        if math.isinf(value):
-            return "+Inf"
-        return f"{value:g}"
+    def _render_counter(families: list, snapshot: dict, name: str, help_text: str, key: str) -> None:
+        metric = CounterMetricFamily(f"pypto:{name}", help_text, labels=["model_name", "engine"])
+        for replica in snapshot["replicas"]:
+            metric.add_metric([snapshot["model_name"], str(replica["engine"])], replica["counters"][key])
+        families.append(metric)
+
+    @staticmethod
+    def _render_finish_reasons(families: list, snapshot: dict) -> None:
+        metric = CounterMetricFamily("pypto:request_success", "Count of terminated requests.",
+                                     labels=["model_name", "engine", "finished_reason"])
+        for replica in snapshot["replicas"]:
+            for reason, count in replica["finish_reasons"].items():
+                metric.add_metric([snapshot["model_name"], str(replica["engine"]), reason], count)
+        families.append(metric)
+
+    @staticmethod
+    def _render_histogram(families: list, snapshot: dict, name: str, help_text: str, key: str) -> None:
+        metric = HistogramMetricFamily(f"pypto:{name}", help_text, labels=["model_name", "engine"])
+        for replica in snapshot["replicas"]:
+            histogram = replica["histograms"][key]
+            buckets = [(str(float(bucket["le"])), bucket["count"]) for bucket in histogram["buckets"]]
+            buckets.append(("+Inf", histogram["count"]))
+            metric.add_metric([snapshot["model_name"], str(replica["engine"])], buckets, histogram["sum"])
+        families.append(metric)
