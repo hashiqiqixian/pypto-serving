@@ -14,10 +14,12 @@ host/device transfers on every call; it is not a fused device-resident backend.
 Decoded low-precision values must already be BF16. FP32-critical HC, routing and
 head arithmetic belongs to the caller and must not be silently rounded here.
 
-The per-call budget counts tensor buffers, including padding, estimated device
-copies, and conservative finite-check scratch. Compiler/runtime workspaces and
-previously returned tensors are outside this limit. Compilation has a separate
-bounded number of shape specializations; no persistent binary cache is assumed.
+The per-call budget counts complete inputs and the owned result, plus padding,
+estimated device copies, and conservative finite-check scratch. The PyPTO
+provider splits oversized calls along rows without changing K accumulation.
+Compiler/runtime workspaces and previously returned tensors are outside this
+limit. Compilation has a separate bounded number of shape specializations;
+no persistent binary cache is assumed.
 """
 
 from __future__ import annotations
@@ -153,26 +155,54 @@ class PyptoMatmulOps:
             if self._closed:
                 raise RuntimeError("matmul provider is closed")
             rows, columns, inner = _shape(a, b)
-            padded = ((rows + 15) // 16 * 16, (columns + 63) // 64 * 64, (inner + 63) // 64 * 64)
-            pm, pn, pk = padded
-            buffers = 2 * (pm * pk + pk * pn) + 4 * pm * pn
-            _budget(
-                2 * (rows * inner + inner * columns)
-                + 2 * buffers
-                + 4 * rows * columns
-                + 16 * max(pm * pk, pk * pn, pm * pn),
-                self.max_buffer_bytes,
-            )
-            _finite(a)
+            chunk_rows = self._row_chunk_size(rows, columns, inner)
+            # Validate every input before dispatch, including late chunks, without
+            # allocating finite-check scratch for the complete oversized matrix.
+            for start in range(0, rows, chunk_rows):
+                _finite(a[start : start + chunk_rows])
             _finite(b)
-            kernel, directory = self._entry(padded)
-            lhs = self._pad(a, (pm, pk))
-            rhs = self._pad(b, (pk, pn))
-            output = torch.empty((pm, pn), dtype=torch.float32)
-            config = replace(self._config, save_kernels_dir=directory.name)
-            kernel(lhs, rhs, output, config=config)
-            _finite(output)
-            return output[:rows, :columns].clone(memory_format=torch.contiguous_format)
+            result = torch.empty((rows, columns), dtype=torch.float32)
+            for start in range(0, rows, chunk_rows):
+                self._dispatch_into(a[start : start + chunk_rows], b, result[start : start + chunk_rows])
+            return result
+
+    def _row_chunk_size(self, rows: int, columns: int, inner: int) -> int:
+        pn, pk = (columns + 63) // 64 * 64, (inner + 63) // 64 * 64
+        # Complete caller inputs and the final result stay live across all chunks.
+        resident = 2 * (rows * inner + inner * columns) + 4 * rows * columns
+
+        def estimate(pm: int) -> int:
+            buffers = 2 * (pm * pk + pk * pn) + 4 * pm * pn
+            return resident + 2 * buffers + 16 * max(pm * pk, pk * pn, pm * pn)
+
+        blocks = (rows + 15) // 16
+        if estimate(blocks * 16) <= self.max_buffer_bytes:
+            return rows
+        # Reject impossible calls before any tensor allocation or compilation.
+        _budget(estimate(16), self.max_buffer_bytes)
+        low, high = 1, blocks - 1
+        while low < high:
+            middle = (low + high + 1) // 2
+            if estimate(middle * 16) <= self.max_buffer_bytes:
+                low = middle
+            else:
+                high = middle - 1
+        return low * 16
+
+    def _dispatch_into(self, a: torch.Tensor, b: torch.Tensor, result: torch.Tensor) -> None:
+        # All chunk temporaries expire on return, before the next chunk is padded.
+        rows, inner = a.shape
+        columns = b.shape[1]
+        padded = ((rows + 15) // 16 * 16, (columns + 63) // 64 * 64, (inner + 63) // 64 * 64)
+        pm, pn, pk = padded
+        kernel, directory = self._entry(padded)
+        lhs = self._pad(a, (pm, pk))
+        rhs = self._pad(b, (pk, pn))
+        output = torch.empty((pm, pn), dtype=torch.float32)
+        config = replace(self._config, save_kernels_dir=directory.name)
+        kernel(lhs, rhs, output, config=config)
+        _finite(output)
+        result.copy_(output[:rows, :columns])
 
     def _entry(self, padded: tuple[int, int, int]) -> tuple[object, tempfile.TemporaryDirectory]:
         if padded in self._cache:

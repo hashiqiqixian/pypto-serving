@@ -70,6 +70,18 @@ at 64 MiB. `placement="uncached"` disables row retention. Neither mode loads the
 full Engram table or promises HBM-resident weights. Header/index Python objects,
 compiler workspaces and caller-retained outputs are separate memory costs.
 
+`PyptoMatmulOps` keeps its 256 MiB default by splitting oversized BF16 products
+along M (rows). Its estimate includes the complete caller inputs and final FP32
+result, plus one padded chunk, estimated device copies and finite-check scratch.
+K accumulation and the caller's prefill chunk remain unchanged. For the 8K
+`wo_a` product `[8192,4096] @ [4096,1024]`, five 1568-row chunks and a 352-row
+tail reduce the estimate from 824 MiB to 254.75 MiB. Inputs are checked in bounded
+chunks before dispatch; outputs are checked and copied into the final result
+one chunk at a time. Calls that cannot fit even a 16-row chunk still fail before
+allocation. This limit does not bound the whole model's memory use or compiler
+and runtime workspaces. The independent `TorchMatmulOps` reference keeps its
+existing full-product budget check.
+
 The source index includes text, vision and draft schemas. The original
 `DeepSeekV41WeightLoader` remains available for bounded inspection and selected
 layer conversion. Production arithmetic uses the streaming tensor store.

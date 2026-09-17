@@ -14,6 +14,7 @@ import dataclasses
 import importlib.util
 import sys
 import types
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -47,20 +48,31 @@ def fake_dispatch(ops_module, monkeypatch):
         save_kernels: bool
         save_kernels_dir: str | None = None
 
-    state = SimpleNamespace(created=0, calls=[], fail=False, nonfinite=False)
+    state = SimpleNamespace(
+        created=0,
+        calls=[],
+        fail=False,
+        nonfinite=False,
+        fail_at=None,
+        nonfinite_at=None,
+        output_refs=[],
+        live_previous_outputs=[],
+    )
 
     def factory():
         state.created += 1
         identity = state.created
 
         def kernel(a, b, output, *, config):
+            state.live_previous_outputs.append(sum(ref() is not None for ref in state.output_refs))
+            state.output_refs.append(weakref.ref(output))
             state.calls.append((identity, a.clone(), b.clone(), output.shape, config))
             # Simulate a compiler-owned artifact only to test its cleanup path.
             (Path(config.save_kernels_dir) / "artifact.txt").write_text("dispatch test")
-            if state.fail:
+            if state.fail or state.fail_at == len(state.calls):
                 raise RuntimeError("synthetic dispatch failure")
             output.copy_(a.float() @ b.float())
-            if state.nonfinite:
+            if state.nonfinite or state.nonfinite_at == len(state.calls):
                 output[0, 0] = float("inf")
 
         return kernel
@@ -125,6 +137,137 @@ def test_pypto_bridge_padding_crop_and_runconfig(ops_module, fake_dispatch, tmp_
     finally:
         ops.close()
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_row_chunking_preserves_strided_inputs_padding_values_and_output_ownership(
+    ops_module, fake_dispatch, tmp_path, platform
+):
+    # 110 KiB accommodates 32 padded rows, but not the full 65-row call.
+    a = (torch.arange(65 * 6).reshape(65, 6) % 9 - 4).to(torch.bfloat16)[:, ::2]
+    b = (torch.arange(3 * 14).reshape(3, 14) % 7 - 3).to(torch.bfloat16)[:, ::2]
+    before_a, before_b = a.clone(), b.clone()
+    expected = reference(a, b)
+    ops = ops_module.PyptoMatmulOps(platform=platform, build_dir=tmp_path, max_buffer_bytes=110 << 10)
+    try:
+        result = ops.matmul(a, b)
+        assert result.dtype == torch.float32 and result.shape == (65, 7)
+        assert result.is_contiguous() and not result.requires_grad
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        assert [call[1].shape[0] for call in fake_dispatch.calls] == [32, 32, 16]
+        assert fake_dispatch.live_previous_outputs == [0, 0, 0]
+        # The final one-row chunk must clear all padded M/K/N lanes.
+        _, lhs, rhs, _, _ = fake_dispatch.calls[-1]
+        assert torch.count_nonzero(lhs[1:]) == torch.count_nonzero(lhs[:, 3:]) == 0
+        assert torch.count_nonzero(rhs[3:]) == torch.count_nonzero(rhs[:, 7:]) == 0
+        repeated = ops.matmul(a, -b)
+        torch.testing.assert_close(repeated, -expected, rtol=0, atol=0)
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        result.zero_()
+        assert torch.equal(a, before_a) and torch.equal(b, before_b)
+    finally:
+        ops.close()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_8k_group_projection_uses_six_chunks_at_unchanged_default_budget(
+    ops_module, fake_dispatch, tmp_path, monkeypatch
+):
+    # Exercise the real public planner without large CPU GEMMs or input clones.
+    # The logical 64 MiB/8 MiB inputs share only two scalar allocations.
+    a = torch.tensor(1.0, dtype=torch.bfloat16).expand(8192, 4096)
+    b = torch.tensor(1.0, dtype=torch.bfloat16).expand(4096, 1024)
+    assert a.untyped_storage().nbytes() + b.untyped_storage().nbytes() == 4
+    ops = ops_module.PyptoMatmulOps(build_dir=tmp_path)
+    calls = []
+
+    def dispatch_into(left, right, target):
+        assert left.shape[1] == 4096 and right is b
+        assert target.shape == (left.shape[0], 1024)
+        calls.append((left.shape[0], target.storage_offset()))
+        target.fill_(len(calls))
+
+    monkeypatch.setattr(ops, "_dispatch_into", dispatch_into)
+    try:
+        assert ops.max_buffer_bytes == 256 << 20
+        result = ops.matmul(a, b)
+        assert [rows for rows, _ in calls] == [1568] * 5 + [352]
+        assert [offset for _, offset in calls] == [index * 1568 * 1024 for index in range(6)]
+        assert result.shape == (8192, 1024) and result.dtype == torch.float32 and result.is_contiguous()
+        start = 0
+        for index, (rows, _) in enumerate(calls, 1):
+            assert bool((result[start : start + rows] == index).all())
+            start += rows
+        assert start == 8192 and fake_dispatch.created == 0
+        assert float(a[0, 0]) == float(b[0, 0]) == 1.0
+    finally:
+        ops.close()
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("operand", ["a", "b"])
+def test_chunked_call_rejects_late_nonfinite_input_before_any_dispatch(
+    ops_module, fake_dispatch, tmp_path, operand
+):
+    a, b = torch.ones(65, 3, dtype=torch.bfloat16), torch.ones(3, 7, dtype=torch.bfloat16)
+    (a if operand == "a" else b)[-1, -1] = float("nan")
+    ops = ops_module.PyptoMatmulOps(build_dir=tmp_path, max_buffer_bytes=110 << 10)
+    try:
+        with pytest.raises(ValueError, match="finite"):
+            ops.matmul(a, b)
+        assert not fake_dispatch.calls and fake_dispatch.created == 0
+    finally:
+        ops.close()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_chunked_call_rejects_impossible_minimum_before_result_or_padding_allocation(
+    ops_module, fake_dispatch, tmp_path, monkeypatch
+):
+    a, b = torch.ones(65, 3, dtype=torch.bfloat16), torch.ones(3, 7, dtype=torch.bfloat16)
+    ops = ops_module.PyptoMatmulOps(build_dir=tmp_path, max_buffer_bytes=95000)
+
+    def no_allocation(*args, **kwargs):
+        pytest.fail("an impossible minimum chunk must fail before allocating output or padding")
+
+    monkeypatch.setattr(torch, "empty", no_allocation)
+    monkeypatch.setattr(torch, "zeros", no_allocation)
+    monkeypatch.setattr(ops, "_pad", no_allocation)
+    try:
+        with pytest.raises(ValueError, match="budget"):
+            ops.matmul(a, b)
+        assert not fake_dispatch.calls and fake_dispatch.created == 0
+    finally:
+        ops.close()
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("failure", ["fail_at", "nonfinite_at"])
+def test_later_chunk_failure_propagates_then_clean_retry_succeeds(
+    ops_module, fake_dispatch, tmp_path, monkeypatch, failure
+):
+    marker = tmp_path / "user-file.txt"
+    marker.write_text("preserve")
+    a, b = torch.ones(65, 3, dtype=torch.bfloat16), torch.ones(3, 7, dtype=torch.bfloat16)
+    ops = ops_module.PyptoMatmulOps(build_dir=tmp_path, max_buffer_bytes=110 << 10)
+    setattr(fake_dispatch, failure, 2)
+
+    def no_fallback(*args, **kwargs):
+        pytest.fail("a failed chunk must not select the CPU reference provider")
+
+    monkeypatch.setattr(ops_module.TorchMatmulOps, "matmul", no_fallback)
+    try:
+        with pytest.raises((ValueError, RuntimeError), match="finite|synthetic dispatch failure"):
+            ops.matmul(a, b)
+        assert len(fake_dispatch.calls) == 2
+        setattr(fake_dispatch, failure, None)
+        fake_dispatch.calls.clear()
+        result = ops.matmul(a, b)
+        torch.testing.assert_close(result, torch.full((65, 7), 3.0), rtol=0, atol=0)
+        assert len(fake_dispatch.calls) == 3
+    finally:
+        ops.close()
+    assert list(tmp_path.iterdir()) == [marker] and marker.read_text() == "preserve"
 
 
 @pytest.mark.parametrize("platform", ["a2a3", "a5"])

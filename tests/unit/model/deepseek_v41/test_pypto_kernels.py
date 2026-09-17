@@ -14,6 +14,8 @@ is process-global: an initialized A3 backend cannot be replaced by A5 in place.
 Set PYPTO_V41_NPU_TESTS=1, TASK_DEVICE to the allocated single device, and
 PYPTO_V41_NPU_PLATFORM=a2a3 (default) or a5 to run the hardware cases. Hardware
 tests require existing CANN/PTO-ISA/ptoas installations; they do not fetch them.
+The A5 8K regression additionally requires PYPTO_V41_NPU_8K_TESTS=1. Run it
+under task-submit with a 600-second process-tree limit; its oracle uses no CPU GEMM.
 """
 
 import importlib
@@ -30,7 +32,8 @@ import pytest
 
 
 RUN_NPU = os.environ.get("PYPTO_V41_NPU_TESTS") == "1"
-if RUN_NPU:
+RUN_NPU_8K = os.environ.get("PYPTO_V41_NPU_8K_TESTS") == "1"
+if RUN_NPU or RUN_NPU_8K:
     import torch
 else:
     torch = pytest.importorskip("torch", reason="kernel IR tests require Torch tensor metadata")
@@ -163,12 +166,17 @@ def _assert_generated_cube(tmp_path, platform, inner):
 
 
 @pytest.fixture
-def real_npu_ops(tmp_path, monkeypatch):
+def real_npu_ops(tmp_path, monkeypatch, request):
     if not RUN_NPU:
+        if RUN_NPU_8K:
+            pytest.fail("PYPTO_V41_NPU_8K_TESTS also requires PYPTO_V41_NPU_TESTS=1")
         pytest.skip("set PYPTO_V41_NPU_TESTS=1 under an allocated task-submit device")
     platform = os.environ.get("PYPTO_V41_NPU_PLATFORM", "a2a3")
     if platform not in ("a2a3", "a5"):
         pytest.fail("PYPTO_V41_NPU_PLATFORM must select hardware 'a2a3' or 'a5'")
+    default_budget = getattr(request, "param", None) == "default_budget"
+    if default_budget and platform != "a5":
+        pytest.fail("the opted-in 8K regression requires PYPTO_V41_NPU_PLATFORM=a5")
     device_text = os.environ.get("TASK_DEVICE", "")
     if not device_text.isascii() or not device_text.isdecimal():
         pytest.fail("TASK_DEVICE must be the allocated single nonnegative device index")
@@ -201,12 +209,13 @@ def real_npu_ops(tmp_path, monkeypatch):
         pytest.fail("real NPU test must not dispatch the CPU reference provider")
 
     monkeypatch.setattr(module.TorchMatmulOps, "matmul", no_cpu_provider)
+    budget = {} if default_budget else {"max_buffer_bytes": 8 << 20}
     ops = module.PyptoMatmulOps(
         platform=platform,
         device_id=int(device_text),
         build_dir=tmp_path,
-        max_buffer_bytes=8 << 20,
         max_cached_shapes=1,
+        **budget,
     )
     try:
         yield ops
@@ -234,3 +243,42 @@ def test_real_npu_bf16_matmul_matches_fp32_cpu_oracle(real_npu_ops, rows, column
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
     result.zero_()
     assert torch.equal(a, before_a) and torch.equal(b, before_b)
+
+
+@pytest.mark.skipif(not RUN_NPU_8K, reason="set PYPTO_V41_NPU_8K_TESTS=1 for the allocated A5 8K run")
+@pytest.mark.parametrize("real_npu_ops", ["default_budget"], indirect=True)
+def test_real_a5_8k_group_projection_matches_exact_structured_oracle(real_npu_ops, monkeypatch):
+    # A[i,k] = r[i]*s[k], B[k,j] = s[k]*c[j], with s[k] in {-1,1}.
+    # Hence C[i,j] = 4096*r[i]*c[j]. Binary fractions keep every product and
+    # partial sum exact in FP32, including nonzero values of both signs.
+    # Only the allocated NPU performs the full matrix product.
+    rows, inner, columns = 8192, 4096, 1024
+    row_coefficients = ((torch.arange(rows) % 17 - 8).float() / 8).to(torch.bfloat16)
+    column_coefficients = ((torch.arange(columns) * 7 % 19 - 9).float() / 16).to(torch.bfloat16)
+    signs = (1 - 2 * (torch.arange(inner) % 2)).to(torch.bfloat16)
+    a = row_coefficients[:, None] * signs[None, :]
+    b = signs[:, None] * column_coefficients[None, :]
+    assert torch.unique(row_coefficients).numel() == 17
+    assert torch.unique(column_coefficients).numel() == 19
+    assert real_npu_ops.max_buffer_bytes == 256 << 20
+    dispatch_rows = []
+    dispatch = real_npu_ops._dispatch_into
+
+    def record_dispatch(left, right, target):
+        dispatch_rows.append(left.shape[0])
+        return dispatch(left, right, target)
+
+    monkeypatch.setattr(real_npu_ops, "_dispatch_into", record_dispatch)
+    result = real_npu_ops.matmul(a, b)
+    assert dispatch_rows == [1568] * 5 + [352]
+    assert result.device.type == "cpu" and result.dtype == torch.float32
+    assert result.shape == (rows, columns) and result.is_contiguous()
+    # Compare every output, including every chunk boundary, with small oracle
+    # buffers instead of retaining another full 32 MiB result or input clones.
+    for start in range(0, rows, 256):
+        expected = inner * row_coefficients[start : start + 256, None].float() * column_coefficients.float()
+        torch.testing.assert_close(result[start : start + 256], expected, rtol=0, atol=0)
+        assert torch.equal(
+            a[start : start + 256], row_coefficients[start : start + 256, None] * signs[None, :]
+        )
+    assert torch.equal(b, signs[:, None] * column_coefficients[None, :])
