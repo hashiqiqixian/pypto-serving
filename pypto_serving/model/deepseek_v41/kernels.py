@@ -71,7 +71,6 @@ def make_block_scaled_matmul_kernel() -> object:
                             b[start : start + 32, column : column + 64],
                             out_dtype=pl.FP32,
                         )
-                        partial = pl.cast(partial, pl.FP32, mode="none")
                         scaled = pl.row_expand_mul(partial, a_scales[row : row + 16, block : block + 1])
                         scaled = pl.col_expand_mul(scaled, b_scales[block : block + 1, column : column + 64])
                         acc = pl.add(acc, scaled)
