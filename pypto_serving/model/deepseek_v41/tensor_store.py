@@ -240,6 +240,9 @@ class DeepSeekV41TensorStore:
     def matrix_tiles(self, name: str) -> Iterator[tuple[int, int, torch.Tensor, torch.Tensor | None]]:
         """Yield local offsets, normalized [Ntile,Ktile] values and per-row scales.
 
+        Tiles are ordered by output block, then by ascending reduction offset;
+        every output block is complete before the next block begins.
+
         Quantized weights always use complete K32 tiles. wo_a is the explicit
         exception: it is converted to BF16 and has no separate returned scale.
         """

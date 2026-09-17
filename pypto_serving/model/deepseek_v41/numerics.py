@@ -16,6 +16,7 @@ FP4 is decoded explicitly. No packed integer dtype is treated as an FP8 tensor.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import groupby
 from typing import Any
 
 import torch
@@ -196,17 +197,29 @@ class TensorOps:
             activation_scales = activation.scale_values()
         else:
             normalized = flat.float() if fmt == "float32" else flat.to(torch.bfloat16)
-        output = torch.zeros(flat.shape[0], out_features, device=x.device, dtype=torch.float32)
-        for out_start, in_start, values, scales in self.weights.matrix_tiles(name):
-            values = values.to(x.device)
-            partial = self.matmul(normalized[:, in_start:in_start + values.shape[1]], values.T)
-            if quantized:
-                partial *= activation_scales[:, in_start // 32, None]
-                partial *= scales.to(x.device)[None, :]
-            output[:, out_start:out_start + values.shape[0]] += partial
-        if bias:
-            output += self.weight(name.removesuffix(".weight") + ".bias").float()
-        return output.reshape(*shape, out_features).to(x.dtype)
+        output = torch.zeros(flat.shape[0], out_features, device=x.device, dtype=x.dtype)
+        bias_value = self.weight(name.removesuffix(".weight") + ".bias").float() if bias else None
+        if bias_value is not None:
+            output.copy_(bias_value)
+        # Checkpoint tiles are ordered by output block, then reduction block.
+        # Complete one FP32 accumulator before casting, without retaining an
+        # FP32 copy of the entire Engram projection alongside the BF16 result.
+        for out_start, tiles in groupby(self.weights.matrix_tiles(name), key=lambda tile: tile[0]):
+            accumulated = None
+            for _, in_start, values, scales in tiles:
+                values = values.to(x.device)
+                partial = self.matmul(normalized[:, in_start:in_start + values.shape[1]], values.T)
+                if quantized:
+                    partial *= activation_scales[:, in_start // 32, None]
+                    partial *= scales.to(x.device)[None, :]
+                if accumulated is None:
+                    accumulated = torch.zeros_like(partial)
+                accumulated += partial
+            stop = out_start + accumulated.shape[1]
+            if bias_value is not None:
+                accumulated += bias_value[out_start:stop]
+            output[:, out_start:stop].copy_(accumulated)
+        return output.reshape(*shape, out_features)
 
     def embedding(self, name: str, ids: torch.Tensor) -> torch.Tensor:
         rows = self.weights.embedding(name, ids.detach().cpu()).to(self.device)
@@ -250,8 +263,21 @@ class ModelMath:
     @staticmethod
     def hc_post(x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor,
                 comb: torch.Tensor) -> torch.Tensor:
-        mixed = (comb.unsqueeze(-1) * residual.float().unsqueeze(-2)).sum(-3)
-        return (post.unsqueeze(-1) * x.float().unsqueeze(-2) + mixed).to(x.dtype)
+        hc, dim = residual.shape[-2:]
+        value = x.reshape(-1, dim)
+        source = residual.reshape(-1, hc, dim)
+        post = post.reshape(-1, hc)
+        comb = comb.reshape(-1, hc, hc)
+        output = torch.empty_like(source, dtype=x.dtype)
+        # Bound the HC-by-HC broadcast product to 16 MiB. Token rows are
+        # independent; retain the original multiply/reduce order within each.
+        chunk_rows = max(1, (16 << 20) // (hc * hc * dim * 4))
+        for start in range(0, len(value), chunk_rows):
+            end = start + chunk_rows
+            mixed = (comb[start:end].unsqueeze(-1) * source[start:end].float().unsqueeze(-2)).sum(-3)
+            result = post[start:end].unsqueeze(-1) * value[start:end].float().unsqueeze(-2) + mixed
+            output[start:end].copy_(result)
+        return output.reshape(residual.shape)
 
     def expert(self, x: torch.Tensor, prefix: str, routing_weight: torch.Tensor | None = None) -> torch.Tensor:
         gate = self.ops.linear(x, prefix + ".w1").float()

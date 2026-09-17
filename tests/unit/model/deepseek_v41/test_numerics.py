@@ -243,6 +243,90 @@ def test_fp32_inputs_are_preserved_for_routing_and_head(module):
     torch.testing.assert_close(ops.linear(x, "head"), x @ torch.tensor([[1.001], [-1.]]), rtol=0, atol=0)
 
 
+def _largest_fp32_tensor():
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_flatten
+
+    class Observe(TorchDispatchMode):
+        largest_bytes = 0
+
+        def __torch_dispatch__(self, function, types, args=(), kwargs=None):
+            result = function(*args, **(kwargs or {}))
+            tensors, _ = tree_flatten(result)
+            for value in tensors:
+                if isinstance(value, torch.Tensor) and value.dtype == torch.float32:
+                    self.largest_bytes = max(self.largest_bytes, value.numel() * value.element_size())
+            return result
+
+    return Observe()
+
+
+@pytest.mark.parametrize("fmt", ["fp8", "fp4", "bf16", "float32"])
+@pytest.mark.parametrize("bias", [False, True])
+def test_linear_finishes_reduction_before_output_cast(module, fmt, bias):
+    weights = (torch.arange(256 * 64).reshape(256, 64) % 7 - 3).to(torch.bfloat16)
+    scales = torch.tensor([.5, 2.]).expand(256, 2)
+    bias_value = torch.arange(256).float() / 4
+    quantized = fmt in ("fp8", "fp4")
+
+    class Weights:
+        def matrix_shape(self, name):
+            return 256, 64
+
+        def matrix_format(self, name):
+            return fmt
+
+        def matrix_tiles(self, name):
+            for row in range(0, 256, 64):
+                for column in (0, 32):
+                    yield (row, column, weights[row:row + 64, column:column + 32],
+                           scales[row:row + 64, column // 32] if quantized else None)
+
+        def weight(self, name):
+            assert name == "projection.bias"
+            return bias_value
+
+    x = (torch.arange(512 * 64).reshape(2, 256, 64) % 15 - 7).to(torch.bfloat16)
+    x[..., ::32] = 448  # Unit FP8 activation scales with exactly representable values.
+    if fmt == "float32":
+        x = x.float()
+    expanded = weights.float() * (scales.repeat_interleave(32, -1) if quantized else 1)
+    expected = x.float() @ expanded.T
+    if bias:
+        expected += bias_value
+    with _largest_fp32_tensor() as memory:
+        actual = module.TensorOps(Weights()).linear(x, "projection.weight", bias=bias)
+    torch.testing.assert_close(actual, expected.to(x.dtype), rtol=0, atol=0)
+    if x.dtype == torch.bfloat16:
+        assert memory.largest_bytes <= 512 * 64 * 4
+
+
+def test_hc_post_bounds_broadcast_scratch_and_preserves_noncontiguous_rows(module):
+    rows, hc, dim = 4097, 4, 128
+    source = ((torch.arange(hc * rows * dim).reshape(hc, rows, dim) % 17 - 8) / 8).bfloat16()
+    residual = source.transpose(0, 1)
+    x = ((torch.arange(rows * dim).reshape(rows, dim) % 11 - 5) / 4).bfloat16()
+    post = torch.tensor([.25, .5, 1., 2.]).expand(rows, hc)
+    comb = (torch.arange(hc * hc).reshape(hc, hc).float() / 16).expand(rows, hc, hc)
+    expected = ((comb.unsqueeze(-1) * residual.float().unsqueeze(-2)).sum(-3)
+                + post.unsqueeze(-1) * x.float().unsqueeze(-2)).to(x.dtype)
+    with _largest_fp32_tensor() as memory:
+        actual = module.ModelMath.hc_post(x, residual, post, comb)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert memory.largest_bytes <= 16 << 20
+
+
+def test_hc_post_preserves_leading_batch_dimensions(module):
+    torch.manual_seed(37)
+    x = torch.randn(2, 3, 8).bfloat16()
+    residual = torch.randn(2, 3, 4, 8).bfloat16()
+    post = torch.randn(2, 3, 4)
+    comb = torch.randn(2, 3, 4, 4)
+    expected = ((comb.unsqueeze(-1) * residual.float().unsqueeze(-2)).sum(-3)
+                + post.unsqueeze(-1) * x.float().unsqueeze(-2)).to(x.dtype)
+    torch.testing.assert_close(module.ModelMath.hc_post(x, residual, post, comb), expected, rtol=0, atol=0)
+
+
 @pytest.fixture
 def npu_device():
     """Use only the explicitly allocated card; opt-in setup failures are errors."""
