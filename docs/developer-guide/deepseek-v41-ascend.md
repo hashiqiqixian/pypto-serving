@@ -29,6 +29,8 @@ Quantization reads IEEE sign bits to preserve negative zero and constructs exact
 FP32 powers of two. Scale rounding follows the pinned reference's FP32 reciprocal
 multiply and exponent/mantissa extraction. These operations avoid the observed
 A3 `signbit(-0)` and approximate `pow` differences without moving tensors to CPU.
+UE8M0 normalization multiplies by the exact inverse power of two because A5
+division flushes subnormal inputs. Non-power-of-two E4M3 scales retain division.
 
 ## Functional validation
 

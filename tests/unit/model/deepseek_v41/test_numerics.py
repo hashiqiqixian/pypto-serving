@@ -112,7 +112,7 @@ def _assert_ue8m0_scale_bits(module, device):
 def _assert_power_scale_midpoints(module, device, fmt):
     fp8 = fmt.startswith("fp8")
     maximum = 448 if fp8 else 6
-    exponents = (-22, -8, 0, 7, 118) if fp8 else (-126, -8, 0, 7, 124)
+    exponents = (-22, -8, 0, 7, 118, 119) if fp8 else (-126, -125, -124, -8, 0, 7, 124, 125)
     # -336 at scale=1 is the FP8 0xfa/0xfb midpoint seen failing on A3;
     # the FP4 5.0 midpoint similarly must choose magnitude code 6, not 7.
     midpoint = [0., -0., 1.0625, -1.0625, 336., -336., 432., -432.] if fp8 else [

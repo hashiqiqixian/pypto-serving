@@ -113,6 +113,7 @@ def quantize_rows(x: torch.Tensor, fmt: str, block_size: int) -> QuantizedRows:
             raise ValueError("main KV scale overflows finite E4M3")
         scale_bits = encode_e4m3(amax.clamp_min(6 * 2.0 ** -9) / 6)
         scales = decode_e4m3(scale_bits)
+        normalized = values / scales.unsqueeze(-1)
     else:
         maximum = 448 if fmt.startswith("fp8") else 6
         floor = 1e-4 if maximum == 448 else 6 * 2.0 ** -126
@@ -123,8 +124,10 @@ def quantize_rows(x: torch.Tensor, fmt: str, block_size: int) -> QuantizedRows:
         if bool(((exponents < -127) | (exponents > 127)).any()):
             raise ValueError("activation scale is outside finite UE8M0 range")
         scale_bits = (exponents + 127).to(torch.uint8)
-        scales = decode_ue8m0(scale_bits)
-    normalized = (values / scales.unsqueeze(-1)).flatten(-2)
+        # Ascend division flushes subnormal inputs. Multiplication by the exact
+        # inverse power of two preserves them without changing midpoint rounding.
+        normalized = values * _pow2(-exponents).unsqueeze(-1)
+    normalized = normalized.flatten(-2)
     packed = encode_e4m3(normalized) if fmt.startswith("fp8") else encode_e2m1(normalized)
     return QuantizedRows(packed, scale_bits, fmt, block_size)
 
