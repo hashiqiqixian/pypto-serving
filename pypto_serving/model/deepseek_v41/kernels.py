@@ -71,7 +71,10 @@ def make_block_scaled_matmul_kernel() -> object:
                             b[start : start + 32, column : column + 64],
                             out_dtype=pl.FP32,
                         )
-                        scaled = pl.row_expand_mul(partial, a_scales[row : row + 16, block : block + 1])
+                        # Transfer one contiguous scale row before viewing it
+                        # as a column; A3 cannot load strided ND columns into DN.
+                        row_scales = pl.reshape(a_scales[block : block + 1, row : row + 16], [16, 1])
+                        scaled = pl.row_expand_mul(partial, row_scales)
                         scaled = pl.col_expand_mul(scaled, b_scales[block : block + 1, column : column + 64])
                         acc = pl.add(acc, scaled)
                     c[row : row + 16, column : column + 64] = acc

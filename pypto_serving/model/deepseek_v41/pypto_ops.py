@@ -296,7 +296,7 @@ class PyptoMatmulOps:
         kernel, directory = self._entry(padded, block_scaled=True)
         lhs = self._pad(a, (pm, pk))
         rhs = self._pad(b, (pk, pn))
-        lhs_scales = self._pad(a_scales, (pm, pk // 32))
+        lhs_scales = self._pad(a_scales.T, (pk // 32, pm))
         rhs_scales = self._pad(b_scales, (pk // 32, pn))
         output = torch.empty((pm, pn), dtype=torch.float32)
         config = replace(self._config, save_kernels_dir=directory.name)

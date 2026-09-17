@@ -95,7 +95,7 @@ def scaled_dispatch(scaled_module, monkeypatch):
                     partial = a[:, block * 32 : block * 32 + 32].float() @ b[
                         block * 32 : block * 32 + 32
                     ].float()
-                    output.add_(partial * sa[:, block : block + 1] * sb[block : block + 1])
+                    output.add_(partial * sa[block : block + 1].T * sb[block : block + 1])
             else:
                 output = rest[0]
                 output.copy_(a.float() @ b.float())
@@ -143,7 +143,7 @@ def test_scaled_bridge_chunks_rows_and_keeps_k_groups_in_one_dispatch(
         assert [shapes[0][0] for _, shapes, _ in scaled_dispatch.calls] == [32, 32, 16]
         for scaled, shapes, config in scaled_dispatch.calls:
             assert scaled and shapes[0][1] == 96
-            assert shapes[2] == (shapes[0][0], 3) and shapes[3] == (3, 64)
+            assert shapes[2] == (3, shapes[0][0]) and shapes[3] == (3, 64)
             assert config.platform == platform
         repeated = ops.block_scaled_matmul(-a, b, sa, sb)
         torch.testing.assert_close(repeated, -expected, rtol=0, atol=0)
@@ -251,8 +251,9 @@ def _compile_scaled(platform, output_directory):
     spec.loader.exec_module(module)
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(decorator, "_ptoas_available", lambda: False)
+        a, b, sa, sb = _values(16, 64, 96)
         compiled = module.make_block_scaled_matmul_kernel().compile(
-            *_values(16, 64, 96), torch.empty(16, 64),
+            a, b, sa.T.contiguous(), sb, torch.empty(16, 64),
             config=RunConfig(
                 platform=platform, codegen_only=True, save_kernels=True, save_kernels_dir=output_directory
             ),
@@ -265,7 +266,7 @@ def _compile_scaled(platform, output_directory):
         DataType.BF16, DataType.BF16, DataType.FP32, DataType.FP32, DataType.FP32,
     ]
     assert [[dim.value for dim in param.type.shape] for param in entry.params] == [
-        [16, 96], [96, 64], [16, 3], [3, 64], [16, 64],
+        [16, 96], [96, 64], [3, 16], [3, 64], [16, 64],
     ]
     assert list(Path(output_directory).rglob("*.pto")), "real PTO codegen must emit artifacts"
 
