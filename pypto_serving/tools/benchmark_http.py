@@ -44,14 +44,19 @@ class Measurement:
     completion_tokens: int | None
     finish_reason: str | None
     error: str | None
+    request_id: str | None = None
+    output_sha256: str | None = None
 
 
-def measure_stream(lines, started: float, *, clock=time.perf_counter, max_bytes=MAX_STREAM_BYTES) -> dict:
+def measure_stream(lines, started: float, *, clock=time.perf_counter, max_bytes=MAX_STREAM_BYTES,
+                   capture_identity=False) -> dict:
     """Read OpenAI SSE events; require a finish event, [DONE], and authoritative usage."""
     first = last = None
     usage = reason = None
     total = 0
     done = False
+    request_id = None
+    digests = {}
     for raw in lines:
         total += len(raw)
         if total > max_bytes:
@@ -65,10 +70,27 @@ def measure_stream(lines, started: float, *, clock=time.perf_counter, max_bytes=
         event = json.loads(data)
         if "error" in event:
             raise ValueError("server returned a streaming error")
+        event_id = event.get("id")
+        if event_id is not None:
+            if not isinstance(event_id, str) or not event_id or len(event_id) > 256:
+                raise ValueError("stream request ID must be a bounded nonempty string")
+            if request_id is not None and event_id != request_id:
+                raise ValueError("stream changed request ID")
+            request_id = event_id
         if event.get("usage") is not None:
             usage = event["usage"]
         for choice in event.get("choices", []):
             delta = choice.get("delta", {})
+            if capture_identity:
+                index = choice.get("index", 0)
+                if type(index) is not int or index < 0 or index > 64:
+                    raise ValueError("stream choice index is invalid")
+                for channel, text in (("text", choice.get("text")), ("content", delta.get("content")),
+                                      ("reasoning_content", delta.get("reasoning_content"))):
+                    if text is not None:
+                        if not isinstance(text, str):
+                            raise ValueError("stream output must be text")
+                        digests.setdefault((index, channel), hashlib.sha256()).update(text.encode("utf-8"))
             content = choice.get("text") or delta.get("content") or delta.get("reasoning_content")
             if content:
                 last = clock()
@@ -86,9 +108,13 @@ def measure_stream(lines, started: float, *, clock=time.perf_counter, max_bytes=
         raise ValueError("stream usage token counts must be nonnegative integers")
     if completion and first is None and reason != "eos":
         raise ValueError("stream usage reports tokens without a timed output event")
-    return {"latency_s": ended - started, "ttft_s": None if first is None else first - started,
+    result = {"latency_s": ended - started, "ttft_s": None if first is None else first - started,
             "tpot_s": (last - first) / (completion - 1) if completion > 1 and first is not None else None,
             "prompt_tokens": prompt, "completion_tokens": completion, "finish_reason": reason}
+    if capture_identity:
+        content = [(index, channel, digest.hexdigest()) for (index, channel), digest in sorted(digests.items())]
+        result.update(request_id=request_id, output_sha256=hashlib.sha256(json.dumps(content).encode()).hexdigest())
+    return result
 
 
 def request_once(index: int, endpoint: str, payload: dict, timeout: float) -> Measurement:
@@ -108,7 +134,7 @@ def request_once(index: int, endpoint: str, payload: dict, timeout: float) -> Me
                     if total > MAX_STREAM_BYTES or (len(line) == 1 << 20 and not line.endswith(b"\n")):
                         raise ValueError("stream event or response exceeds byte budget")
                     yield line
-            result = measure_stream(lines(), started)
+            result = measure_stream(lines(), started, capture_identity=True)
         return Measurement(index, True, **result, error=None)
     except Exception as error:
         # Do not include response bodies, URLs, or prompts in error diagnostics.
@@ -142,6 +168,42 @@ def summarize(measurements: list[Measurement], elapsed: float, *, ttft_slo=None,
             **{field: distribution(field) for field in ("latency_s", "ttft_s", "tpot_s")}}
 
 
+def check_workload(measurements, workload_rows, *, expected_prompt=None, expected_completion=None,
+                   repeat=False):
+    """Check measured counts and sequential repeatability without inferring cache internals."""
+    if type(workload_rows) is not int or workload_rows < 1:
+        raise ValueError("workload_rows must be a positive integer")
+    checks = {}
+    for field, expected in (("prompt_tokens", expected_prompt), ("completion_tokens", expected_completion)):
+        if expected is not None:
+            failed = [row.index for row in measurements if not row.success or getattr(row, field) != expected]
+            checks[field] = {"passed": bool(measurements) and not failed, "expected": expected,
+                             "failed_request_indices": failed}
+    if repeat:
+        previous = {}
+        failures = []
+        repeats = 0
+        request_ids = set()
+        for row in measurements:
+            key = row.index % workload_rows
+            if (not row.success or not row.request_id or not row.output_sha256
+                    or row.request_id in request_ids):
+                failures.append(row.index)
+            request_ids.add(row.request_id)
+            signature = (row.output_sha256, row.prompt_tokens, row.completion_tokens, row.finish_reason)
+            if key in previous:
+                repeats += 1
+                if previous[key] != signature:
+                    failures.append(row.index)
+            previous[key] = signature
+        checks["sequential_repeatability"] = {
+            "passed": repeats > 0 and not failures, "repeated_requests": repeats,
+            "failed_request_indices": sorted(set(failures)),
+            "scope": "HTTP text/reasoning digests and usage; no token-ID or internal cache comparison",
+        }
+    return checks
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--endpoint", required=True, help="Explicit /v1/completions or /v1/chat/completions URL")
@@ -155,6 +217,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--ttft-slo", type=float)
     parser.add_argument("--tpot-slo", type=float)
+    parser.add_argument("--expect-prompt-tokens", type=int, help="Fail if authoritative prompt usage differs")
+    parser.add_argument("--expect-completion-tokens", type=int, help="Fail if output stops before this count")
+    parser.add_argument("--check-repeats", action="store_true",
+                        help="Check sequential repeats by output digest; does not establish token golden or rollback")
     args = parser.parse_args(argv)
     parsed = urlsplit(args.endpoint)
     if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
@@ -163,6 +229,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("concurrency must be 1..64, requests 1..10000 and max-tokens positive")
     if not math.isfinite(args.timeout) or not 0 < args.timeout <= 3600:
         parser.error("timeout must be finite and in (0,3600] seconds")
+    if any(value is not None and value < 1 for value in (args.expect_prompt_tokens, args.expect_completion_tokens)):
+        parser.error("expected token counts must be positive")
+    if args.check_repeats and args.concurrency != 1:
+        parser.error("--check-repeats requires --concurrency 1")
     if args.prompts.stat().st_size > 64 << 20:
         parser.error("prompt file exceeds 64 MiB")
     raw = args.prompts.read_bytes()
@@ -170,6 +240,8 @@ def main(argv: list[str] | None = None) -> int:
     if not prompts or any(not isinstance(value, dict) or (set(value) != {"prompt"} and set(value) != {"messages"})
                           for value in prompts):
         parser.error("each workload row must contain exactly prompt or messages")
+    if args.check_repeats and args.requests <= len(prompts):
+        parser.error("--check-repeats requires more requests than workload rows")
     manifest = None
     if args.server_manifest:
         if args.server_manifest.stat().st_size > 1 << 20:
@@ -186,15 +258,19 @@ def main(argv: list[str] | None = None) -> int:
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         measurements = list(pool.map(execute, range(args.requests)))
     elapsed = time.perf_counter() - started
+    checks = check_workload(measurements, len(prompts), expected_prompt=args.expect_prompt_tokens,
+                            expected_completion=args.expect_completion_tokens, repeat=args.check_repeats)
     artifact = {"schema": "pypto_http_benchmark_v1", "created_at": datetime.now(timezone.utc).isoformat(),
                 "model": args.model, "concurrency": args.concurrency, "max_tokens": args.max_tokens,
-                "workload_sha256": hashlib.sha256(raw).hexdigest(), "server_manifest": manifest,
+                "workload_rows": len(prompts), "workload_sha256": hashlib.sha256(raw).hexdigest(),
+                "server_manifest": manifest,
                 "measurement_scope": "HTTP client; no inferred HBM/OOM capacity or real-model golden acceptance",
+                "workload_checks": checks,
                 "summary": summarize(measurements, elapsed, ttft_slo=args.ttft_slo, tpot_slo=args.tpot_slo),
                 "requests": [asdict(result) for result in measurements]}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(artifact, indent=2) + "\n")
-    return 0 if all(result.success for result in measurements) else 1
+    return 0 if all(result.success for result in measurements) and all(value["passed"] for value in checks.values()) else 1
 
 
 if __name__ == "__main__":

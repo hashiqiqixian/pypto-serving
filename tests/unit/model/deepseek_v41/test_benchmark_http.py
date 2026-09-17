@@ -9,6 +9,7 @@
 """Streaming benchmark accounting tests; protocol fixtures are not model inference."""
 
 import importlib.util
+from dataclasses import replace
 import json
 from pathlib import Path
 import sys
@@ -86,3 +87,39 @@ def test_immediate_eos_has_no_invented_visible_token_time(module):
     result = module.measure_stream(lines, 0., clock=lambda: 1.)
     assert result["ttft_s"] is None and result["tpot_s"] is None
     assert result["completion_tokens"] == 1 and result["finish_reason"] == "eos"
+
+
+def test_output_digest_ignores_sse_fragmentation_but_separates_reasoning(module):
+    def measured(parts):
+        lines = [event({"id": "request-1", "choices": [{"delta": part}]}) for part in parts]
+        lines.extend([event({"id": "request-1", "choices": [{"finish_reason": "length"}],
+                             "usage": {"prompt_tokens": 8192, "completion_tokens": 128}}), b"data: [DONE]\n"])
+        return module.measure_stream(lines, 0., clock=lambda: 1., capture_identity=True)
+
+    fragmented = measured([{"content": "hel"}, {"content": "lo"}])
+    assert fragmented["request_id"] == "request-1"
+    assert fragmented["output_sha256"] == measured([{"content": "hello"}])["output_sha256"]
+    assert fragmented["output_sha256"] != measured([{"reasoning_content": "hello"}])["output_sha256"]
+
+
+def test_stream_cannot_switch_request_identity(module):
+    with pytest.raises(ValueError, match="changed request ID"):
+        module.measure_stream([event({"id": "a"}), event({"id": "b"})], 0., capture_identity=True)
+
+
+def test_repeat_check_uses_measured_counts_output_and_distinct_ids(module):
+    rows = [module.Measurement(i, True, 1., .1, .01, 8192, 128, "length", None,
+                               f"request-{i}", "a" * 64 if i % 2 == 0 else "b" * 64) for i in range(3)]
+    checks = module.check_workload(rows, 2, expected_prompt=8192, expected_completion=128, repeat=True)
+    assert all(check["passed"] for check in checks.values())
+    assert checks["sequential_repeatability"]["repeated_requests"] == 1
+    for replacement in (replace(rows[2], completion_tokens=127, finish_reason="eos"),
+                        replace(rows[2], output_sha256="c" * 64), replace(rows[2], request_id="request-0")):
+        failed = module.check_workload([*rows[:2], replacement], 2, expected_completion=128, repeat=True)
+        assert not failed["sequential_repeatability"]["passed"]
+        assert failed["sequential_repeatability"]["failed_request_indices"] == [2]
+
+
+def test_repeat_check_requires_positive_workload_size(module):
+    with pytest.raises(ValueError, match="positive integer"):
+        module.check_workload([], 0, repeat=True)

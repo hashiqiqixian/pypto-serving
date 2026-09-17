@@ -115,3 +115,4 @@ nav:
       - DeepSeek V4.1 Framework: developer-guide/deepseek-v41-framework.md
       - DeepSeek V4.1 Execution: developer-guide/deepseek-v41-execution.md
       - DeepSeek V4.1 A3/A5: developer-guide/deepseek-v41-ascend.md
+      - DeepSeek V4.1 M0 Validation: developer-guide/deepseek-v41-m0-validation.md
