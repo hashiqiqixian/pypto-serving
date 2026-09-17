@@ -9,6 +9,7 @@
 """Main host-side functional guard for the DSpark serving adaptation."""
 
 import ast
+import ctypes
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,8 @@ import torch
 
 from pypto_serving.config.types import DecodeBatch, PrefillBatch
 from pypto_serving.model.deepseek_dspark import task_args as task_args_module
+from pypto_serving.model.deepseek_dspark import npu_runner as runner_module
+from pypto_serving.model.deepseek_dspark.npu_executor import DeepSeekV4DSparkPyptoExecutor
 from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSPARK_CACHE_GROUP_NAMES,
     DSparkCacheLayout,
@@ -45,6 +48,7 @@ def _runner(*, speculative: bool = False) -> DSparkModelRunner:
     layout = DSparkCacheLayout(
         prefill_tokens=128,
         prefill_local_tokens=32,
+        prefill_requests=2,
         hidden_size=4,
     )
     runner = DSparkModelRunner(
@@ -119,6 +123,25 @@ def _block_rows(count: int) -> list[dict[str, list[int]]]:
     return rows
 
 
+@pytest.mark.parametrize("limit", [None, "2", "64"])
+def test_packed_prefill_executor_limits_are_opt_in(monkeypatch, limit):
+    monkeypatch.delenv("PYPTO_DSPARK_PREFILL_MAX_REQUESTS", raising=False)
+    if limit is not None:
+        monkeypatch.setenv("PYPTO_DSPARK_PREFILL_MAX_REQUESTS", limit)
+    executor = DeepSeekV4DSparkPyptoExecutor(device_ids=range(16))
+    expected = int(limit or 1)
+    assert executor.max_prefill_requests_per_partition == expected
+    assert executor.max_prefill_batch_size == 4 * expected
+    assert executor.max_prefill_tokens_per_partition == 8192
+
+
+@pytest.mark.parametrize("limit", ["0", "65", "-1", "invalid"])
+def test_packed_prefill_executor_rejects_invalid_limits(monkeypatch, limit):
+    monkeypatch.setenv("PYPTO_DSPARK_PREFILL_MAX_REQUESTS", limit)
+    with pytest.raises(ValueError):
+        DeepSeekV4DSparkPyptoExecutor(device_ids=range(16))
+
+
 def test_prefill_to_decode_staging_contract() -> None:
     runner = _runner()
     layout = runner._compiled.layout
@@ -154,7 +177,7 @@ def test_prefill_to_decode_staging_contract() -> None:
     # tails natively (pypto-lib#1161), so their staging stays zero-initialized
     # (query_start_loc terminal 0) instead of mirroring an active group.
     assert bool(torch.count_nonzero(x_hc[4]) == 0)
-    terminals = staged_prefill["query_start_loc"][:, -1].tolist()
+    terminals = runner._packed_host_prefix(staged_prefill["query_start_loc"], 2)[:, -1].tolist()
     assert terminals == [tokens] * 4 + [0] * 4 + [tokens] * 4 + [0] * 4
     assert staged_prefill["logit_row_indices"][0, 0].item() == tokens - 1
     assert staged_prefill["logit_row_indices"][8, 0].item() == tokens - 1
@@ -257,6 +280,172 @@ def test_prefill_context_bound_uses_each_requests_own_length() -> None:
 
     with pytest.raises(ValueError, match="exceed max_seq_len=512"):
         runner.prepare_prefill_inputs(model, _batch(505))
+
+
+def _packed_prefill_batch(lengths=(5, 7, 6), groups=(0, 2, 0), starts=(0, 32, 64)):
+    offsets = [sum(lengths[:index]) for index in range(len(lengths))]
+    total = sum(lengths)
+    return PrefillBatch(
+        request_ids=[f"request-{index}" for index in range(len(lengths))],
+        token_ids=torch.arange(total, dtype=torch.long),
+        input_embeddings=torch.arange(total * 4, dtype=torch.float32).reshape(total, 4),
+        seq_lens=[start + length for start, length in zip(starts, lengths)],
+        chunk_lens=list(lengths),
+        chunk_offsets=offsets,
+        chunk_starts=list(starts),
+        block_ids_by_group=_block_rows(len(lengths)),
+        cache_partitions=list(groups),
+    )
+
+
+def test_packed_prefill_keeps_request_boundaries_and_reuses_compact_buffers(monkeypatch):
+    runner = _runner()
+    model = SimpleNamespace(runtime=SimpleNamespace(max_seq_len=512))
+    batch = _packed_prefill_batch()
+    inputs = runner.prepare_prefill_inputs(model, batch)
+    assert inputs.physical_tokens == 12
+    assert inputs.packed_offsets == (0, 0, 5)
+    assert inputs.query_start_loc[0].tolist() == [0, 5, 11]
+    assert inputs.query_start_loc[8].tolist() == [0, 7, 7]
+    assert inputs.query_start_loc[4].tolist() == [0, 0, 0]
+    assert inputs.sampled_slots == ((0, 0), (8, 0), (0, 1))
+    assert inputs.logit_row_indices[0, :2].tolist() == [4, 10]
+    assert inputs.logit_row_indices[8, :2].tolist() == [6, -1]
+    assert inputs.position_ids_full[0].tolist() == [0, 1, 2, 3, 4, 64, 65, 66, 67, 68, 69, 70]
+    assert inputs.input_ids[:4].reshape(-1).tolist() == [0, 1, 2, 3, 4, 12, 13, 14, 15, 16, 17, 0]
+    for name, table in inputs.block_tables.items():
+        assert bool((table[8, 1] == -1).all()), name
+        assert bool((table[4] == -1).all()), name
+        torch.testing.assert_close(table[0], table[3])
+    for index, (length, group, start) in enumerate(zip(batch.chunk_lens, inputs.groups, batch.chunk_starts)):
+        single = _packed_prefill_batch((length,), (group,), (start,))
+        single.block_ids_by_group = [batch.block_ids_by_group[index]]
+        reference = runner.prepare_prefill_inputs(model, single)
+        rank = group * 4
+        offset = inputs.packed_offsets[index]
+        ordinal = inputs.sampled_slots[index][1]
+        for name, table in inputs.block_tables.items():
+            torch.testing.assert_close(table[rank, ordinal], reference.block_tables[name][rank, 0])
+        for name, mapping in inputs.slot_mappings.items():
+            torch.testing.assert_close(
+                mapping[rank, offset:offset + length], reference.slot_mappings[name][rank, :length]
+            )
+        for name, rope in inputs.rope_tables.items():
+            torch.testing.assert_close(
+                rope[rank, offset:offset + length], reference.rope_tables[name][rank, :length]
+            )
+
+    runner._stage_prefill_inputs(inputs)
+    staged = runner._prefill_task_args.tensors
+    x_hc = runner._packed_host_prefix(staged["x_hc"], 12)
+    expected = torch.cat([batch.input_embeddings[:5], batch.input_embeddings[12:]])
+    torch.testing.assert_close(x_hc[0, :11, 0], expected)
+    assert bool((x_hc[0, 11:] == 0).all())
+    for name, value in inputs.block_tables.items():
+        torch.testing.assert_close(runner._packed_host_prefix(staged[name], 2), value)
+    # Exercise the host ABI descriptors without loading weights/device scratch.
+    monkeypatch.setattr(runner, "_prefill_task_args", SimpleNamespace(
+        names=tuple(staged), tensors=staged, build=lambda: tuple(staged.values()),
+    ))
+    args = dict(zip(runner._prefill_task_args.names, runner._prefill_dispatch_args(12, 2)))
+    assert args["query_start_loc"].shape == (16, 3)
+    assert args["ori_block_table"].shape[:2] == (16, 2)
+    assert args["input_ids"].shape == (16, 3)
+
+    # A later single-request dispatch must not retain the second request/group.
+    smaller = runner.prepare_prefill_inputs(model, _packed_prefill_batch((3,), (0,), (0,)))
+    runner._stage_prefill_inputs(smaller)
+    args = dict(zip(runner._prefill_task_args.names, runner._prefill_dispatch_args(4, 1)))
+    assert args["query_start_loc"][0].tolist() == [0, 3]
+    assert args["query_start_loc"][8].tolist() == [0, 0]
+    assert args["ori_block_table"].shape[:2] == (16, 1)
+    assert bool((args["ori_block_table"][8] == -1).all())
+    assert bool((args["logit_row_indices"][0, 1:] == -1).all())
+
+
+def test_packed_prefill_reads_each_requests_sampled_slot(monkeypatch):
+    runner = _runner()
+    runner._compiled.prefill = object()
+    batch = _packed_prefill_batch()
+    batch.allow_device_greedy_sampling = True
+    monkeypatch.setattr(runner, "_ensure_l3_shared_buffers", lambda model: None)
+    monkeypatch.setattr(runner, "_prefill_dispatch_args", lambda *args: ())
+
+    def dispatch(*args):
+        sampled = runner._prefill_task_args.tensors["sampled_ids"]
+        sampled[0, 0, 0] = 10
+        sampled[8, 0, 0] = 20
+        sampled[0, 1, 0] = 30
+
+    monkeypatch.setattr(runner, "_run_l3", dispatch)
+    result = runner.run_prefill(SimpleNamespace(runtime=SimpleNamespace(max_seq_len=512)), batch)
+    assert result.sampled_token_ids.tolist() == [10, 20, 30]
+
+
+def test_packed_prefill_validates_group_capacity_not_aggregate_context_length():
+    runner = _runner()
+    model = SimpleNamespace(runtime=SimpleNamespace(max_seq_len=64))
+    batch = _packed_prefill_batch((64, 64), (0, 0), (0, 0))
+    assert runner.prepare_prefill_inputs(model, batch).physical_tokens == 128
+    with pytest.raises(ValueError, match="requests per TP group exceed"):
+        runner.prepare_prefill_inputs(model, _packed_prefill_batch((1, 1, 1), (0, 0, 0), (0, 0, 0)))
+    with pytest.raises(ValueError, match="tokens, got 129"):
+        runner.prepare_prefill_inputs(
+            SimpleNamespace(runtime=SimpleNamespace(max_seq_len=512)),
+            _packed_prefill_batch((64, 65), (0, 0), (0, 0)),
+        )
+
+
+def test_packed_prefill_tail_extraction_crosses_rank_bands():
+    rows = torch.arange(12 * 2).reshape(4, 3, 2)
+    tail = DSparkModelRunner._prefill_chunk_bands(rows, 3, 6, 5)
+    torch.testing.assert_close(tail, rows.reshape(12, 2)[5:11])
+    rows.zero_()
+    assert bool((tail != 0).any())
+
+
+def test_prefill_seeding_uses_independent_waves_for_same_group(monkeypatch):
+    runner = _runner()
+    runner._compiled = SimpleNamespace(num_speculative_tokens=7)
+    for request_id, group in (("a", 0), ("b", 0), ("c", 2), ("d", 2), ("e", 0)):
+        runner._drafter_states[request_id] = SimpleNamespace(group=group)
+    waves = []
+    monkeypatch.setattr(runner, "_seed_prefill_wave", lambda ids, tokens: waves.append((ids, tokens)))
+    runner.finalize_prefill(["a", "b", "c", "d", "e"], [10, 20, 30, 40, 50])
+    assert waves == [(["a", "c"], [10, 30]), (["b", "d"], [20, 40]), (["e"], [50])]
+
+
+def test_packed_prefill_captures_separate_request_tails(monkeypatch):
+    runner = _runner()
+    batch = _packed_prefill_batch()
+    inputs = runner.prepare_prefill_inputs(SimpleNamespace(runtime=SimpleNamespace(max_seq_len=512)), batch)
+    monkeypatch.setattr(runner_module, "DSPARK_MAIN_HIDDEN_DIM", 2)
+    device_rows = torch.arange(16 * 3 * 2, dtype=torch.bfloat16).reshape(16, 3, 2)
+    device = SimpleNamespace(
+        shards=[SimpleNamespace(data_ptr=rows.data_ptr()) for rows in device_rows],
+        worker_ids=list(range(16)),
+    )
+    copied = []
+
+    def copy_from(dst, src, size, *, worker_id):
+        copied.append(worker_id)
+        ctypes.memmove(dst, src, size)
+
+    monkeypatch.setattr(runner, "_alloc_zeroed_stacked_tensor", lambda *args, **kwargs: device)
+    monkeypatch.setattr(runner, "_shared_l3_worker", lambda: SimpleNamespace(copy_from=copy_from))
+    runner._capture_prefill_tails(batch, inputs)
+    assert sorted(copied) == [0, 1, 2, 3, 8, 9, 10, 11]
+    for index, request_id in enumerate(batch.request_ids):
+        state = runner._drafter_state(request_id)
+        group = inputs.groups[index]
+        offset = inputs.packed_offsets[index]
+        length = inputs.actual_tokens[index]
+        expected = device_rows[group * 4:(group + 1) * 4].reshape(12, 2)[offset:offset + length]
+        torch.testing.assert_close(state.prefill_tail_rows, expected)
+        assert state.prefill_tail_positions.tolist() == list(
+            range(batch.chunk_starts[index], batch.chunk_starts[index] + length)
+        )
+    assert runner._drafter_state("request-0").lease != runner._drafter_state("request-2").lease
 
 
 def _pypto_lib_function(module_name: str, function_name: str) -> ast.FunctionDef:

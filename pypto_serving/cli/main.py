@@ -746,6 +746,11 @@ def run_serve(
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     for _n in ("simpler_setup", "pypto", "simpler"):
         logging.getLogger(_n).setLevel(logging.WARNING)
+    # Debug hook: the worker process re-applies WARNING before Worker.init();
+    # PYPTO_SIMPLER_LOG_LEVEL overrides both sides (device stall snapshots).
+    _simpler_level = os.environ.get("PYPTO_SIMPLER_LOG_LEVEL", "").strip().upper()
+    if _simpler_level:
+        logging.getLogger("simpler").setLevel(_simpler_level)
     try:
         import uvicorn
     except ImportError as e:

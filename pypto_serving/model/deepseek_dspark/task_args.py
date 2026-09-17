@@ -57,7 +57,6 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSPARK_PREFILL_HCA_CMP_TABLE_BLOCKS,
     DSPARK_PREFILL_HCA_STATE_TABLE_BLOCKS,
     DSPARK_PREFILL_IDX_TABLE_BLOCKS,
-    DSPARK_PREFILL_MAX_REQUESTS,
     DSPARK_PREFILL_ORI_TABLE_BLOCKS,
     DSPARK_ROPE_HEAD_DIM,
     DSPARK_SAMPLED_IDS_PAD,
@@ -101,27 +100,28 @@ def _prefill_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
     ranks = layout.ranks
     tokens = layout.prefill_tokens
     local_tokens = layout.prefill_local_tokens
+    requests = layout.prefill_requests
     group_rope = (tokens, DSPARK_ROPE_HEAD_DIM)
     slot_specs = {
         "x_hc": (torch.float32, (ranks, tokens, DSPARK_HC_MULT, layout.hidden_size)),
         # Packed-prefill boundaries (pypto-lib#1095): one entry per request plus
         # the terminal logical length.
         "query_start_loc": (
-            torch.int32, (ranks, DSPARK_PREFILL_MAX_REQUESTS + 1),
+            torch.int32, (ranks, requests + 1),
         ),
         "hca_compress_state_block_table": (
             torch.int32,
-            (ranks, DSPARK_PREFILL_MAX_REQUESTS, DSPARK_PREFILL_HCA_STATE_TABLE_BLOCKS),
+            (ranks, requests, DSPARK_PREFILL_HCA_STATE_TABLE_BLOCKS),
         ),
         "csa_compress_state_block_table": (
             torch.int32,
-            (ranks, DSPARK_PREFILL_MAX_REQUESTS, DSPARK_PREFILL_CSA_STATE_TABLE_BLOCKS),
+            (ranks, requests, DSPARK_PREFILL_CSA_STATE_TABLE_BLOCKS),
         ),
         "csa_inner_compress_state_block_table": (
             torch.int32,
             (
                 ranks,
-                DSPARK_PREFILL_MAX_REQUESTS,
+                requests,
                 DSPARK_PREFILL_CSA_INNER_STATE_TABLE_BLOCKS,
             ),
         ),
@@ -134,18 +134,18 @@ def _prefill_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
         "csa_cmp_freqs_cos": (torch.bfloat16, (ranks, *group_rope)),
         "csa_cmp_freqs_sin": (torch.bfloat16, (ranks, *group_rope)),
         "ori_block_table": (
-            torch.int32, (ranks, DSPARK_PREFILL_MAX_REQUESTS, DSPARK_PREFILL_ORI_TABLE_BLOCKS),
+            torch.int32, (ranks, requests, DSPARK_PREFILL_ORI_TABLE_BLOCKS),
         ),
         "hca_cmp_block_table": (
             torch.int32,
-            (ranks, DSPARK_PREFILL_MAX_REQUESTS, DSPARK_PREFILL_HCA_CMP_TABLE_BLOCKS),
+            (ranks, requests, DSPARK_PREFILL_HCA_CMP_TABLE_BLOCKS),
         ),
         "csa_cmp_block_table": (
             torch.int32,
-            (ranks, DSPARK_PREFILL_MAX_REQUESTS, DSPARK_PREFILL_CSA_CMP_TABLE_BLOCKS),
+            (ranks, requests, DSPARK_PREFILL_CSA_CMP_TABLE_BLOCKS),
         ),
         "idx_block_table": (
-            torch.int32, (ranks, DSPARK_PREFILL_MAX_REQUESTS, DSPARK_PREFILL_IDX_TABLE_BLOCKS),
+            torch.int32, (ranks, requests, DSPARK_PREFILL_IDX_TABLE_BLOCKS),
         ),
         "ori_slot_mapping_full": (torch.int64, (ranks, tokens)),
         "position_ids_local": (torch.int32, (ranks, local_tokens)),

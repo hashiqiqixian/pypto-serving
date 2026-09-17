@@ -12,8 +12,8 @@ Serves ``l3_prefill_fwd`` and ``l3_decode_fwd`` from
 ``pypto-lib/models/deepseek_v4_flash_dspark`` on the canonical 16-card
 TP4/DP4/EP16 topology:
 
-* The 16 NPU ranks form 4 TP groups.  One group owns one request's prefill
-  (all 4 ranks run the same prompt through context-parallel attention) and up
+* The 16 NPU ranks form 4 TP groups.  One group owns packed requests' prefill
+  (all 4 ranks share the packed stream through context-parallel attention) and up
   to 64 requests' decode (each rank owns 16 requests' 8-row query tiles while
   the group's whole 512-row token stream is gathered to every rank).
 * Cache pools are scheduler-visible as 4 partitions -- one per TP group --
@@ -156,7 +156,7 @@ DSPARK_MOE_TOKENS = 128
 # The LM-head / greedy-sampling windows cover one owner's rows per rank
 # (pypto-lib#1182 right-sized them from the whole step's DECODE_TOKENS to
 # MOE_TOKENS): decode packs at most local_batch * decode_seq = 128 logit
-# rows per rank, prefill selects one, and markov at most 16 * 7.
+# rows per rank, prefill selects each request's last row, and markov at most 16 * 7.
 DSPARK_MAX_LOGIT_ROWS = DSPARK_MOE_TOKENS
 DSPARK_SAMPLED_IDS_PAD = 8
 DSPARK_MAX_SEQ_LEN = 16384
@@ -181,11 +181,10 @@ DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS = 8
 
 # ---- prefill geometry ----
 DSPARK_PREFILL_MAX_TOKENS = 8192
-# The physical token extent is fixed: the kernel-internal staging tensors are
-# device-resident, so their dynamic extents cannot shrink below allocation.
+# Maximum backing allocation; dispatches bind a compact TP-aligned prefix.
 DSPARK_PREFILL_DISPATCH_TOKENS = DSPARK_PREFILL_MAX_TOKENS
 DSPARK_PREFILL_LOCAL_TOKENS = DSPARK_PREFILL_DISPATCH_TOKENS // DSPARK_TP_SIZE
-DSPARK_PREFILL_MAX_BATCH = DSPARK_CACHE_PARTITIONS
+DSPARK_PREFILL_MAX_BATCH = DSPARK_CACHE_PARTITIONS * DSPARK_DECODE_BATCH
 DSPARK_PREFILL_MAX_CONTEXT_TOKENS = 1_048_576
 DSPARK_PREFILL_ORI_TABLE_BLOCKS = 32768
 DSPARK_PREFILL_HCA_CMP_TABLE_BLOCKS = 256
@@ -200,9 +199,16 @@ DSPARK_PREFILL_CSA_STATE_TABLE_BLOCKS = 524288
 DSPARK_PREFILL_CSA_INNER_STATE_TABLE_BLOCKS = 524288
 # Packed-prefill request axis (pypto-lib#1095): the kernel takes per-request
 # block tables plus a monotonic query_start_loc over the packed extent.
-# Serving dispatches one request per TP group, so the staged request count is
-# one; raising it only changes the slot shapes here and the staging below.
-DSPARK_PREFILL_MAX_REQUESTS = 1
+# Keep admission within the subsequent decode and drafter lease capacity.
+DSPARK_PREFILL_MAX_REQUESTS = DSPARK_DECODE_BATCH
+
+_PREFILL_REQUEST_DYNAMIC_NAMES = frozenset(
+    {
+        "ori_block_table", "hca_cmp_block_table", "csa_cmp_block_table", "idx_block_table",
+        "hca_compress_state_block_table", "csa_compress_state_block_table",
+        "csa_inner_compress_state_block_table",
+    }
+)
 
 # Dynamic packed-prefill axes from pypto-lib's l3_prefill_fwd ABI. The slots
 # retain their maximum backing allocation, but each dispatch binds only the
@@ -431,6 +437,7 @@ class DSparkCacheLayout:
     prefill_tokens: int = DSPARK_PREFILL_DISPATCH_TOKENS
     prefill_local_tokens: int = DSPARK_PREFILL_LOCAL_TOKENS
     prefill_batch: int = DSPARK_PREFILL_MAX_BATCH
+    prefill_requests: int = DSPARK_PREFILL_MAX_REQUESTS
 
     def validate_runtime(
         self, config: ModelConfig, runtime: RuntimeConfig, device_ids: Sequence[int]
@@ -718,14 +725,15 @@ class DSparkPreparedPrefillInputs:
     actual_tokens: tuple[int, ...]
     physical_tokens: int
     chunk_starts: tuple[int, ...]
+    packed_offsets: tuple[int, ...]
     # Per-request prompt-chunk embeddings ([tokens, hidden] FP32); staged
     # directly into the shared x_hc slot with a zero tail.
     embeddings: tuple[torch.Tensor, ...]
     input_ids: torch.Tensor
     position_ids_local: torch.Tensor
     position_ids_full: torch.Tensor
-    # Packed request boundaries per rank: [0, chunk_len] for the group's one
-    # request, [0, 0] for groups without a request this dispatch.
+    # Packed request boundaries per rank; repeated terminal entries pad groups
+    # with fewer requests to the dispatch's common request-axis extent.
     query_start_loc: torch.Tensor
     rope_tables: dict[str, torch.Tensor]
     slot_mappings: dict[str, torch.Tensor]
@@ -1665,7 +1673,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
     # prefill
     # ------------------------------------------------------------------
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
-        """Run one prefill chunk per TP group at its TP-aligned extent."""
+        """Run packed prefill chunks per TP group at their common TP-aligned extent."""
         if self._compiled.prefill is None:
             raise RuntimeError("DSpark kernels were not compiled for this runner")
         if not batch.allow_device_greedy_sampling:
@@ -1678,12 +1686,19 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             inputs = self.prepare_prefill_inputs(model, batch)
             self._stage_prefill_inputs(inputs)
             self._prefill_task_args.clear_outputs()
-            args = self._prefill_dispatch_args(inputs.physical_tokens)
+            args = self._prefill_dispatch_args(
+                inputs.physical_tokens, inputs.query_start_loc.shape[1] - 1
+            )
             try:
                 with profile_span(
                     "DSparkModelRunner.prefill.l3_dispatch",
                     cat="executor",
-                    args={"actual_tokens": max(inputs.actual_tokens)},
+                    args={
+                        "actual_tokens": int(inputs.query_start_loc[:, -1].max()),
+                        "requests_per_group": [
+                            inputs.groups.count(group) for group in range(self._compiled.layout.partitions)
+                        ],
+                    },
                 ):
                     self._run_l3(self._compiled.prefill, *args)
             except RuntimeError as exc:
@@ -1695,8 +1710,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 self._capture_prefill_tails(batch, inputs)
             sampled = self._prefill_task_args.tensors["sampled_ids"]
             tokens = [
-                int(sampled[leader_rank, 0, 0].item())
-                for leader_rank in (group * self._compiled.layout.tp_size for group in inputs.groups)
+                int(sampled[rank, row, 0].item()) for rank, row in inputs.sampled_slots
             ]
             return PrefillResult(
                 last_hidden=None,
@@ -1704,8 +1718,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 sampled_token_ids=torch.tensor(tokens, dtype=torch.long),
             )
 
-    def _prefill_kernel_tokens(self, actual_tokens: int, *, max_seq_len: int) -> int:
-        """Return the TP-aligned packed extent for one logical chunk."""
+    def _prefill_kernel_tokens(self, actual_tokens: int) -> int:
+        """Return the TP-aligned packed extent, independent of individual context lengths."""
         if actual_tokens <= 0 or actual_tokens > self._compiled.layout.prefill_tokens:
             raise ValueError(
                 "DSpark prefill chunks must be in "
@@ -1716,10 +1730,6 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             // self._compiled.layout.tp_size
             * self._compiled.layout.tp_size
         )
-        if physical_tokens > max_seq_len:
-            raise ValueError(
-                f"DSpark prefill physical extent {physical_tokens} exceeds max_seq_len={max_seq_len}"
-            )
         return physical_tokens
 
     @staticmethod
@@ -1759,7 +1769,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             tensor.worker_ids,
         )
 
-    def _prefill_dispatch_args(self, physical_tokens: int) -> tuple[Any, ...]:
+    def _prefill_dispatch_args(self, physical_tokens: int, request_rows: int) -> tuple[Any, ...]:
         """Build prefill args with the kernel's exact dynamic P/L descriptors."""
         task_args = self._prefill_task_args
         if task_args is None:
@@ -1772,6 +1782,10 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 rows = physical_tokens
             elif name in _PREFILL_LOCAL_DYNAMIC_NAMES:
                 rows = local_tokens
+            elif name in _PREFILL_REQUEST_DYNAMIC_NAMES:
+                rows = request_rows
+            elif name == "query_start_loc":
+                rows = request_rows + 1
             if rows is None:
                 bounded.append(arg)
             elif isinstance(arg, torch.Tensor):
@@ -1793,39 +1807,66 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         request_count = len(batch.request_ids)
         if request_count <= 0 or request_count > layout.prefill_batch:
             raise ValueError(
-                "DSpark prefill supports one request per TP group and at most "
-                f"{layout.prefill_batch} per dispatch, got {request_count}"
+                f"DSpark prefill supports at most {layout.prefill_batch} requests per dispatch, "
+                f"got {request_count}"
             )
         if len(batch.cache_partitions) != request_count:
             raise ValueError("DSpark prefill requires one cache partition per request")
         groups = tuple(int(group) for group in batch.cache_partitions)
-        if len(set(groups)) != request_count:
-            raise ValueError("DSpark prefill accepts at most one request per TP group")
         if min(groups) < 0 or max(groups) >= layout.partitions:
             raise ValueError(
                 f"DSpark prefill cache partitions must be in [0, {layout.partitions - 1}]"
             )
         if batch.input_embeddings is None:
             raise ValueError("DSpark prefill requires host input embeddings")
-        if len(batch.chunk_lens) != request_count:
-            raise ValueError("DSpark prefill requires one chunk length per request")
+        if any(len(values) != request_count for values in (
+            batch.chunk_lens, batch.chunk_starts, batch.chunk_offsets,
+        )):
+            raise ValueError("DSpark prefill requires one chunk length, start and offset per request")
+
+        counts = [0] * layout.partitions
+        group_lengths = [0] * layout.partitions
+        packed_offsets = []
+        request_ordinals = []
+        for index, group in enumerate(groups):
+            length = int(batch.chunk_lens[index])
+            start = int(batch.chunk_starts[index])
+            offset = int(batch.chunk_offsets[index])
+            if length <= 0:
+                raise ValueError("DSpark prefill chunk lengths must be positive")
+            if start < 0 or start + length > model.runtime.max_seq_len:
+                raise ValueError(
+                    f"prefill chunk positions [{start}, {start + length}) "
+                    f"exceed max_seq_len={model.runtime.max_seq_len}"
+                )
+            if offset < 0 or offset + length > min(
+                batch.token_ids.shape[0], batch.input_embeddings.shape[0]
+            ):
+                raise ValueError("DSpark prefill chunk exceeds its token or embedding buffer")
+            packed_offsets.append(group_lengths[group])
+            request_ordinals.append(counts[group])
+            counts[group] += 1
+            group_lengths[group] += length
+        request_rows = max(counts)
+        if request_rows > min(layout.prefill_requests, layout.max_logit_rows):
+            raise ValueError(
+                f"DSpark prefill requests per TP group exceed capacity {layout.prefill_requests}"
+            )
 
         builder = self.cache_metadata
         rope = self._require_rope_tables()
-        tokens = self._prefill_kernel_tokens(
-            max(int(length) for length in batch.chunk_lens),
-            max_seq_len=model.runtime.max_seq_len,
-        )
+        tokens = self._prefill_kernel_tokens(max(group_lengths))
         local_tokens = tokens // layout.tp_size
         max_position = rope.max_position
 
         input_ids = torch.zeros((layout.ranks, local_tokens), dtype=torch.int64)
         position_ids_local = torch.zeros((layout.ranks, local_tokens), dtype=torch.int32)
         position_ids_full = torch.zeros((layout.ranks, tokens), dtype=torch.int32)
+        group_input_ids = torch.zeros((layout.partitions, tokens), dtype=torch.int64)
         # Packed-prefill boundaries (pypto-lib#1095): monotonic per-rank starts
         # ending at the group's logical length; [0, 0] leaves a group idle.
         query_start_loc = torch.zeros(
-            (layout.ranks, DSPARK_PREFILL_MAX_REQUESTS + 1), dtype=torch.int32
+            (layout.ranks, request_rows + 1), dtype=torch.int32
         )
         slot_mappings = {
             name: torch.full((layout.ranks, tokens), -1, dtype=torch.int64)
@@ -1841,7 +1882,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         }
         block_tables = {
             name: torch.full(
-                (layout.ranks, DSPARK_PREFILL_MAX_REQUESTS, depth), -1, dtype=torch.int32
+                (layout.ranks, request_rows, depth), -1, dtype=torch.int32
             )
             for name, depth in (
                 ("ori_block_table", DSPARK_PREFILL_ORI_TABLE_BLOCKS),
@@ -1862,7 +1903,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         group_rows = self._normalize_group_block_ids(
             batch.block_ids_by_group, actual_batch=request_count
         )
-        actual_tokens_by_group: list[int] = []
+        actual_tokens_by_request: list[int] = []
         chunk_starts: list[int] = []
         embeddings_by_request: list[torch.Tensor] = []
         # Per-rank rope rows: every TP group gathers its own table at its own
@@ -1889,26 +1930,15 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             actual_tokens = int(batch.chunk_lens[index])
             chunk_start = int(batch.chunk_starts[index])
             chunk_offset = int(batch.chunk_offsets[index])
-            actual_tokens_by_group.append(actual_tokens)
+            packed_start = packed_offsets[index]
+            packed_end = packed_start + actual_tokens
+            ordinal = request_ordinals[index]
+            actual_tokens_by_request.append(actual_tokens)
             chunk_starts.append(chunk_start)
-            if actual_tokens <= 0 or actual_tokens > DSPARK_PREFILL_MAX_TOKENS:
-                raise ValueError(
-                    f"DSpark prefill chunk must be in [1, {DSPARK_PREFILL_MAX_TOKENS}] tokens, "
-                    f"got {actual_tokens}"
-                )
-            # Bound the request by its own effective length: the packed
-            # physical extent is the batch maximum and its padding tail past a
-            # shorter request's end carries only synthetic positions with -1
-            # cache mappings, so it consumes no real context window.
-            if chunk_start + actual_tokens > model.runtime.max_seq_len:
-                raise ValueError(
-                    f"prefill chunk positions [{chunk_start}, {chunk_start + actual_tokens}) "
-                    f"exceed max_seq_len={model.runtime.max_seq_len}"
-                )
             ranks = tuple(
                 range(group * layout.tp_size, (group + 1) * layout.tp_size)
             )
-            positions = torch.arange(chunk_start, chunk_start + tokens, dtype=torch.int64)
+            positions = torch.arange(chunk_start, chunk_start + actual_tokens, dtype=torch.int64)
             positions_c = positions.clamp(max=max_position - 1)
             group_rope_rows = {
                 "swa_freqs_cos": rope.gather(rope.swa_cos, positions_c).to(torch.bfloat16),
@@ -1940,7 +1970,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             ).to(torch.bfloat16)
             rank_lo = group * layout.tp_size
             for name, rows in group_rope_rows.items():
-                rope_tables[name][rank_lo : rank_lo + layout.tp_size] = rows
+                rope_tables[name][rank_lo : rank_lo + layout.tp_size, packed_start:packed_end] = rows
             token_ids = (
                 batch.token_ids[chunk_offset : chunk_offset + actual_tokens]
                 .detach()
@@ -1954,24 +1984,10 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 .to(torch.float32)
                 .contiguous()
             )
-            # pypto-lib#1069 padding contract: zero-padded input rows, natural
-            # (non-aliasing) positions for the padding, -1 cache mappings.
+            group_input_ids[group, packed_start:packed_end] = token_ids
             for rank in ranks:
-                tp_rank = rank % layout.tp_size
-                local_index = torch.arange(local_tokens, dtype=torch.int64)
-                local_positions = positions_c[tp_rank * local_tokens + local_index]
-                position_ids_local[rank] = local_positions.to(torch.int32)
-                local_ids = torch.zeros(local_tokens, dtype=torch.int64)
-                active_local = (
-                    (tp_rank * local_tokens + local_index) < actual_tokens
-                )
-                local_ids[active_local] = token_ids[
-                    (tp_rank * local_tokens + local_index)[active_local]
-                ]
-                input_ids[rank] = local_ids
-                position_ids_full[rank] = positions_c.to(torch.int32)
-                logit_row_indices[rank] = -1
-            logit_row_indices[group * layout.tp_size, 0] = actual_tokens - 1
+                position_ids_full[rank, packed_start:packed_end] = positions_c.to(torch.int32)
+            logit_row_indices[group * layout.tp_size, ordinal] = packed_end - 1
 
             blocks = group_rows[index]
             tables = {
@@ -1998,7 +2014,6 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     depth=DSPARK_PREFILL_CSA_INNER_STATE_TABLE_BLOCKS,
                 ),
             }
-            logical_positions = positions[:actual_tokens].reshape(1, -1)
             logical_positions_c = positions_c[:actual_tokens].reshape(1, -1)
             mappings = {
                 "ori_slot_mapping_full": builder.paged_slot_mapping(
@@ -2037,18 +2052,33 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 ),
             }
             for rank in ranks:
-                query_start_loc[rank, DSPARK_PREFILL_MAX_REQUESTS] = actual_tokens
+                query_start_loc[rank, ordinal + 1:] = packed_end
                 for name, table in tables.items():
-                    block_tables[name][rank, 0] = table
+                    block_tables[name][rank, ordinal] = table
                 for name, mapping in mappings.items():
-                    slot_mappings[name][rank, :actual_tokens] = mapping.reshape(-1)
+                    slot_mappings[name][rank, packed_start:packed_end] = mapping.reshape(-1)
+
+        for group, length in enumerate(group_lengths):
+            for member in range(layout.tp_size):
+                rank = group * layout.tp_size + member
+                # Padding has no request ID and no cache publication slots.
+                # Synthetic positions stay distinct from every live position.
+                if length:
+                    tail_start = int(position_ids_full[rank, :length].max()) + 1
+                    position_ids_full[rank, length:] = torch.arange(
+                        tail_start, tail_start + tokens - length, dtype=torch.int32
+                    )
+                lo = member * local_tokens
+                input_ids[rank] = group_input_ids[group, lo:lo + local_tokens]
+                position_ids_local[rank] = position_ids_full[rank, lo:lo + local_tokens]
 
         return DSparkPreparedPrefillInputs(
             request_ids=tuple(batch.request_ids),
             groups=groups,
-            actual_tokens=tuple(actual_tokens_by_group),
+            actual_tokens=tuple(actual_tokens_by_request),
             physical_tokens=tokens,
             chunk_starts=tuple(chunk_starts),
+            packed_offsets=tuple(packed_offsets),
             embeddings=tuple(embeddings_by_request),
             input_ids=input_ids,
             position_ids_local=position_ids_local,
@@ -2059,7 +2089,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             block_tables=block_tables,
             logit_row_indices=logit_row_indices,
             sampled_slots=tuple(
-                (group * layout.tp_size, 0) for group in groups
+                (group * layout.tp_size, ordinal)
+                for group, ordinal in zip(groups, request_ordinals, strict=True)
             ),
         )
 
@@ -2086,10 +2117,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         layout = self._compiled.layout
         x_hc = self._packed_host_prefix(tensors["x_hc"], inputs.physical_tokens)
         x_hc.zero_()
-        for group, embeddings in zip(inputs.groups, inputs.embeddings, strict=True):
+        for group, offset, embeddings in zip(
+            inputs.groups, inputs.packed_offsets, inputs.embeddings, strict=True
+        ):
             replicated = embeddings.unsqueeze(1).expand(-1, layout.hc_mult, -1)
             for rank in range(group * layout.tp_size, (group + 1) * layout.tp_size):
-                x_hc[rank, : embeddings.shape[0]].copy_(replicated)
+                x_hc[rank, offset:offset + embeddings.shape[0]].copy_(replicated)
         for name, value in values.items():
             destination = tensors[name]
             if name in _PREFILL_GROUP_DYNAMIC_NAMES:
@@ -2098,6 +2131,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 destination = self._packed_host_prefix(
                     destination, inputs.physical_tokens // layout.tp_size
                 )
+            elif name in _PREFILL_REQUEST_DYNAMIC_NAMES or name == "query_start_loc":
+                destination = self._packed_host_prefix(destination, value.shape[1])
             copy_shared(destination, value, name=f"dspark_prefill_{name}")
 
         # Idle TP groups keep their zero-initialized staging (query_start_loc
@@ -3186,14 +3221,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         worker = self._shared_l3_worker()
         local_tokens = inputs.physical_tokens // tp
         row_bytes = DSPARK_MAIN_HIDDEN_DIM * 2
-        for index, (group, request_id) in enumerate(
-            zip(inputs.groups, batch.request_ids, strict=True)
-        ):
-            state = self._drafter_states.get(request_id)
-            if state is None:
-                state = self._reserve_drafter_state(request_id, group=group, prompt_len=0)
-            actual = int(inputs.actual_tokens[index])
-            chunk_start = int(inputs.chunk_starts[index])
+        group_rows = {}
+        for group in set(inputs.groups):
             rows = torch.empty(
                 (tp, local_tokens, DSPARK_MAIN_HIDDEN_DIM), dtype=torch.bfloat16
             )
@@ -3205,26 +3234,33 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     local_tokens * row_bytes,
                     worker_id=device.worker_ids[rank],
                 )
+            group_rows[group] = rows
+        for index, (group, request_id) in enumerate(
+            zip(inputs.groups, batch.request_ids, strict=True)
+        ):
+            state = self._drafter_states.get(request_id)
+            if state is None:
+                state = self._reserve_drafter_state(request_id, group=group, prompt_len=0)
+            actual = int(inputs.actual_tokens[index])
+            chunk_start = int(inputs.chunk_starts[index])
             # Rank-major logical order: each rank owns a contiguous band of
-            # the packed chunk, truncated at the chunk's logical end.
-            chunk_rows = self._prefill_chunk_bands(rows, local_tokens, actual)
+            # the packed group, which may contain several request boundaries.
+            chunk_rows = self._prefill_chunk_bands(
+                group_rows[group], local_tokens, actual, inputs.packed_offsets[index]
+            )
             if chunk_rows is None:
                 continue
             self._append_prefill_tail(state, chunk_rows, chunk_start)
 
     @staticmethod
     def _prefill_chunk_bands(
-        rows: torch.Tensor, local_tokens: int, actual: int
+        rows: torch.Tensor, local_tokens: int, actual: int, packed_offset: int = 0
     ) -> torch.Tensor | None:
-        """Concatenate the rank bands' logically valid tap rows, rank-major."""
-        keep = []
-        for member in range(rows.shape[0]):
-            valid = min(local_tokens, max(0, actual - member * local_tokens))
-            if valid > 0:
-                keep.append(rows[member, :valid])
-        if not keep:
+        """Extract one request's packed interval across rank bands."""
+        if actual <= 0:
             return None
-        return torch.cat(keep, dim=0)
+        packed = rows[:, :local_tokens].reshape(-1, rows.shape[-1])
+        return packed[packed_offset:packed_offset + actual].clone()
 
     @staticmethod
     def _append_prefill_tail(
@@ -3271,6 +3307,26 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         del sampling_params  # greedy-only serving; nothing to select
         if len(request_ids) != len(sampled_token_ids):
             raise ValueError("DSpark seeding requires one sampled token per request")
+        # The drafter seed ABI has one context/lease per group. Pack independent
+        # groups together, then seed further requests in that group in later waves.
+        waves: list[list[tuple[str, int]]] = []
+        group_counts: dict[int, int] = {}
+        for request_id, token in zip(request_ids, sampled_token_ids, strict=True):
+            group = self._drafter_state(request_id).group
+            wave = group_counts.get(group, 0)
+            group_counts[group] = wave + 1
+            if wave == len(waves):
+                waves.append([])
+            waves[wave].append((request_id, int(token)))
+        for wave in waves:
+            self._seed_prefill_wave(
+                [request_id for request_id, _ in wave], [token for _, token in wave]
+            )
+
+    def _seed_prefill_wave(
+        self, request_ids: Sequence[str], sampled_token_ids: Sequence[int]
+    ) -> None:
+        """Seed at most one request per TP group using independent prompt tails."""
         layout = self._compiled.layout
         tp = layout.tp_size
         rows_by_rank: list[list[DSparkDrafterRequestRow]] = [[] for _ in range(layout.ranks)]
