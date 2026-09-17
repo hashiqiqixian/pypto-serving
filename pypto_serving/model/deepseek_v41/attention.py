@@ -353,33 +353,41 @@ class Attention:
         if q.shape[1] != weights.shape[1] or cfg.index_n_heads % q.shape[1]:
             raise ValueError("rank-local index heads disagree with the checkpoint")
         indexes, candidates = [], []
-        for query in range(len(x)):
+        # Share key reads/GEMMs and reduce a complete score block across ranks.
+        # Keep score storage bounded for long histories and preserve per-query
+        # masking, candidate selection and stable TopK after the reduction.
+        query_tile = max(1, min(32, (8 << 20) // (length * 4)))
+        positions = torch.arange(length, device=x.device)
+        for query_begin in range(0, len(x), query_tile):
+            query_end = min(len(x), query_begin + query_tile)
+            queries = q[query_begin:query_end]
             pieces = []
             for begin in range(0, length, self.index_key_tile):
                 keys = source.index.read(begin, min(length, begin + self.index_key_tile))
-                score = self.ops.matmul(q[query], keys.T).to(q.dtype)
-                score = (score.relu() * weights[query, :, None]).sum(0)
-                pieces.append(self.ops.all_reduce(score))
-            scores = torch.cat(pieces)
-            reachable = (shared.start_pos + query + 1) // ratio
-            positions = torch.arange(length, device=x.device)
-            scores = scores.masked_fill(positions >= reachable, -torch.inf)
-            candidate_source = self.plan.candidate_source_layer_id
-            if self.layer_id == cfg.candidate_source_layer_id:
-                candidates.append(select_candidate_blocks(scores, reachable, cfg.candidate_topk_blocks,
-                                                           cfg.candidate_block_size))
-            elif candidate_source is not None:
-                if candidate_source not in shared.candidates:
-                    raise ValueError("hierarchical candidate source has not executed in this chunk")
-                blocks = shared.candidates[candidate_source][query]
-                allowed = torch.zeros((length + cfg.candidate_block_size - 1) // cfg.candidate_block_size,
-                                      dtype=torch.bool, device=x.device)
-                allowed[blocks] = True
-                scores = scores.masked_fill(~allowed[positions // cfg.candidate_block_size], -torch.inf)
-            chosen = _topk_positions(scores, topk)
-            # The published reference filters causal positions here, not all -inf
-            # candidate scores. Keep that distinction for underfilled candidate sets.
-            indexes.append(torch.where(chosen < reachable, chosen, -1).to(torch.int32))
+                score = self.ops.matmul(queries.flatten(0, 1), keys.T).to(q.dtype)
+                score = score.reshape(len(queries), q.shape[1], len(keys))
+                pieces.append((score.relu() * weights[query_begin:query_end, :, None]).sum(1))
+            reduced = self.ops.all_reduce(torch.cat(pieces, dim=1))
+            for offset, scores in enumerate(reduced):
+                query = query_begin + offset
+                reachable = (shared.start_pos + query + 1) // ratio
+                scores = scores.masked_fill(positions >= reachable, -torch.inf)
+                candidate_source = self.plan.candidate_source_layer_id
+                if self.layer_id == cfg.candidate_source_layer_id:
+                    candidates.append(select_candidate_blocks(scores, reachable, cfg.candidate_topk_blocks,
+                                                               cfg.candidate_block_size))
+                elif candidate_source is not None:
+                    if candidate_source not in shared.candidates:
+                        raise ValueError("hierarchical candidate source has not executed in this chunk")
+                    blocks = shared.candidates[candidate_source][query]
+                    allowed = torch.zeros((length + cfg.candidate_block_size - 1) // cfg.candidate_block_size,
+                                          dtype=torch.bool, device=x.device)
+                    allowed[blocks] = True
+                    scores = scores.masked_fill(~allowed[positions // cfg.candidate_block_size], -torch.inf)
+                chosen = _topk_positions(scores, topk)
+                # The published reference filters causal positions here, not all -inf
+                # candidate scores. Keep that distinction for underfilled candidate sets.
+                indexes.append(torch.where(chosen < reachable, chosen, -1).to(torch.int32))
         if candidates:
             shared.candidates[self.layer_id] = tuple(candidates)
         return torch.stack(indexes)

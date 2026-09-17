@@ -243,6 +243,55 @@ def test_fp32_inputs_are_preserved_for_routing_and_head(module):
     torch.testing.assert_close(ops.linear(x, "head"), x @ torch.tensor([[1.001], [-1.]]), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("fmt", ["fp8", "fp4"])
+def test_quantized_linear_dispatches_complete_reduction_with_original_scale_order(module, fmt):
+    generator = torch.Generator().manual_seed(401)
+    weights = (torch.randint(-6, 7, (7, 96), generator=generator) / 2).bfloat16()
+    scales = torch.tensor([[0.125, 2., 0.5]]).expand(7, -1).clone()
+    scales[3:] *= 2
+    bias = torch.arange(7).float() / 7
+
+    class Weights:
+        def matrix_shape(self, name):
+            return 7, 96
+
+        def matrix_format(self, name):
+            return fmt
+
+        def matrix_tiles(self, name):
+            for row in (0, 3):
+                for column in range(0, 96, 32):
+                    yield row, column, weights[row:row + (3 if row == 0 else 4), column:column + 32], \
+                        scales[row:row + (3 if row == 0 else 4), column // 32]
+
+        def weight(self, name):
+            return bias
+
+    class Provider:
+        def __init__(self):
+            self.calls = []
+
+        def block_scaled_matmul(self, a, b, sa, sb):
+            self.calls.append((a.data_ptr(), sa.data_ptr(), tuple(a.shape), tuple(b.shape)))
+            assert all(t.device.type == "cpu" and t.is_contiguous() for t in (a, b, sa, sb))
+            output = torch.zeros(a.shape[0], b.shape[1])
+            for block in range(a.shape[1] // 32):
+                partial = a[:, block * 32:(block + 1) * 32].float() @ b[block * 32:(block + 1) * 32].float()
+                partial *= sa[:, block, None]
+                partial *= sb[block]
+                output += partial
+            return output
+
+    x = torch.randn((2, 5, 96), generator=generator).bfloat16()
+    provider = Provider()
+    expected = module.TensorOps(Weights()).linear(x, "projection.weight", bias=True)
+    actual = module.TensorOps(Weights(), matmul_provider=provider).linear(x, "projection.weight", bias=True)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert len(provider.calls) == 2
+    assert provider.calls[0][:2] == provider.calls[1][:2]  # Activation transfer is reused across N blocks.
+    assert [call[3] for call in provider.calls] == [(96, 3), (96, 4)]
+
+
 def _largest_fp32_tensor():
     from torch.utils._python_dispatch import TorchDispatchMode
     from torch.utils._pytree import tree_flatten

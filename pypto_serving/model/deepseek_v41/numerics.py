@@ -195,7 +195,12 @@ class TensorOps:
             activation = quantize_rows(flat, "fp8_e4m3_ue8m0", 32)
             normalized = activation.normalized().to(torch.bfloat16)
             activation_scales = activation.scale_values()
-        else:
+        scaled_matmul = getattr(self.matmul_provider, "block_scaled_matmul", None) if quantized else None
+        if callable(scaled_matmul):
+            # Transfer activations once for the projection, not once per K32.
+            normalized = normalized.cpu().contiguous()
+            activation_scales = activation_scales.cpu().contiguous()
+        elif not quantized:
             normalized = flat.float() if fmt == "float32" else flat.to(torch.bfloat16)
         output = torch.zeros(flat.shape[0], out_features, device=x.device, dtype=x.dtype)
         bias_value = self.weight(name.removesuffix(".weight") + ".bias").float() if bias else None
@@ -206,15 +211,27 @@ class TensorOps:
         # FP32 copy of the entire Engram projection alongside the BF16 result.
         for out_start, tiles in groupby(self.weights.matrix_tiles(name), key=lambda tile: tile[0]):
             accumulated = None
-            for _, in_start, values, scales in tiles:
-                values = values.to(x.device)
-                partial = self.matmul(normalized[:, in_start:in_start + values.shape[1]], values.T)
-                if quantized:
-                    partial *= activation_scales[:, in_start // 32, None]
-                    partial *= scales.to(x.device)[None, :]
-                if accumulated is None:
-                    accumulated = torch.zeros_like(partial)
-                accumulated += partial
+            if callable(scaled_matmul):
+                weight_blocks, scale_blocks = [], []
+                for _, in_start, values, scales in tiles:
+                    if in_start != 32 * len(weight_blocks) or values.shape[1] != 32:
+                        raise ValueError("quantized matrix tiles must cover K in ordered 32-value blocks")
+                    weight_blocks.append(values.T.cpu())
+                    scale_blocks.append(scales.cpu())
+                if len(weight_blocks) * 32 != in_features:
+                    raise ValueError("quantized matrix tiles do not cover the projection input")
+                accumulated = scaled_matmul(normalized, torch.cat(weight_blocks).contiguous(),
+                                            activation_scales, torch.stack(scale_blocks).contiguous()).to(x.device)
+            else:
+                for _, in_start, values, scales in tiles:
+                    values = values.to(x.device)
+                    partial = self.matmul(normalized[:, in_start:in_start + values.shape[1]], values.T)
+                    if quantized:
+                        partial *= activation_scales[:, in_start // 32, None]
+                        partial *= scales.to(x.device)[None, :]
+                    if accumulated is None:
+                        accumulated = torch.zeros_like(partial)
+                    accumulated += partial
             stop = out_start + accumulated.shape[1]
             if bias_value is not None:
                 accumulated += bias_value[out_start:stop]

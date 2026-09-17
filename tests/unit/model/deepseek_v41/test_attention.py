@@ -180,6 +180,30 @@ def test_full_reindex_reuse_are_numerical_and_chunk_contiguous(modules, config, 
     assert any(a == torch.Size([2, 32]) and b == torch.Size([32, 3]) for a, b in ops.matmul_shapes)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_indexer_batches_queries_without_changing_causal_candidates(modules, config, dtype):
+    class ObservedOps(NumericalOps):
+        def __init__(self):
+            super().__init__(config, dtype)
+            self.index_reductions = []
+
+        def all_reduce(self, values):
+            if values.ndim == 2 and values.shape[0] <= 32 and values.shape[1] in (65, 32):
+                self.index_reductions.append(tuple(values.shape))
+            return values
+
+    ops = ObservedOps()
+    x = torch.randn((65, 32), generator=torch.Generator().manual_seed(23)).to(dtype)
+    whole, _ = run_chunks(modules["attention"], config, ops, x, [65])
+    # Four indexer layers require at most three score collectives each. The
+    # previous per-query/per-key path required thousands for this history.
+    assert len(ops.index_reductions) == 12
+    assert (32, 65) in ops.index_reductions and (1, 65) in ops.index_reductions
+    chunked, _ = run_chunks(modules["attention"], config, NumericalOps(config, dtype), x, [1] * 65)
+    tolerance = .035 if dtype == torch.bfloat16 else 2e-5
+    torch.testing.assert_close(whole, chunked, rtol=tolerance, atol=tolerance)
+
+
 @pytest.mark.parametrize("padding", [0, 1, 7, 64])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_topk_cutoff_ties_use_absolute_position_independent_of_future_padding(modules, padding, dtype):
