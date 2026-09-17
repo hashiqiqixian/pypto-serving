@@ -32,6 +32,38 @@ A3 `signbit(-0)` and approximate `pow` differences without moving tensors to CPU
 UE8M0 normalization multiplies by the exact inverse power of two because A5
 division flushes subnormal inputs. Non-power-of-two E4M3 scales retain division.
 
+## Optional native attention
+
+The default backend remains the shared A3/A5 bridge. An alternative factory
+connects the library's SWA, C2A Full/Reuse and C1A Full/Reindex/Reuse kernels to
+the existing serving backend. Select it with:
+
+```text
+--platform a5 --devices 0 --block-size 256
+--v41-kernel-factory pypto_serving.model.deepseek_v41.native_attention:create_backend
+```
+
+This factory requires A5, TP1, Flash attention dimensions and a source-token
+page size divisible by 256. Select the existing request chunk limit at 8192 or
+below. Set `PYPTO_LIB_ROOT` if the library checkout is not beside the serving
+package. Native TP and EP dimensions are configured before importing kernels;
+an incompatible configuration already imported in the process is rejected.
+
+The native worker retains separate packed payload and scale pools and bounded
+attention weight bundles. It derives all addresses from existing scheduler
+leases. Index backing follows the corresponding main-KV physical order while
+validating the independent index lease, so the scheduler need not allocate
+identical page IDs. Failed writes and speculative checkpoints restore bytes at
+the same device addresses, including ratio-2 compressor state.
+
+Each layer transfers its current activation to the L2 worker and returns its
+local FP32 result through the existing reduction interface. Engram, MoE, HC,
+head and serving continue through the existing backend. This is an attention
+integration, not native whole-model or multi-rank acceptance. CPU transport
+tests cover dispatch, independent page namespaces, isolation and recovery;
+the library's native compilation/numerical harness and real-checkpoint M0
+validation are separate requirements.
+
 ## Functional validation
 
 The CPU suite includes both platform selections, rank capability checks and

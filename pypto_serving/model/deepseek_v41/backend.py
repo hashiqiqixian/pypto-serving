@@ -83,6 +83,7 @@ class DeepSeekV41Backend:
         self.requests: dict[tuple[str, int], _RequestState] = {}
         self._ticket: _Batch | None = None
         self._closed = False
+        self.attention_provider = None
         self.capabilities = V41BackendCapabilities(
             world_size=ops.world_size,
             max_chunk_tokens=runtime.max_prefill_tokens_per_request or runtime.max_num_batched_tokens,
@@ -137,6 +138,8 @@ class DeepSeekV41Backend:
         self._ticket = ticket
         self.pool.begin()
         try:
+            if self.attention_provider is not None:
+                self.attention_provider.begin(contexts)
             for context in contexts:
                 key = self._key(context)
                 request = self.requests.get(key)
@@ -208,6 +211,8 @@ class DeepSeekV41Backend:
             state.targets.append(state.value.mean(-2))
         request = self.requests[self._key(context)]
         def attend(x):
+            if self.attention_provider is not None:
+                return self.attention_provider.forward(layer_id, x, context, request.layers)
             return self.attention[layer_id].forward(x, context.work.start_pos, request.layers[layer_id],
                                                     state.shared)
         state.value, state.pre_mix = self.math.block(state.value, state.pre_mix, f"layers.{layer_id}", attend,
@@ -239,23 +244,32 @@ class DeepSeekV41Backend:
     def abort_batch(self, ticket) -> None:
         if ticket is not self._ticket:
             raise RuntimeError("cannot abort an unrelated backend batch")
+        if self.attention_provider is not None:
+            self.attention_provider.abort()
         self.pool.abort()
         for key, snapshot in ticket.snapshots.items():
             self.requests[key].restore(snapshot)
         for key in ticket.created:
             self.requests.pop(key, None)
+            if self.attention_provider is not None:
+                self.attention_provider.release(*key)
         ticket.active = False
 
     def release_request(self, request_id: str, generation: int) -> None:
+        if self.attention_provider is not None:
+            self.attention_provider.release(request_id, generation)
         self.requests.pop((request_id, generation), None)
 
     def checkpoint(self):
         if self._ticket is not None and self._ticket.active:
             raise RuntimeError("checkpoint requires an inactive backend")
-        return self.pool.checkpoint(), {key: state.snapshot() for key, state in self.requests.items()}
+        native = self.attention_provider.checkpoint() if self.attention_provider is not None else None
+        return self.pool.checkpoint(), {key: state.snapshot() for key, state in self.requests.items()}, native
 
     def finish_checkpoint(self, checkpoint, *, restore: bool = False) -> None:
-        pages, snapshots = checkpoint
+        pages, snapshots, native = checkpoint
+        if self.attention_provider is not None:
+            self.attention_provider.finish_checkpoint(native, restore=restore)
         self.pool.finish_checkpoint(pages, restore=restore)
         if restore:
             for key in tuple(self.requests):
@@ -288,6 +302,11 @@ class DeepSeekV41Backend:
             "weight_row_cache_bytes": getattr(self.ops.weights, "_cached_bytes", None),
             "npu_memory_allocated": None, "npu_memory_reserved": None, "npu_max_memory_allocated": None,
         }
+        if self.attention_provider is not None:
+            native = self.attention_provider.diagnostics()
+            result["native_attention"] = native
+            result["cache_bytes"] += native["cache_bytes"]
+            result["journal_bytes"] += native["journal_bytes"]
         npu = getattr(torch, "npu", None)
         if self.ops.device.type == "npu" and npu is not None:
             for name in ("memory_allocated", "memory_reserved", "max_memory_allocated"):
@@ -298,8 +317,12 @@ class DeepSeekV41Backend:
 
     def close(self) -> None:
         try:
-            if self.ops.matmul_provider is not None:
-                self.ops.matmul_provider.close()
+            try:
+                if self.attention_provider is not None:
+                    self.attention_provider.close()
+            finally:
+                if self.ops.matmul_provider is not None:
+                    self.ops.matmul_provider.close()
         finally:
             self.ops.weights.close()
             self.pool.close()
