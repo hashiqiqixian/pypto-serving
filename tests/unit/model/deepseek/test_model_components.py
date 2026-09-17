@@ -3126,8 +3126,8 @@ def test_deepseek_mtp_prefill_reads_only_selected_owner_outputs():
         def free_tensor(_tensor, *, worker_id=0):
             pass
 
-        def copy_from(self, dst, src, nbytes, *, worker_id=0):
-            self.copies.append((dst, src, nbytes, worker_id))
+        def copy_from(self, dst, src, nbytes, *, src_offset=0, worker_id=0):
+            self.copies.append((dst, src + src_offset, nbytes, worker_id))
 
     worker = FakeWorker()
     runner._l3_worker = worker
