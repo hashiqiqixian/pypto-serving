@@ -175,7 +175,12 @@ class L3DispatchMixin:
                 for tensor in uploaded:
                     worker.free_tensor(tensor)
 
-    def _submit_l3(self, callable_spec: Any, *args: Any) -> PendingL3Dispatch:
+    def _submit_l3(
+        self,
+        callable_spec: Any,
+        *args: Any,
+        config: Any = None,
+    ) -> PendingL3Dispatch:
         """Submit one L3 program and transfer argument ownership to its handle.
 
         The async counterpart of ``_run_l3``: resolve the args the same way, but
@@ -185,6 +190,7 @@ class L3DispatchMixin:
         span_args: dict[str, Any] = {"aicpu_thread_num": callable_spec.aicpu_thread_num}
         if callable_spec.block_dim is not None:
             span_args["block_dim"] = callable_spec.block_dim
+        run_config = self._l3_run_config if config is None else config
         worker = self._shared_l3_worker()
         uploaded: list[Any] = []
         try:
@@ -206,7 +212,7 @@ class L3DispatchMixin:
                 args=dict(span_args),
             ):
                 handle = worker.submit(
-                    callable_spec.compiled, *l3_args, config=self._l3_run_config,
+                    callable_spec.compiled, *l3_args, config=run_config,
                 )
         except BaseException:
             for tensor in uploaded:

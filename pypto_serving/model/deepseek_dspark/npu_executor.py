@@ -60,6 +60,8 @@ _DSPARK_IMPORT_MODULES = (
     "decode_cp_token_allgather",
     "decode_csa",
     "decode_fwd",
+    "decode_fwd_device_state",
+    "decode_fwd_dspark",
     "decode_hca",
     "decode_indexer",
     "decode_indexer_compressor",
@@ -72,6 +74,9 @@ _DSPARK_IMPORT_MODULES = (
     "decode_swa",
     "dspark_attention",
     "dspark_context_kv",
+    "dspark_decode_bridge",
+    "dspark_draft_step_device_state",
+    "dspark_device_state",
     "dspark_drafter",
     "dspark_markov",
     "dspark_prefill",
@@ -260,8 +265,8 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
 
     @property
     def supports_async_decode_prepare(self) -> bool:
-        """Keep M1 on the synchronous decode path."""
-        return False
+        """Pipeline Host-only decode planning when every runner supports it."""
+        return super().supports_async_decode_prepare
 
     def lookup_embeddings(self, model: RuntimeModel, token_ids: torch.Tensor) -> torch.Tensor:
         """Prefill embedding lookup from the lazily loaded DSpark table."""
@@ -347,6 +352,9 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         speculative = self._num_speculative_tokens > 0
         drafter = None
         markov = None
+        state_prepare = None
+        state_accept = None
+        state_commit = None
         if speculative:
             self._validate_drafter_config(model, config_data)
             # The drafter weights are required (and loaded) only at K=7.
@@ -360,13 +368,24 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         if self._compile_kernels:
             modules = self._load_kernel_modules(layout, speculative=speculative)
             prefill = self._compile_l3_callable("dspark_prefill", modules["prefill_fwd"].l3_prefill_fwd)
-            decode = self._compile_l3_callable("dspark_decode", modules["decode_fwd"].l3_decode_fwd)
             if speculative:
-                drafter = self._compile_l3_callable(
-                    "dspark_drafter", modules["dspark_drafter"].l3_dspark_drafter
+                decode = self._compile_l3_callable(
+                    "dspark_decode_one_l2",
+                    modules["decode_fwd_dspark"].l3_decode_fwd_dspark,
                 )
-                markov = self._compile_l3_callable(
-                    "dspark_markov", modules["dspark_markov"].l3_distributed_markov_sample
+            else:
+                decode = self._compile_l3_callable(
+                    "dspark_decode", modules["decode_fwd"].l3_decode_fwd
+                )
+            if speculative:
+                # The fused decode program owns every recurrent decode stage,
+                # but prefill still needs one standalone draft step to seed the
+                # first K=7 tokens and publish the initial device state.
+                drafter = self._compile_l3_callable(
+                    "dspark_draft_step_device_state_bootstrap",
+                    modules[
+                        "dspark_draft_step_device_state"
+                    ].l3_dspark_draft_step_device_state,
                 )
             rope = self._build_rope_tables(
                 modules["utils"],
@@ -387,6 +406,12 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             decode=decode,
             drafter=drafter,
             markov=markov,
+            state_prepare=state_prepare,
+            state_accept=state_accept,
+            state_commit=state_commit,
+            decode_device_state_fused=speculative,
+            draft_device_state_fused=speculative,
+            decode_full_fused=speculative,
             num_speculative_tokens=self._num_speculative_tokens,
             rope=rope,
             platform=self._platform,
@@ -443,6 +468,18 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             if speculative:
                 modules["dspark_drafter"] = importlib.import_module("dspark_drafter")
                 modules["dspark_markov"] = importlib.import_module("dspark_markov")
+                modules["dspark_draft_step_device_state"] = importlib.import_module(
+                    "dspark_draft_step_device_state"
+                )
+                modules["dspark_device_state"] = importlib.import_module(
+                    "dspark_device_state"
+                )
+                modules["decode_fwd_device_state"] = importlib.import_module(
+                    "decode_fwd_device_state"
+                )
+                modules["decode_fwd_dspark"] = importlib.import_module(
+                    "decode_fwd_dspark"
+                )
         return modules
 
     def _compile_l3_callable(self, name: str, jit_fn: object):

@@ -10,7 +10,8 @@
 """DSpark (deepseek_v4_flash_dspark) target-model HTTP generation guard.
 
 Serves the DSpark W8A8 checkpoint on the canonical 16-card TP4/DP4/EP16
-topology through the standard HTTP path and checks greedy generation.  The
+topology through the standard HTTP path and checks greedy generation.  K=7
+also guards that serving compiled the fused one-L2 decode entry.  The
 process/HTTP harness is shared with the DeepSeek V4 MTP guard; what differs is
 the server command (page 32, the dspark speculative-config method, the
 prefill-tuned ring heap) and the 16-device task contract.
@@ -55,6 +56,7 @@ DSPARK_DP_SIZE = DSPARK_EP_SIZE // DSPARK_TP_SIZE
 DSPARK_RING_HEAP = os.environ.get(
     "PYPTO_DSPARK_RING_HEAP", "2147483648,2147483648,4294967296,8589934592"
 )
+ONE_L2_COMPILE_MARKER = "[kernel-compile] compiling dspark_decode_one_l2"
 
 
 @dataclass(frozen=True)
@@ -277,11 +279,14 @@ def test_dspark_http_greedy_generation(tmp_path: Path, case: DSparkCase) -> None
         # the whole card; wait out the previous server's async HBM reclaim.
         _wait_for_device_reclaim(devices)
         if case.num_speculative_tokens:
-            # The K=7 run must really have dispatched the drafter/markov
-            # chain: the runner logs acceptance progress unconditionally at
-            # its first verify step, so the line exists however few (or many)
-            # steps a fast or slow run takes.
+            # The K=7 run must compile the fused one-L2 entry and really
+            # dispatch its drafter/markov chain.  The runner logs acceptance
+            # progress unconditionally at its first verify step, so both
+            # markers exist however few (or many) steps the run takes.
             log_text = log_path.read_text(encoding="utf-8")
+            assert ONE_L2_COMPILE_MARKER in log_text, (
+                "the K=7 accuracy guard did not compile the fused one-L2 decode entry"
+            )
             assert "DSpark speculation progress" in log_text, (
                 "no acceptance progress line in the server log"
             )
