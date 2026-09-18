@@ -199,15 +199,6 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         compile_kernels: bool = False,
         num_speculative_tokens: int = 0,
     ) -> None:
-        self._prefill_requests_per_partition = int(
-            os.environ.get("PYPTO_DSPARK_PREFILL_MAX_REQUESTS", "1")
-        )
-        max_prefill_requests = DSparkCacheLayout().prefill_requests
-        if not 1 <= self._prefill_requests_per_partition <= max_prefill_requests:
-            raise ValueError(
-                "PYPTO_DSPARK_PREFILL_MAX_REQUESTS must be in "
-                f"[1, {max_prefill_requests}]"
-            )
         worker_device_ids = tuple(device_ids) if device_ids is not None else (int(device_id),)
         super().__init__(
             kv_cache_manager,
@@ -240,11 +231,18 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
     @property
     def max_prefill_batch_size(self) -> int:
         """Global packed-prefill request capacity."""
-        return DSparkCacheLayout().partitions * self.max_prefill_requests_per_partition
+        return min(
+            (compiled.layout.prefill_batch for compiled in self._compiled.values()),
+            default=DSparkCacheLayout().prefill_batch,
+        )
 
     @property
     def max_prefill_requests_per_partition(self) -> int:
-        return self._prefill_requests_per_partition
+        # Admission must fit the metadata buffers of every registered model.
+        return min(
+            (compiled.layout.prefill_requests for compiled in self._compiled.values()),
+            default=DSparkCacheLayout().prefill_requests,
+        )
 
     @property
     def max_prefill_tokens_per_partition(self) -> int:
@@ -314,7 +312,8 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                 "DeepSeekV4DSparkPyptoExecutor requires the W8A8 compressed-tensors checkpoint"
             )
         layout = DSparkCacheLayout(
-            prefill_requests=min(model.runtime.max_batch_size, self.max_prefill_requests_per_partition),
+            prefill_batch=min(model.runtime.max_batch_size, DSparkCacheLayout().prefill_batch),
+            prefill_requests=min(model.runtime.max_batch_size, DSparkCacheLayout().prefill_requests),
         )
         layout.validate_runtime(model.config, model.runtime, self._device_ids)
         compress_ratios = tuple(int(ratio) for ratio in metadata["compress_ratios"])

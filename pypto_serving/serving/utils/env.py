@@ -6,14 +6,30 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Environment-driven serving knobs (worker init/step timeouts)."""
+"""Environment-driven serving logging and worker timeouts."""
 
 from __future__ import annotations
 
+import logging
 import os
 
 _DEFAULT_WORKER_INIT_TIMEOUT_SECONDS = 1800.0
 _DEFAULT_WORKER_STEP_TIMEOUT_SECONDS = 1200.0
+
+
+def configure_runtime_logging() -> None:
+    """Apply runtime log thresholds in both the CLI and spawned worker."""
+    for name in ("simpler_setup", "pypto", "simpler"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+    # Worker.init() snapshots this threshold for device-side diagnostics.
+    level = os.environ.get("PYPTO_SIMPLER_LOG_LEVEL", "").strip().upper()
+    if level:
+        try:
+            logging.getLogger("simpler").setLevel(level)
+        except ValueError:
+            logging.getLogger(__name__).warning(
+                "Invalid PYPTO_SIMPLER_LOG_LEVEL=%r; using WARNING", level
+            )
 
 
 def _positive_env_timeout_seconds(name: str, default: float) -> float:

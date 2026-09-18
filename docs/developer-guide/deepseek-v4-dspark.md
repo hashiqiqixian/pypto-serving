@@ -57,8 +57,8 @@ Validated constraints (enforced at startup):
   surfaces as an opaque AICore 507901; the depths therefore track the kernel
   constants (`IDX_MAX_BLOCKS`, `CMP_MAX_BLOCKS`,
   `COMPRESS_STATE_MAX_BLOCKS`), never the serving context ceiling.
-- **Prefill** can pack multiple requests per TP group, within 16 requests and
-  8192 total chunk tokens per group (64 requests per dispatch across four
+- **Prefill** can pack multiple requests per TP group, within 64 requests and
+  8192 total chunk tokens per group (256 requests per dispatch across four
   groups). These
   are admission capacities, not a claim that every occupancy is hardware
   validated. The worker splits dispatches at either limit; configured
@@ -68,18 +68,22 @@ Validated constraints (enforced at startup):
   The physical token extent is the largest packed group length rounded up to
   TP4 alignment, not the per-request context limit. Padding has zero inputs,
   synthetic positions, and `-1` cache mappings. Request metadata backing
-  capacity is capped by configured concurrency; dispatch descriptors bind
+  capacity follows `--max-num-seqs` within the kernel limits: the global
+  request capacity is `min(max_num_seqs, 256)` and each group's metadata
+  capacity is `min(max_num_seqs, 64)`. The per-group capacity is not divided
+  by four, so uneven groups can share a dispatch. Worker admission follows
+  these compiled capacities; dispatch descriptors bind
   only the live request-axis extent, with repeated terminal boundaries for
   groups containing fewer requests.
-  Packed prefill is experimental: set `PYPTO_DSPARK_PREFILL_MAX_REQUESTS`
-  to the desired per-group limit (1-16). The default remains 1, preserving
-  one request per group per dispatch. A 32-request offline run with ragged
+  Packed prefill is enabled automatically; no environment toggle is needed.
+  Actual dispatch sizes follow scheduled requests and per-group token budgets,
+  without waiting for a full batch. A 32-request offline run with ragged
   33-512 token prompts, 128-token chunked prefill, and K=7 speculation
   completed end-to-end with correct token accounting at eight requests per
   group. Intermittent EP16 prefill stalls reproduce without packed prefill
   (single-request controls and the kernel-side golden fixture fail the same
   way), so they are not attributed to request packing; they are tracked in
-  pypto-lib#1213. The packed path stays opt-in pending that investigation.
+  pypto-lib#1213.
 - **Decode** always runs the full 512-row group tile (16 requests x 8 rows
   per rank). Row 0 of each request carries the committed token and is the
   only accepted row in this milestone (one token per step); rows 1-7 carry
