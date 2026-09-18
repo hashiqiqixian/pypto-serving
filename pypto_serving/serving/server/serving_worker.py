@@ -611,6 +611,12 @@ class WorkerProcess:
                     for chunk in self._partitioned_prefill_chunks(
                         cmd.prefill_requests,
                         max_prefill_batch,
+                        max_requests_per_partition=getattr(
+                            self.executor, "max_prefill_requests_per_partition", 1
+                        ),
+                        max_tokens_per_partition=getattr(
+                            self.executor, "max_prefill_tokens_per_partition", None
+                        ),
                     ):
                         self._batch_prefill(chunk, runtime_model, new_tokens)
             if cmd.decode_requests:
@@ -636,23 +642,47 @@ class WorkerProcess:
         self._last_tokens[request_id] = recent[-1:]
 
     @staticmethod
-    def _partitioned_prefill_chunks(scheduled: list, max_batch: int) -> list[list]:
-        """Pack at most one local-prefill request from each cache partition."""
+    def _partitioned_prefill_chunks(
+        scheduled: list,
+        max_batch: int,
+        *,
+        max_requests_per_partition: int = 1,
+        max_tokens_per_partition: int | None = None,
+    ) -> list[list]:
+        """Pack requests within the executor's per-partition request/token budgets."""
+        if max_batch <= 0 or max_requests_per_partition <= 0:
+            raise ValueError("prefill batch and partition request limits must be positive")
+        if max_tokens_per_partition is not None:
+            if max_tokens_per_partition <= 0:
+                raise ValueError("prefill partition token limit must be positive")
+            if any(len(item.chunk_tokens) > max_tokens_per_partition for item in scheduled):
+                raise ValueError("prefill request chunk exceeds the partition token budget")
         pending = list(scheduled)
         chunks: list[list] = []
         while pending:
             chunk = []
             deferred = []
-            used_partitions: set[int] = set()
+            partition_counts: dict[int, int] = {}
+            partition_tokens: dict[int, int] = {}
             for item in pending:
                 partition = item.cache_partition
                 can_add = len(chunk) < max_batch and (
-                    partition is None or partition not in used_partitions
+                    partition is None or (
+                        partition_counts.get(partition, 0) < max_requests_per_partition
+                        and (
+                            max_tokens_per_partition is None
+                            or partition_tokens.get(partition, 0) + len(item.chunk_tokens)
+                            <= max_tokens_per_partition
+                        )
+                    )
                 )
                 if can_add:
                     chunk.append(item)
                     if partition is not None:
-                        used_partitions.add(partition)
+                        partition_counts[partition] = partition_counts.get(partition, 0) + 1
+                        partition_tokens[partition] = (
+                            partition_tokens.get(partition, 0) + len(item.chunk_tokens)
+                        )
                 else:
                     deferred.append(item)
             if not chunk:
@@ -1011,6 +1041,11 @@ def _worker_entry(
     )
     for _n in ("simpler_setup", "pypto", "simpler"):
         logging.getLogger(_n).setLevel(logging.WARNING)
+    # Debug hook: Worker.init() snapshots the "simpler" logger threshold and
+    # pushes it to the device (stall snapshots need DEBUG); override via env.
+    _simpler_level = os.environ.get("PYPTO_SIMPLER_LOG_LEVEL", "").strip().upper()
+    if _simpler_level:
+        logging.getLogger("simpler").setLevel(_simpler_level)
 
     worker = WorkerProcess(config, input_queue, output_queue, profile_output_queue)
     try:

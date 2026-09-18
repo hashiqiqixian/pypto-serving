@@ -92,11 +92,60 @@ def test_partitioned_prefill_chunks_keep_cache_partitions_unique():
     ]
 
 
+def test_partitioned_prefill_chunks_pack_with_request_and_token_limits():
+    requests = [
+        PrefillRequest(str(index), list(range(length)), 0, [], cache_partition=partition)
+        for index, (partition, length) in enumerate(((0, 5), (0, 7), (1, 8), (0, 3), (1, 2)))
+    ]
+    chunks = WorkerProcess._partitioned_prefill_chunks(
+        requests, max_batch=4, max_requests_per_partition=2, max_tokens_per_partition=10,
+    )
+    assert [[request.request_id for request in chunk] for chunk in chunks] == [
+        ["0", "2", "3", "4"], ["1"],
+    ]
+    chunks = WorkerProcess._partitioned_prefill_chunks(
+        requests, max_batch=3, max_requests_per_partition=2, max_tokens_per_partition=20,
+    )
+    assert [[request.request_id for request in chunk] for chunk in chunks] == [
+        ["0", "1", "2"], ["3", "4"],
+    ]
+
+
+def test_partitioned_prefill_chunks_reject_oversized_request():
+    request = PrefillRequest("large", [1] * 11, 0, [], cache_partition=0)
+    with pytest.raises(ValueError, match="partition token budget"):
+        WorkerProcess._partitioned_prefill_chunks(
+            [request], max_batch=4, max_requests_per_partition=2, max_tokens_per_partition=10,
+        )
+
+
+def test_worker_uses_executor_packed_prefill_limits():
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.model_record = SimpleNamespace(runtime_model=object())
+    worker.executor = SimpleNamespace(
+        max_prefill_batch_size=8,
+        max_prefill_requests_per_partition=2,
+        max_prefill_tokens_per_partition=16,
+    )
+    dispatched = []
+    worker._batch_prefill = lambda chunk, model, tokens: dispatched.append(chunk)
+    requests = [
+        PrefillRequest(str(index), [1] * 8, 0, [], cache_partition=index % 4)
+        for index in range(8)
+    ]
+    worker._execute_step(StepCommand(
+        new_requests=[], prefill_requests=requests, decode_requests=[], finished_request_ids=[],
+    ))
+    assert dispatched == [requests]
+
+
 def test_worker_releases_preempted_state_before_same_command_reregistration():
     released: list[str] = []
     results: list[bytes] = []
     worker = WorkerProcess.__new__(WorkerProcess)
     worker.executor = SimpleNamespace(release_finished_requests=released.extend)
+    # __new__ bypasses __init__, which is what normally provides sampler.
+    worker.sampler = None
     worker._req_cache = {
         "req": NewRequestData("req", [0], 0.0, 1.0, None),
     }

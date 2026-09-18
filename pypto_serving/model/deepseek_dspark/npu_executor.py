@@ -199,6 +199,15 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         compile_kernels: bool = False,
         num_speculative_tokens: int = 0,
     ) -> None:
+        self._prefill_requests_per_partition = int(
+            os.environ.get("PYPTO_DSPARK_PREFILL_MAX_REQUESTS", "1")
+        )
+        max_prefill_requests = DSparkCacheLayout().prefill_requests
+        if not 1 <= self._prefill_requests_per_partition <= max_prefill_requests:
+            raise ValueError(
+                "PYPTO_DSPARK_PREFILL_MAX_REQUESTS must be in "
+                f"[1, {max_prefill_requests}]"
+            )
         worker_device_ids = tuple(device_ids) if device_ids is not None else (int(device_id),)
         super().__init__(
             kv_cache_manager,
@@ -230,8 +239,16 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
 
     @property
     def max_prefill_batch_size(self) -> int:
-        """One prefill request per TP group."""
-        return DSparkCacheLayout().prefill_batch
+        """Global packed-prefill request capacity."""
+        return DSparkCacheLayout().partitions * self.max_prefill_requests_per_partition
+
+    @property
+    def max_prefill_requests_per_partition(self) -> int:
+        return self._prefill_requests_per_partition
+
+    @property
+    def max_prefill_tokens_per_partition(self) -> int:
+        return DSparkCacheLayout().prefill_tokens
 
     @property
     def supports_device_sampling(self) -> bool:
@@ -296,7 +313,9 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             raise ValueError(
                 "DeepSeekV4DSparkPyptoExecutor requires the W8A8 compressed-tensors checkpoint"
             )
-        layout = DSparkCacheLayout()
+        layout = DSparkCacheLayout(
+            prefill_requests=min(model.runtime.max_batch_size, self.max_prefill_requests_per_partition),
+        )
         layout.validate_runtime(model.config, model.runtime, self._device_ids)
         compress_ratios = tuple(int(ratio) for ratio in metadata["compress_ratios"])
         if len(compress_ratios) < model.config.num_hidden_layers + 1:

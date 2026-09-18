@@ -57,10 +57,29 @@ Validated constraints (enforced at startup):
   surfaces as an opaque AICore 507901; the depths therefore track the kernel
   constants (`IDX_MAX_BLOCKS`, `CMP_MAX_BLOCKS`,
   `COMPRESS_STATE_MAX_BLOCKS`), never the serving context ceiling.
-- **Prefill** runs one request per TP group per dispatch at the fixed
-  8192-token physical extent; logical rows are padded per the pypto-lib#1069
-  contract (zero-padded inputs, `-1` cache mappings, logical-only logit
-  rows). A group leader publishes one greedy-sampled token.
+- **Prefill** can pack multiple requests per TP group, within 16 requests and
+  8192 total chunk tokens per group (64 requests per dispatch across four
+  groups). These
+  are admission capacities, not a claim that every occupancy is hardware
+  validated. The worker splits dispatches at either limit; configured
+  `--max-num-seqs`, token budgets, and available cache can impose lower limits.
+  Request boundaries use `query_start_loc`; each request has separate block
+  tables, absolute positions, and a last-token output row on the group leader.
+  The physical token extent is the largest packed group length rounded up to
+  TP4 alignment, not the per-request context limit. Padding has zero inputs,
+  synthetic positions, and `-1` cache mappings. Request metadata backing
+  capacity is capped by configured concurrency; dispatch descriptors bind
+  only the live request-axis extent, with repeated terminal boundaries for
+  groups containing fewer requests.
+  Packed prefill is experimental: set `PYPTO_DSPARK_PREFILL_MAX_REQUESTS`
+  to the desired per-group limit (1-16). The default remains 1, preserving
+  one request per group per dispatch. A 32-request offline run with ragged
+  33-512 token prompts, 128-token chunked prefill, and K=7 speculation
+  completed end-to-end with correct token accounting at eight requests per
+  group. Intermittent EP16 prefill stalls reproduce without packed prefill
+  (single-request controls and the kernel-side golden fixture fail the same
+  way), so they are not attributed to request packing; they are tracked in
+  pypto-lib#1213. The packed path stays opt-in pending that investigation.
 - **Decode** always runs the full 512-row group tile (16 requests x 8 rows
   per rank). Row 0 of each request carries the committed token and is the
   only accepted row in this milestone (one token per step); rows 1-7 carry
@@ -143,6 +162,14 @@ seven query rows never aliases itself at any alignment. Blocks 384-389 hold a
 shared read-only zero-initialized filler history; filler batch rows publish
 nothing (`-1` slots, token 0, `num_sampled = 0`). Leases free on completion,
 abort, and preemption; a re-admitted re-prefill starts a fresh incarnation.
+
+**Packed-prefill seeding.** Backbone hidden rows are extracted by each
+request's packed interval, including intervals crossing TP rank bands. Each
+request retains its own last 128 prompt rows. The drafter seed ABI holds one
+context/lease per group, so terminal-prefill requests seed in waves containing
+at most one request per group; a later request cannot overwrite another
+request's seed context. This does not fix the known inactive-group decode
+`TENSOR_WAIT_TIMEOUT` seen when an active batch shrinks from four to three.
 
 **Verify staging (eager publish).** Speculative decode stages the pending
 drafts into verify rows 1..7 and publishes all eight rows of the window (raw

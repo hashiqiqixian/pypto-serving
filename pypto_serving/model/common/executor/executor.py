@@ -70,6 +70,16 @@ class ModelExecutor(ABC):
         return None
 
     @property
+    def max_prefill_requests_per_partition(self) -> int:
+        """Return the request limit within each partition of a bounded dispatch."""
+        return 1
+
+    @property
+    def max_prefill_tokens_per_partition(self) -> int | None:
+        """Return the packed token budget per cache partition, if any."""
+        return None
+
+    @property
     def supports_async_decode_prepare(self) -> bool:
         """Return whether decode metadata can be prepared ahead of execution.
 
