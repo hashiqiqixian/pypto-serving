@@ -27,6 +27,7 @@ from pypto_serving.config.types import (
     SamplingParams,
 )
 from pypto_serving.serving.utils.gc_utils import freeze_gc_heap
+from pypto_serving.serving.utils.env import configure_runtime_logging
 from pypto_serving.serving.server.ipc import (
     PLACEHOLDER_TOKEN,
     DecodeRequest,
@@ -1039,13 +1040,7 @@ def _worker_entry(
         stream=sys.stderr,
         force=True,
     )
-    for _n in ("simpler_setup", "pypto", "simpler"):
-        logging.getLogger(_n).setLevel(logging.WARNING)
-    # Debug hook: Worker.init() snapshots the "simpler" logger threshold and
-    # pushes it to the device (stall snapshots need DEBUG); override via env.
-    _simpler_level = os.environ.get("PYPTO_SIMPLER_LOG_LEVEL", "").strip().upper()
-    if _simpler_level:
-        logging.getLogger("simpler").setLevel(_simpler_level)
+    configure_runtime_logging()
 
     worker = WorkerProcess(config, input_queue, output_queue, profile_output_queue)
     try:

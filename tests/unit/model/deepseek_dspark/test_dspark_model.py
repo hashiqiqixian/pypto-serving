@@ -18,6 +18,7 @@ import torch
 
 from pypto_serving.config.types import DecodeBatch, PrefillBatch
 from pypto_serving.model.deepseek_dspark import task_args as task_args_module
+from pypto_serving.model.deepseek_dspark import npu_executor as executor_module
 from pypto_serving.model.deepseek_dspark import npu_runner as runner_module
 from pypto_serving.model.deepseek_dspark.npu_executor import DeepSeekV4DSparkPyptoExecutor
 from pypto_serving.model.deepseek_dspark.npu_runner import (
@@ -123,23 +124,32 @@ def _block_rows(count: int) -> list[dict[str, list[int]]]:
     return rows
 
 
-@pytest.mark.parametrize("limit", [None, "2", "64"])
-def test_packed_prefill_executor_limits_are_opt_in(monkeypatch, limit):
-    monkeypatch.delenv("PYPTO_DSPARK_PREFILL_MAX_REQUESTS", raising=False)
-    if limit is not None:
-        monkeypatch.setenv("PYPTO_DSPARK_PREFILL_MAX_REQUESTS", limit)
+@pytest.mark.parametrize("max_batch_size, per_group", [(1, 1), (32, 32), (256, 64)])
+def test_packed_prefill_executor_limits_follow_runtime(monkeypatch, max_batch_size, per_group):
+    # A stale environment toggle must not override the runtime batch capacity.
+    monkeypatch.setenv("PYPTO_DSPARK_PREFILL_MAX_REQUESTS", "1")
+    monkeypatch.setattr(executor_module, "DSparkWeightStore", lambda **_kwargs: SimpleNamespace(
+        validate_startup_contract=lambda **_kwargs: None,
+    ))
     executor = DeepSeekV4DSparkPyptoExecutor(device_ids=range(16))
-    expected = int(limit or 1)
-    assert executor.max_prefill_requests_per_partition == expected
-    assert executor.max_prefill_batch_size == 4 * expected
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            hidden_size=4096, num_hidden_layers=43, num_attention_heads=64,
+            num_key_value_heads=1, head_dim=512, vocab_size=129280,
+        ),
+        runtime=SimpleNamespace(max_batch_size=max_batch_size, page_size=32, max_seq_len=1024),
+        extra={
+            "family": "deepseek_v4", "checkpoint_format": "w8a8-compressed-tensors",
+            "compress_ratios": (0,) * 44, "weight_map": {}, "model_dir": "unused",
+        },
+    )
+    compiled = executor._compile_model(model)
+    executor._compiled["model"] = compiled
+    assert compiled.layout.prefill_requests == per_group
+    assert compiled.layout.prefill_batch == max_batch_size
+    assert executor.max_prefill_requests_per_partition == per_group
+    assert executor.max_prefill_batch_size == max_batch_size
     assert executor.max_prefill_tokens_per_partition == 8192
-
-
-@pytest.mark.parametrize("limit", ["0", "65", "-1", "invalid"])
-def test_packed_prefill_executor_rejects_invalid_limits(monkeypatch, limit):
-    monkeypatch.setenv("PYPTO_DSPARK_PREFILL_MAX_REQUESTS", limit)
-    with pytest.raises(ValueError):
-        DeepSeekV4DSparkPyptoExecutor(device_ids=range(16))
 
 
 def test_prefill_to_decode_staging_contract() -> None:

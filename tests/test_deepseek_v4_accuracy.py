@@ -427,16 +427,18 @@ def test_deepseek_v4_http_completion_contract(
                     assert response.get("model") == MODEL_ID
                     choices = response.get("choices")
                     assert isinstance(choices, list) and len(choices) == 1
+                    text = choices[0].get("text")
+                    assert isinstance(text, str) and text.strip(), (
+                        f"Expected non-empty completion text, got {text!r}"
+                    )
                     assert choices[0].get("finish_reason") == "length"
                     usage = response.get("usage", {})
                     assert usage.get("completion_tokens") == case.max_new_tokens
                     if case.prompt_tokens is not None:
                         assert usage.get("prompt_tokens") == case.prompt_tokens
-                    # Completion text is deliberately not compared: accepted
-                    # NPU kernel nondeterminism makes otherwise identical
-                    # greedy runs diverge, so only the serving contract
-                    # (finish reason and token accounting) is asserted, like
-                    # the DSpark accuracy cases.
+                    # NPU nondeterminism makes exact completion text vary.
+                    # Check text presence, finish reason and token accounting
+                    # without pinning a particular continuation.
 
                 if enable_prefix_caching:
                     prompt_tokens = responses[0].get("usage", {}).get("prompt_tokens", 0)

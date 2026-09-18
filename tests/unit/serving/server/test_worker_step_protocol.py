@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+import logging
 import signal
 import threading
 from queue import Queue
@@ -485,14 +486,22 @@ def test_worker_reclaims_device_accepted_tokens_after_request_cache_release():
 
 
 @pytest.mark.parametrize("busy_loop_fails", [False, True])
-def test_worker_entry_always_closes_worker(monkeypatch, busy_loop_fails):
+@pytest.mark.parametrize("log_level, expected_level", [
+    ("", logging.WARNING), (" debug ", logging.DEBUG), ("invalid", logging.WARNING),
+])
+def test_worker_entry_always_closes_worker(monkeypatch, caplog, busy_loop_fails, log_level, expected_level):
     calls = SimpleNamespace(close=0, ready=0)
+    monkeypatch.setenv("PYPTO_SIMPLER_LOG_LEVEL", log_level)
+    monkeypatch.setattr(logging, "basicConfig", lambda **_kwargs: None)
+    for name in ("simpler_setup", "pypto", "simpler"):
+        monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
 
     class FakeWorker:
         def __init__(self, config, input_queue, output_queue, profile_output_queue=None):
             pass
 
         def init_device_and_model(self):
+            assert logging.getLogger("simpler").level == expected_level
             return 7
 
         def busy_loop(self):
@@ -518,3 +527,5 @@ def test_worker_entry_always_closes_worker(monkeypatch, busy_loop_fails):
     assert num_pages_value.value == 7
     assert calls.ready >= 1
     assert calls.close == 1
+    if log_level == "invalid":
+        assert "Invalid PYPTO_SIMPLER_LOG_LEVEL" in caplog.text
