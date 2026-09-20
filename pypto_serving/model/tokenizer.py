@@ -41,6 +41,11 @@ class TokenizerAdapter:
         raise NotImplementedError
 
     @property
+    def all_special_ids(self) -> tuple[int, ...]:
+        """Return token IDs that must not leak into public text."""
+        return ()
+
+    @property
     def output_parser_id(self) -> str | None:
         """Return the Serving output parser registered for this tokenizer."""
         return None
@@ -140,6 +145,11 @@ class TransformersTokenizerAdapter(TokenizerAdapter):
     def get_vocab(self) -> dict[str, int]:
         """Return a stable copy of the wrapped tokenizer vocabulary."""
         return dict(self.tokenizer.get_vocab())
+
+    @property
+    def all_special_ids(self) -> tuple[int, ...]:
+        """Return all special-token IDs exposed by the wrapped tokenizer."""
+        return tuple(int(token_id) for token_id in self.tokenizer.all_special_ids)
 
     def apply_chat_template(self, messages: list[dict[str, str]], **kwargs) -> str:
         """Apply the Hugging Face chat template loaded with the tokenizer."""

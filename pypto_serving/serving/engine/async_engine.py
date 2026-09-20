@@ -146,6 +146,12 @@ class _RequestContext:
     detok_prefix_offset: int = 0
     detok_read_offset: int = 0
     output_parser: object | None = None
+    parser_detok_parts: list[str] = field(default_factory=list)
+    parser_detok_prefix_offset: int = 0
+    parser_detok_read_offset: int = 0
+    parser_token_offset: int = 0
+    parser_reasoning_parts: list[str] = field(default_factory=list)
+    parser_content_parts: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -153,6 +159,8 @@ class TokenOutput:
     token_id: int | None = None
     text: str = ""
     reasoning: str = ""
+    text_delta: str = ""
+    reasoning_delta: str = ""
     finished: bool = False
     finish_reason: str = ""
     # Authoritative token counts from the engine, so the HTTP layer can report
@@ -828,7 +836,13 @@ class ReplicaEngineCore:
             if ctx is None:
                 continue
 
+            previous_text = ctx.detok_text
             text = self._detokenize_incrementally(ctx)
+            text_delta = (
+                text[len(previous_text) :]
+                if text.startswith(previous_text)
+                else ""
+            )
 
             if not req_output.finished and ctx.request.stop_strings:
                 for stop in ctx.request.stop_strings:
@@ -852,10 +866,53 @@ class ReplicaEngineCore:
             # Stop detection above operates on the original generated text.
             # Semantic parsing only changes the public presentation channels.
             reasoning = ""
+            reasoning_delta = ""
             if ctx.output_parser is not None:
-                parsed = ctx.output_parser.parse(ctx.request.output_token_ids)
-                text = parsed.content
-                reasoning = parsed.reasoning
+                if ctx.stream:
+                    parser_text_delta = self._detokenize_parser_incrementally(ctx)
+                    token_ids = ctx.request.output_token_ids
+                    delta_token_ids = token_ids[ctx.parser_token_offset :]
+                    ctx.parser_token_offset = len(token_ids)
+                    parsed = ctx.output_parser.feed(
+                        parser_text_delta,
+                        delta_token_ids,
+                    )
+                    reasoning_delta = parsed.reasoning
+                    text_delta = parsed.content
+
+                    if req_output.finished:
+                        final_parser_text = self._finalize_parser_detokenization(ctx)
+                        if final_parser_text:
+                            tail = ctx.output_parser.feed(final_parser_text, ())
+                            reasoning_delta += tail.reasoning
+                            text_delta += tail.content
+                        tail = ctx.output_parser.finish()
+                        reasoning_delta += tail.reasoning
+                        text_delta += tail.content
+
+                    if reasoning_delta:
+                        ctx.parser_reasoning_parts.append(reasoning_delta)
+                    if text_delta:
+                        ctx.parser_content_parts.append(text_delta)
+                    if req_output.finished:
+                        reasoning = "".join(ctx.parser_reasoning_parts)
+                        text = "".join(ctx.parser_content_parts)
+                    else:
+                        reasoning = ""
+                        text = ""
+                elif req_output.finished:
+                    raw_text = self.tokenizer.decode(
+                        ctx.request.output_token_ids,
+                        skip_special_tokens=False,
+                    )
+                    parsed = ctx.output_parser.parse_complete(
+                        raw_text,
+                        ctx.request.output_token_ids,
+                    )
+                    text = parsed.content
+                    reasoning = parsed.reasoning
+                    text_delta = text
+                    reasoning_delta = reasoning
 
             # Non-streaming requests only need the final output: suppress
             # intermediate ones to save a queue push and HTTP-coroutine wake-up
@@ -868,6 +925,8 @@ class ReplicaEngineCore:
                 token_id=req_output.new_token_id,
                 text=text,
                 reasoning=reasoning,
+                text_delta=text_delta,
+                reasoning_delta=reasoning_delta,
                 finished=req_output.finished,
                 finish_reason=req_output.finish_reason,
                 prompt_tokens=ctx.request.num_prompt_tokens,
@@ -887,33 +946,72 @@ class ReplicaEngineCore:
         the full output_token_ids every step (O(N^2) over a generation).
         Returns the cumulative decoded text so far.
         """
-        output_ids = ctx.request.output_token_ids
-        if not output_ids:
-            return ctx.detok_text
-
-        # Decode a short window: [prefix_offset:] gives context so the delta is
-        # rendered identically to a full decode; the delta is the tail beyond
-        # what [prefix_offset:read_offset] already covered.
-        prefix_ids = output_ids[ctx.detok_prefix_offset: ctx.detok_read_offset]
-        new_ids = output_ids[ctx.detok_prefix_offset:]
-
-        prefix_text = self.tokenizer.decode(prefix_ids) if prefix_ids else ""
-        new_text = self.tokenizer.decode(new_ids)
-
-        if len(new_text) <= len(prefix_text) or new_text.endswith("�"):
-            # No new complete text yet (e.g. mid multi-token character); wait for
-            # more tokens without advancing offsets.
-            return ctx.detok_text
-
-        delta = new_text[len(prefix_text):]
-        ctx.detok_text += delta
-        # Keep a small sliding context window (last few tokens) rather than
-        # collapsing the prefix onto the read offset. A 1-2 token prefix loses
-        # boundary context and can corrupt spacing / multi-token characters for
-        # SentencePiece / byte-level BPE tokenizers.
-        ctx.detok_read_offset = len(output_ids)
-        ctx.detok_prefix_offset = max(0, ctx.detok_read_offset - 3)
+        (
+            ctx.detok_text,
+            ctx.detok_prefix_offset,
+            ctx.detok_read_offset,
+            _,
+        ) = self._advance_detokenization(
+            ctx.request.output_token_ids,
+            text=ctx.detok_text,
+            prefix_offset=ctx.detok_prefix_offset,
+            read_offset=ctx.detok_read_offset,
+            skip_special_tokens=True,
+        )
         return ctx.detok_text
+
+    def _detokenize_parser_incrementally(self, ctx: _RequestContext) -> str:
+        """Return newly released raw text for one stateful output parser."""
+        (
+            _,
+            ctx.parser_detok_prefix_offset,
+            ctx.parser_detok_read_offset,
+            delta,
+        ) = self._advance_detokenization(
+            ctx.request.output_token_ids,
+            text="",
+            prefix_offset=ctx.parser_detok_prefix_offset,
+            read_offset=ctx.parser_detok_read_offset,
+            skip_special_tokens=False,
+        )
+        if delta:
+            ctx.parser_detok_parts.append(delta)
+        return delta
+
+    def _advance_detokenization(
+        self,
+        output_ids: Sequence[int],
+        *,
+        text: str,
+        prefix_offset: int,
+        read_offset: int,
+        skip_special_tokens: bool,
+    ) -> tuple[str, int, int, str]:
+        """Advance one bounded-context detokenizer and return its text delta."""
+        if not output_ids:
+            return text, prefix_offset, read_offset, ""
+
+        prefix_ids = output_ids[prefix_offset:read_offset]
+        new_ids = output_ids[prefix_offset:]
+
+        def decode(token_ids: Sequence[int]) -> str:
+            if skip_special_tokens:
+                return self.tokenizer.decode(token_ids)
+            return self.tokenizer.decode(
+                token_ids,
+                skip_special_tokens=False,
+            )
+
+        prefix_text = decode(prefix_ids) if prefix_ids else ""
+        new_text = decode(new_ids)
+        if len(new_text) <= len(prefix_text) or new_text.endswith("�"):
+            return text, prefix_offset, read_offset, ""
+
+        delta = new_text[len(prefix_text) :]
+        text += delta
+        read_offset = len(output_ids)
+        prefix_offset = max(0, read_offset - 3)
+        return text, prefix_offset, read_offset, delta
 
     def _finalize_detokenization(self, ctx: _RequestContext) -> str:
         """Return the authoritative final text for a finished request.
@@ -931,6 +1029,30 @@ class ReplicaEngineCore:
         ctx.detok_read_offset = len(output_ids)
         ctx.detok_prefix_offset = max(0, ctx.detok_read_offset - 3)
         return final_text
+
+    def _finalize_parser_detokenization(self, ctx: _RequestContext) -> str:
+        """Flush raw parser text without changing an already streamed prefix."""
+        output_ids = ctx.request.output_token_ids
+        if not output_ids:
+            return ""
+        final_text = self.tokenizer.decode(
+            output_ids,
+            skip_special_tokens=False,
+        )
+        streamed_text = "".join(ctx.parser_detok_parts)
+        if not final_text.startswith(streamed_text):
+            raise ValueError(
+                "final parser detokenization changed an already emitted prefix"
+            )
+        delta = final_text[len(streamed_text) :]
+        if delta:
+            ctx.parser_detok_parts.append(delta)
+        ctx.parser_detok_read_offset = len(output_ids)
+        ctx.parser_detok_prefix_offset = max(
+            0,
+            ctx.parser_detok_read_offset - 3,
+        )
+        return delta
 
     def _shutdown_worker(self, *, timeout: float) -> None:
         input_q = self._input_queue

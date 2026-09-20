@@ -400,14 +400,18 @@ class ServingServer:
                 config,
                 output_parser_spec=output_parser_spec,
             ):
-                delta = output.text[len(prev_text):] if output.text else ""
-                prev_text = output.text or prev_text
-                reasoning_delta = (
-                    output.reasoning[len(prev_reasoning):]
-                    if output.reasoning
-                    else ""
-                )
-                prev_reasoning = output.reasoning or prev_reasoning
+                if output_parser_spec is not None:
+                    delta = output.text_delta
+                    reasoning_delta = output.reasoning_delta
+                else:
+                    delta = output.text[len(prev_text):] if output.text else ""
+                    prev_text = output.text or prev_text
+                    reasoning_delta = (
+                        output.reasoning[len(prev_reasoning):]
+                        if output.reasoning
+                        else ""
+                    )
+                    prev_reasoning = output.reasoning or prev_reasoning
                 finish_reason = self._map_finish_reason(output.finish_reason) if output.finished else None
 
                 chunk = ChatCompletionResponse(

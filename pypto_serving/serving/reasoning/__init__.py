@@ -11,6 +11,7 @@
 from .parser import (
     DeepSeekV4ReasoningParser,
     OutputParserSpec,
+    ParsedDelta,
     ParsedOutput,
     create_output_parser,
 )
@@ -18,6 +19,7 @@ from .parser import (
 __all__ = (
     "DeepSeekV4ReasoningParser",
     "OutputParserSpec",
+    "ParsedDelta",
     "ParsedOutput",
     "create_output_parser",
 )

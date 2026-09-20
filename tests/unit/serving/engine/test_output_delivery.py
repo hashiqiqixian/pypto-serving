@@ -114,12 +114,20 @@ def test_process_step_output_splits_reasoning_from_k7_token_burst():
     class _ReasoningTokenizer:
         vocab = {"<think>": 90, "</think>": 91}
         pieces = {1: "先", 2: "思考", 3: "答案"}
+        all_special_ids = (90, 91)
 
         def get_vocab(self):
             return dict(self.vocab)
 
         def decode(self, ids, *, skip_special_tokens=True):
-            return "".join(self.pieces.get(token_id, "") for token_id in ids)
+            parts = []
+            for token_id in ids:
+                if token_id in self.vocab.values():
+                    if not skip_special_tokens:
+                        parts.append({90: "<think>", 91: "</think>"}[token_id])
+                    continue
+                parts.append(self.pieces.get(token_id, ""))
+            return "".join(parts)
 
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
     core.tokenizer = _ReasoningTokenizer()
@@ -151,19 +159,142 @@ def test_process_step_output_splits_reasoning_from_k7_token_burst():
     output = ctx.queue.get_nowait()
     assert output.reasoning == "先思考"
     assert output.text == "答案"
+    assert output.reasoning_delta == "先思考"
+    assert output.text_delta == "答案"
     assert output.token_ids == (1, 2, 91, 3)
+
+
+def test_process_step_output_keeps_incremental_reasoning_state() -> None:
+    class _ReasoningTokenizer:
+        vocab = {"<think>": 90, "</think>": 91}
+        pieces = {1: "先", 2: "思考", 3: "答案"}
+        all_special_ids = (90, 91)
+
+        def get_vocab(self):
+            return dict(self.vocab)
+
+        def decode(self, ids, *, skip_special_tokens=True):
+            parts = []
+            for token_id in ids:
+                if token_id in self.vocab.values():
+                    if not skip_special_tokens:
+                        parts.append({90: "<think>", 91: "</think>"}[token_id])
+                    continue
+                parts.append(self.pieces.get(token_id, ""))
+            return "".join(parts)
+
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.tokenizer = _ReasoningTokenizer()
+    core._pending_free_ids = []
+    core.scheduler = _ScriptedScheduler(
+        [
+            RequestOutput(request_id="r", new_token_id=2),
+            RequestOutput(
+                request_id="r",
+                new_token_id=3,
+                finished=True,
+                finish_reason="FINISHED_LENGTH",
+            ),
+        ]
+    )
+    request = Request(request_id="r", prompt_token_ids=[9], max_new_tokens=4)
+    request.output_token_ids.extend([1, 2])
+    ctx = _RequestContext(
+        request=request,
+        stream=True,
+        output_parser=create_output_parser(
+            OutputParserSpec("deepseek_v4", "reasoning"),
+            core.tokenizer,
+        ),
+    )
+    core._request_contexts = {"r": ctx}
+
+    core._process_step_output(SchedulerOutput(scheduled_requests=[]), {})
+    first = ctx.queue.get_nowait()
+    assert first.reasoning_delta == "先思考"
+    assert first.text_delta == ""
+    assert first.reasoning == first.text == ""
+
+    request.output_token_ids.extend([91, 3])
+    core._process_step_output(SchedulerOutput(scheduled_requests=[]), {})
+    final = ctx.queue.get_nowait()
+    assert final.reasoning_delta == ""
+    assert final.text_delta == "答案"
+    assert final.reasoning == "先思考"
+    assert final.text == "答案"
+
+
+def test_parser_detokenization_work_is_linear_in_generated_tokens() -> None:
+    class _CountingTokenizer:
+        vocab = {"<think>": 90, "</think>": 91}
+        all_special_ids = (90, 91)
+
+        def __init__(self):
+            self.decoded_token_count = 0
+
+        def get_vocab(self):
+            return dict(self.vocab)
+
+        def decode(self, ids, *, skip_special_tokens=True):
+            self.decoded_token_count += len(ids)
+            parts = []
+            for token_id in ids:
+                if token_id in self.vocab.values():
+                    if not skip_special_tokens:
+                        parts.append({90: "<think>", 91: "</think>"}[token_id])
+                    continue
+                parts.append("x")
+            return "".join(parts)
+
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.tokenizer = _CountingTokenizer()
+    request = Request(request_id="r", prompt_token_ids=[9], max_new_tokens=128)
+    ctx = _RequestContext(
+        request=request,
+        stream=True,
+        output_parser=create_output_parser(
+            OutputParserSpec("deepseek_v4", "reasoning"),
+            core.tokenizer,
+        ),
+    )
+
+    token_count = 128
+    for _ in range(token_count):
+        request.output_token_ids.append(1)
+        text_delta = core._detokenize_parser_incrementally(ctx)
+        new_ids = request.output_token_ids[ctx.parser_token_offset :]
+        ctx.parser_token_offset = len(request.output_token_ids)
+        ctx.output_parser.feed(text_delta, new_ids)
+
+    tail = core._finalize_parser_detokenization(ctx)
+    if tail:
+        ctx.output_parser.feed(tail, ())
+    ctx.output_parser.finish()
+
+    # The bounded three-token detokenizer context visits at most a constant
+    # number of IDs per step, plus one final full decode. A cumulative-prefix
+    # parser would visit roughly N*(N+1)/2 IDs and fail this bound.
+    assert core.tokenizer.decoded_token_count <= 9 * token_count
 
 
 def test_stop_string_detection_precedes_reasoning_presentation_split():
     class _ReasoningTokenizer:
         vocab = {"<think>": 90, "</think>": 91}
         pieces = {1: "先", 2: "思考"}
+        all_special_ids = (90, 91)
 
         def get_vocab(self):
             return dict(self.vocab)
 
         def decode(self, ids, *, skip_special_tokens=True):
-            return "".join(self.pieces.get(token_id, "") for token_id in ids)
+            parts = []
+            for token_id in ids:
+                if token_id in self.vocab.values():
+                    if not skip_special_tokens:
+                        parts.append({90: "<think>", 91: "</think>"}[token_id])
+                    continue
+                parts.append(self.pieces.get(token_id, ""))
+            return "".join(parts)
 
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
     core.tokenizer = _ReasoningTokenizer()

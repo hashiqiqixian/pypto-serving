@@ -24,6 +24,7 @@ class _Tokenizer:
         4: "</think>",  # ordinary text token, not the control-token ID
         5: "完成",
     }
+    all_special_ids = (90, 91, 92)
 
     def get_vocab(self):
         return dict(self.vocab)
@@ -50,26 +51,40 @@ def _parser(initial_state="reasoning", *, include_reasoning=True):
     )
 
 
+def _parse(token_ids, initial_state="reasoning", *, include_reasoning=True):
+    tokenizer = _Tokenizer()
+    parser = DeepSeekV4ReasoningParser(
+        tokenizer,
+        OutputParserSpec(
+            parser_id="deepseek_v4",
+            initial_state=initial_state,
+            include_reasoning=include_reasoning,
+        ),
+    )
+    text = tokenizer.decode(token_ids, skip_special_tokens=False)
+    return parser.parse_complete(text, token_ids)
+
+
 def test_prompt_opened_reasoning_splits_k7_burst_at_control_token() -> None:
-    parsed = _parser().parse((1, 2, 91, 3, 5, 92))
+    parsed = _parse((1, 2, 91, 3, 5, 92))
     assert parsed.reasoning == "先思考"
     assert parsed.content == "答案完成"
 
 
 def test_literal_marker_text_does_not_trigger_token_terminal() -> None:
-    parsed = _parser().parse((1, 4, 2, 91, 3))
+    parsed = _parse((1, 4, 2, 91, 3))
     assert parsed.reasoning == "先</think>思考"
     assert parsed.content == "答案"
 
 
 def test_content_mode_can_enter_reasoning_and_absorbs_duplicate_markers() -> None:
-    parsed = _parser("content").parse((3, 90, 90, 1, 91, 5))
+    parsed = _parse((3, 90, 90, 1, 91, 5), initial_state="content")
     assert parsed.reasoning == "先"
     assert parsed.content == "答案完成"
 
 
 def test_include_reasoning_hides_reasoning_without_leaking_to_content() -> None:
-    parsed = _parser(include_reasoning=False).parse((1, 2, 91, 3))
+    parsed = _parse((1, 2, 91, 3), include_reasoning=False)
     assert parsed.reasoning == ""
     assert parsed.content == "答案"
 
@@ -82,3 +97,41 @@ def test_missing_reasoning_terminal_fails_closed() -> None:
             tokenizer,
             OutputParserSpec("deepseek_v4", "reasoning"),
         )
+
+
+def test_streaming_parser_keeps_state_and_resolves_deferred_terminal() -> None:
+    parser = _parser()
+
+    first = parser.feed("先思考", (1, 2))
+    held = parser.feed("", (91,))
+    final = parser.feed("</think>答案完成", (3, 5))
+    flushed = parser.finish()
+
+    assert first.reasoning == "先思考"
+    assert held.reasoning == held.content == ""
+    assert final.reasoning == ""
+    assert final.content == "答案完成"
+    assert flushed.reasoning == flushed.content == ""
+
+
+def test_streaming_and_complete_parsing_are_equivalent_for_k7_bursts() -> None:
+    token_ids = (1, 2, 91, 3, 5, 92)
+    complete = _parse(token_ids)
+    parser = _parser()
+
+    deltas = [
+        parser.feed("先思考</think>答案", token_ids[:4]),
+        parser.feed("完成<eos>", token_ids[4:]),
+        parser.finish(),
+    ]
+
+    assert "".join(delta.reasoning for delta in deltas) == complete.reasoning
+    assert "".join(delta.content for delta in deltas) == complete.content
+
+
+def test_unreleased_reasoning_terminal_fails_closed_at_finish() -> None:
+    parser = _parser()
+    parser.feed("", (91,))
+
+    with pytest.raises(ValueError, match="terminal text was not released"):
+        parser.finish()

@@ -24,6 +24,7 @@ import pytest
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import TokenOutput
+from pypto_serving.serving.reasoning import OutputParserSpec
 from pypto_serving.serving.server.server import (
     ChatCompletionRequest,
     ChatMessage,
@@ -209,11 +210,12 @@ def test_chat_serializes_reasoning_and_freezes_parser_spec() -> None:
 def test_chat_stream_emits_independent_reasoning_and_content_deltas() -> None:
     engine = _FakeEngine(
         [
-            TokenOutput(reasoning="先"),
-            TokenOutput(reasoning="先分析"),
+            TokenOutput(reasoning_delta="先"),
+            TokenOutput(reasoning_delta="分析"),
             TokenOutput(
                 reasoning="先分析",
                 text="答案",
+                text_delta="答案",
                 finished=True,
                 finish_reason="FINISHED_EOS",
                 prompt_tokens=2,
@@ -231,6 +233,10 @@ def test_chat_stream_emits_independent_reasoning_and_content_deltas() -> None:
                 "prompt",
                 GenerateConfig(stream=True),
                 "test-model",
+                output_parser_spec=OutputParserSpec(
+                    "deepseek_v4",
+                    "reasoning",
+                ),
             )
         ]
 
