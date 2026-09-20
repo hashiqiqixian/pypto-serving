@@ -868,51 +868,66 @@ class ReplicaEngineCore:
             reasoning = ""
             reasoning_delta = ""
             if ctx.output_parser is not None:
-                if ctx.stream:
-                    parser_text_delta = self._detokenize_parser_incrementally(ctx)
-                    token_ids = ctx.request.output_token_ids
-                    delta_token_ids = token_ids[ctx.parser_token_offset :]
-                    ctx.parser_token_offset = len(token_ids)
-                    parsed = ctx.output_parser.feed(
-                        parser_text_delta,
-                        delta_token_ids,
-                    )
-                    reasoning_delta = parsed.reasoning
-                    text_delta = parsed.content
+                try:
+                    if ctx.stream:
+                        parser_text_delta = self._detokenize_parser_incrementally(ctx)
+                        token_ids = ctx.request.output_token_ids
+                        delta_token_ids = token_ids[ctx.parser_token_offset :]
+                        ctx.parser_token_offset = len(token_ids)
+                        parsed = ctx.output_parser.feed(
+                            parser_text_delta,
+                            delta_token_ids,
+                        )
+                        reasoning_delta = parsed.reasoning
+                        text_delta = parsed.content
 
-                    if req_output.finished:
-                        final_parser_text = self._finalize_parser_detokenization(ctx)
-                        if final_parser_text:
-                            tail = ctx.output_parser.feed(final_parser_text, ())
+                        if req_output.finished:
+                            final_parser_text = self._finalize_parser_detokenization(ctx)
+                            if final_parser_text:
+                                tail = ctx.output_parser.feed(final_parser_text, ())
+                                reasoning_delta += tail.reasoning
+                                text_delta += tail.content
+                            tail = ctx.output_parser.finish()
                             reasoning_delta += tail.reasoning
                             text_delta += tail.content
-                        tail = ctx.output_parser.finish()
-                        reasoning_delta += tail.reasoning
-                        text_delta += tail.content
 
-                    if reasoning_delta:
-                        ctx.parser_reasoning_parts.append(reasoning_delta)
-                    if text_delta:
-                        ctx.parser_content_parts.append(text_delta)
-                    if req_output.finished:
-                        reasoning = "".join(ctx.parser_reasoning_parts)
-                        text = "".join(ctx.parser_content_parts)
-                    else:
-                        reasoning = ""
-                        text = ""
-                elif req_output.finished:
-                    raw_text = self.tokenizer.decode(
-                        ctx.request.output_token_ids,
-                        skip_special_tokens=False,
+                        if reasoning_delta:
+                            ctx.parser_reasoning_parts.append(reasoning_delta)
+                        if text_delta:
+                            ctx.parser_content_parts.append(text_delta)
+                        if req_output.finished:
+                            reasoning = "".join(ctx.parser_reasoning_parts)
+                            text = "".join(ctx.parser_content_parts)
+                        else:
+                            reasoning = ""
+                            text = ""
+                    elif req_output.finished:
+                        raw_text = self.tokenizer.decode(
+                            ctx.request.output_token_ids,
+                            skip_special_tokens=False,
+                        )
+                        parsed = ctx.output_parser.parse_complete(
+                            raw_text,
+                            ctx.request.output_token_ids,
+                        )
+                        text = parsed.content
+                        reasoning = parsed.reasoning
+                        text_delta = text
+                        reasoning_delta = reasoning
+                except ValueError as exc:
+                    # Parser failures are request-local presentation errors.
+                    # Remove ownership before waking the consumer so its
+                    # add_request() finally block cannot schedule a duplicate
+                    # worker free while this loop explicitly releases state.
+                    self._request_contexts.pop(req_output.request_id, None)
+                    ctx.queue.put_nowait(exc)
+                    self.scheduler.abort_request(req_output.request_id)
+                    self._schedule_worker_free(req_output.request_id)
+                    logger.exception(
+                        "request %s output parser failed",
+                        req_output.request_id,
                     )
-                    parsed = ctx.output_parser.parse_complete(
-                        raw_text,
-                        ctx.request.output_token_ids,
-                    )
-                    text = parsed.content
-                    reasoning = parsed.reasoning
-                    text_delta = text
-                    reasoning_delta = reasoning
+                    continue
 
             # Non-streaming requests only need the final output: suppress
             # intermediate ones to save a queue push and HTTP-coroutine wake-up

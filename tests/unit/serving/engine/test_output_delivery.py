@@ -224,6 +224,73 @@ def test_process_step_output_keeps_incremental_reasoning_state() -> None:
     assert final.text == "答案"
 
 
+def test_process_step_output_contains_parser_failure_to_one_request() -> None:
+    class _Tokenizer:
+        def decode(self, ids, *, skip_special_tokens=True):
+            return "".join(str(token_id) for token_id in ids)
+
+    class _FailingParser:
+        def feed(self, delta_text, delta_token_ids):
+            return SimpleNamespace(reasoning="", content=delta_text)
+
+        def finish(self):
+            raise ValueError("malformed terminal tail")
+
+    class _TwoRequestScheduler:
+        def __init__(self):
+            self.aborted = []
+
+        def update_from_output(self, scheduler_output, new_tokens):
+            return [
+                RequestOutput(
+                    request_id="bad",
+                    new_token_id=1,
+                    finished=True,
+                    finish_reason="FINISHED_LENGTH",
+                ),
+                RequestOutput(
+                    request_id="good",
+                    new_token_id=2,
+                    finished=True,
+                    finish_reason="FINISHED_LENGTH",
+                ),
+            ]
+
+        def abort_request(self, request_id):
+            self.aborted.append(request_id)
+
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.tokenizer = _Tokenizer()
+    core._pending_free_ids = []
+    core.scheduler = _TwoRequestScheduler()
+
+    bad_request = Request(request_id="bad", prompt_token_ids=[9], max_new_tokens=1)
+    bad_request.output_token_ids.append(1)
+    bad_ctx = _RequestContext(
+        request=bad_request,
+        stream=True,
+        output_parser=_FailingParser(),
+    )
+    good_request = Request(request_id="good", prompt_token_ids=[9], max_new_tokens=1)
+    good_request.output_token_ids.append(2)
+    good_ctx = _RequestContext(request=good_request, stream=True)
+    core._request_contexts = {"bad": bad_ctx, "good": good_ctx}
+
+    core._process_step_output(SchedulerOutput(scheduled_requests=[]), {})
+
+    failure = bad_ctx.queue.get_nowait()
+    assert isinstance(failure, ValueError)
+    assert str(failure) == "malformed terminal tail"
+    assert "bad" not in core._request_contexts
+    assert core.scheduler.aborted == ["bad"]
+    assert core._pending_free_ids.count("bad") == 1
+
+    good_output = good_ctx.queue.get_nowait()
+    assert good_output.finished
+    assert good_output.text == "2"
+    assert core._pending_free_ids.count("good") == 1
+
+
 def test_parser_detokenization_work_is_linear_in_generated_tokens() -> None:
     class _CountingTokenizer:
         vocab = {"<think>": 90, "</think>": 91}
