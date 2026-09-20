@@ -44,15 +44,18 @@ class MtpAccuracyCase:
     top_k: int | None = None
     seed: int | None = None
     enable_prefix_caching: bool = False
+    expected_prefix_hit_tokens: int | None = None
 
 
-# K=1 uses EAGLE look-ahead, so a reusable 128-token prefix needs another
-# complete page after it. Repeating a common single-token fragment also keeps
-# this case above one 1024-token serving chunk and below the 2048-token limit.
-PREFIX_PROMPT = " and" * 1200 + " Huawei is"
+# With 1024-token chunks, a 1089-token prompt has a short final chunk that
+# completes the prior pending MTP state, making page 896..1023 reusable.
+# A 1202-token prompt has a 178-token final chunk: MTP only computes its tail,
+# leaving no complete reusable page, even after the ten generated tokens.
+PREFIX_HIT_PROMPT = " and" * 1087 + " Huawei is"
+PREFIX_MISS_PROMPT = " and" * 1200 + " Huawei is"
 
 # Keep the fused K=1 baseline, one standalone DeepSeek MTP decode shape, and
-# one NPU prefix-cache case. K=3 selects the S=4/B=4 standalone tile.
+# two NPU prefix-cache cases. K=3 selects the S=4/B=4 standalone tile.
 # Multi-request state and other MTP depths are covered by focused unit guards
 # without expanding this hardware feature gate.
 MTP_CASES = (
@@ -88,13 +91,22 @@ MTP_CASES = (
     ),
     MtpAccuracyCase(
         num_speculative_tokens=1,
-        prompt=PREFIX_PROMPT,
-        prompt_tokens=None,
+        prompt=PREFIX_HIT_PROMPT,
+        prompt_tokens=1089,
         max_new_tokens=10,
         enable_prefix_caching=True,
+        expected_prefix_hit_tokens=1024,
+    ),
+    MtpAccuracyCase(
+        num_speculative_tokens=1,
+        prompt=PREFIX_MISS_PROMPT,
+        prompt_tokens=1202,
+        max_new_tokens=10,
+        enable_prefix_caching=True,
+        expected_prefix_hit_tokens=0,
     ),
 )
-MTP_CASE_IDS = ("k1-fused", "k3-s4-b4", "k1-prefix-cache")
+MTP_CASE_IDS = ("k1-fused", "k3-s4-b4", "k1-prefix-cache-hit", "k1-prefix-cache-incomplete")
 
 STARTUP_TIMEOUT_SECONDS = int(os.environ.get("PYPTO_DSV4_STARTUP_TIMEOUT_SECONDS", "1800"))
 OVERALL_TIMEOUT_SECONDS = int(os.environ.get("PYPTO_DSV4_OVERALL_TIMEOUT_SECONDS", "2400"))
@@ -451,8 +463,13 @@ def test_deepseek_v4_http_completion_contract(
                 int(value)
                 for value in re.findall(r"prefix_cache_hit_tokens=(\d+)", log_text)
             ]
-            assert hits and max(hits) >= 128, (
-                "Repeated long prompt produced no observable grouped prefix-cache hit"
+            assert case.expected_prefix_hit_tokens is not None
+            # The first request is cold. Only the repeat may hit, and only
+            # when the donor produced a complete MTP page.
+            expected_hits = [case.expected_prefix_hit_tokens] if case.expected_prefix_hit_tokens else []
+            assert hits == expected_hits, (
+                f"Expected grouped prefix-cache hits {expected_hits}, got {hits} "
+                f"for a repeated {case.prompt_tokens}-token prompt"
             )
     except BaseException:
         _print_server_log(log_path)
@@ -510,8 +527,12 @@ def test_mtp_matrix_covers_fused_and_standalone_shapes() -> None:
     prefix_cases = tuple(case for case in MTP_CASES if case.enable_prefix_caching)
 
     assert non_prefix_depths == (1, 3)
-    assert len(prefix_cases) == 1
-    assert prefix_cases[0].num_speculative_tokens == 1
+    assert len(prefix_cases) == 2
+    assert all(case.num_speculative_tokens == 1 for case in prefix_cases)
+    assert [(case.prompt_tokens, case.expected_prefix_hit_tokens) for case in prefix_cases] == [
+        (1089, 1024),
+        (1202, 0),
+    ]
     assert (MTP_CASES[0].prompt_tokens, MTP_CASES[0].max_new_tokens) == (64, 128)
     assert (MTP_CASES[0].temperature, MTP_CASES[0].top_k, MTP_CASES[0].seed) == (
         0.2,
