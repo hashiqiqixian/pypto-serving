@@ -23,6 +23,9 @@ class _Tokenizer:
         3: "答案",
         4: "</think>",  # ordinary text token, not the control-token ID
         5: "完成",
+        6: "secret",
+        7: "�",
+        8: "好",
     }
     all_special_ids = (90, 91, 92)
 
@@ -31,12 +34,19 @@ class _Tokenizer:
 
     def decode(self, token_ids, *, skip_special_tokens=True):
         parts = []
-        for token_id in token_ids:
+        index = 0
+        while index < len(token_ids):
+            token_id = token_ids[index]
+            if tuple(token_ids[index : index + 2]) == (7, 8):
+                parts.append("好")
+                index += 2
+                continue
             if token_id in (90, 91, 92):
                 if not skip_special_tokens:
                     parts.append({90: "<think>", 91: "</think>", 92: "<eos>"}[token_id])
-                continue
-            parts.append(self.pieces[token_id])
+            else:
+                parts.append(self.pieces[token_id])
+            index += 1
         return "".join(parts)
 
 
@@ -111,6 +121,19 @@ def test_streaming_parser_keeps_state_and_resolves_deferred_terminal() -> None:
     assert held.reasoning == held.content == ""
     assert final.reasoning == ""
     assert final.content == "答案完成"
+    assert flushed.reasoning == flushed.content == ""
+
+
+def test_deferred_terminal_keeps_token_order_around_literal_lookalike() -> None:
+    parser = _parser()
+
+    held = parser.feed("", (4, 6, 91, 7))
+    resumed = parser.feed("</think>secret</think>好", (8,))
+    flushed = parser.finish()
+
+    assert held.reasoning == held.content == ""
+    assert resumed.reasoning == "</think>secret"
+    assert resumed.content == "好"
     assert flushed.reasoning == flushed.content == ""
 
 

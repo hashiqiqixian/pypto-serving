@@ -38,6 +38,29 @@ def test_fast_tokenizer_load_preserves_checkpoint_chat_template(tmp_path):
     assert tokenizer.kwargs["chat_template"] == "{{ messages[0].content }}"
 
 
+def test_fast_tokenizer_load_registers_backend_special_tokens(tmp_path):
+    class FakeTokenizer:
+        def __init__(self, tokenizer_file, **kwargs):
+            self.tokenizer_file = tokenizer_file
+            self.kwargs = kwargs
+
+    (tmp_path / "tokenizer.json").write_text(json.dumps({
+        "added_tokens": [
+            {"id": 0, "content": "<bos>", "special": True},
+            {"id": 2, "content": "<internal>", "special": True},
+            {"id": 3, "content": "ordinary", "special": False},
+        ],
+    }))
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({
+        "bos_token": {"content": "<bos>"},
+    }))
+
+    tokenizer = _load_fast_tokenizer_from_file(tmp_path, FakeTokenizer)
+
+    assert tokenizer.kwargs["bos_token"] == "<bos>"
+    assert tokenizer.kwargs["additional_special_tokens"] == ["<internal>"]
+
+
 def test_deepseek_v4_defaults_to_chat_mode():
     adapter = DeepSeekV4TokenizerAdapter(tokenizer=object())
 

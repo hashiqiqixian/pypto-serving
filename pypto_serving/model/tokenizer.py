@@ -223,13 +223,28 @@ def _load_fast_tokenizer_from_file(model_path: Path, tokenizer_cls: type) -> obj
     tokenizer_file = model_path / "tokenizer.json"
     if not tokenizer_file.exists():
         raise FileNotFoundError(f"Missing tokenizer.json in {model_path}")
+    tokenizer_payload = json.loads(tokenizer_file.read_text())
     config_path = model_path / "tokenizer_config.json"
     tokenizer_config = json.loads(config_path.read_text()) if config_path.exists() else {}
-    special_tokens = {
+    special_tokens: dict[str, object] = {
         name: _token_content(tokenizer_config.get(name))
         for name in ("bos_token", "eos_token", "pad_token", "unk_token")
         if _token_content(tokenizer_config.get(name)) is not None
     }
+    registered = set(special_tokens.values())
+    additional_special_tokens: list[str] = []
+    for token in tokenizer_payload.get("added_tokens", ()):
+        if not isinstance(token, dict) or token.get("special") is not True:
+            continue
+        content = token.get("content")
+        if (
+            isinstance(content, str)
+            and content not in registered
+        ):
+            additional_special_tokens.append(content)
+            registered.add(content)
+    if additional_special_tokens:
+        special_tokens["additional_special_tokens"] = additional_special_tokens
     chat_template = tokenizer_config.get("chat_template")
     if isinstance(chat_template, (str, dict)):
         special_tokens["chat_template"] = chat_template

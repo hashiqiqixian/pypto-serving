@@ -93,23 +93,67 @@ class _TokenTerminalScanner:
             token_id: tokenizer.decode([token_id], skip_special_tokens=False)
             for token_id in terminals
         }
-        self._deferred_terminals: list[_TerminalSegment] = []
-        self._deferred_text = ""
+        self._pending_token_ids: list[int] = []
+        self._pending_text = ""
 
     def reset(self) -> None:
-        self._deferred_terminals.clear()
-        self._deferred_text = ""
+        self._pending_token_ids.clear()
+        self._pending_text = ""
 
     def scan(
         self,
         delta_text: str,
         delta_token_ids: Sequence[int],
     ) -> list[_Segment]:
-        prefix, effective_text = self._resolve_deferred(delta_text)
-        if not any(int(token_id) in self._terminals for token_id in delta_token_ids):
-            if effective_text:
-                prefix.append(_TextSegment(effective_text))
-            return prefix
+        token_ids = self._pending_token_ids + [
+            int(token_id) for token_id in delta_token_ids
+        ]
+        effective_text = self._pending_text + delta_text
+        self._pending_token_ids = []
+        self._pending_text = ""
+
+        if not any(token_id in self._terminals for token_id in token_ids):
+            return [_TextSegment(effective_text)] if effective_text else []
+
+        decoded = self._decode_segments(token_ids)
+        if not effective_text:
+            self._defer(token_ids, "")
+            return []
+
+        aligned = self._align_to_text(effective_text, decoded)
+        if aligned is None:
+            self._defer(token_ids, effective_text)
+            return []
+        return aligned
+
+    def finish(self) -> list[_Segment]:
+        if not self._pending_token_ids:
+            result = [_TextSegment(self._pending_text)] if self._pending_text else []
+            self.reset()
+            return result
+
+        decoded = self._decode_segments(self._pending_token_ids)
+        if self._pending_text:
+            aligned = self._align_to_text(self._pending_text, decoded)
+            if aligned is not None:
+                self.reset()
+                return aligned
+
+        unresolved = [
+            segment.kind
+            for segment in decoded
+            if isinstance(segment, _TerminalSegment)
+            and (segment.kind != _DROP_TERMINAL or segment.text)
+        ]
+        if unresolved:
+            names = ", ".join(unresolved)
+            raise ValueError(f"reasoning terminal text was not released: {names}")
+        result = [_TextSegment(self._pending_text)] if self._pending_text else []
+        self.reset()
+        return result
+
+    def _decode_segments(self, token_ids: Sequence[int]) -> list[_Segment]:
+        """Decode token-ordered segments while preserving terminal positions."""
 
         decoded: list[_Segment] = []
         ordinary_ids: list[int] = []
@@ -125,8 +169,7 @@ class _TokenTerminalScanner:
             if text:
                 decoded.append(_TextSegment(text))
 
-        for raw_token_id in delta_token_ids:
-            token_id = int(raw_token_id)
+        for token_id in token_ids:
             terminal = self._terminals.get(token_id)
             if terminal is None:
                 ordinary_ids.append(token_id)
@@ -138,61 +181,17 @@ class _TokenTerminalScanner:
             if terminal != _DROP_TERMINAL or terminal_text:
                 decoded.append(_TerminalSegment(terminal, terminal_text))
         flush_ordinary()
+        return decoded
 
-        if not effective_text:
-            self._defer_terminals(decoded)
-            return prefix
-
-        prefix.extend(self._align_to_text(effective_text, decoded))
-        return prefix
-
-    def finish(self) -> list[_Segment]:
-        unresolved = [
-            terminal
-            for terminal in self._deferred_terminals
-            if terminal.kind != _DROP_TERMINAL
-        ]
-        if unresolved:
-            names = ", ".join(terminal.kind for terminal in unresolved)
-            raise ValueError(f"reasoning terminal text was not released: {names}")
-        result = [_TextSegment(self._deferred_text)] if self._deferred_text else []
-        self.reset()
-        return result
-
-    def _resolve_deferred(self, delta_text: str) -> tuple[list[_Segment], str]:
-        if not self._deferred_terminals:
-            if self._deferred_text:
-                delta_text = self._deferred_text + delta_text
-                self._deferred_text = ""
-            return [], delta_text
-
-        deferred = self._deferred_terminals
-        self._deferred_terminals = []
-        remaining = self._deferred_text + delta_text
-        self._deferred_text = ""
-        result: list[_Segment] = []
-
-        for index, terminal in enumerate(deferred):
-            if terminal.kind == _DROP_TERMINAL and not terminal.text:
-                continue
-            position = remaining.find(terminal.text)
-            if position < 0:
-                if terminal.kind == _DROP_TERMINAL:
-                    continue
-                self._deferred_text = remaining
-                self._deferred_terminals.extend(deferred[index:])
-                return result, ""
-            if position:
-                result.append(_TextSegment(remaining[:position]))
-            result.append(terminal)
-            remaining = remaining[position + len(terminal.text) :]
-        return result, remaining
+    def _defer(self, token_ids: Sequence[int], text: str) -> None:
+        self._pending_token_ids = list(token_ids)
+        self._pending_text = text
 
     def _align_to_text(
         self,
         delta_text: str,
         decoded: list[_Segment],
-    ) -> list[_Segment]:
+    ) -> list[_Segment] | None:
         reconstructed = "".join(segment.text for segment in decoded)
         if reconstructed:
             position = delta_text.find(reconstructed)
@@ -238,27 +237,11 @@ class _TokenTerminalScanner:
                 consumed = position + len(anchor.text)
                 continue
 
-            if anchor.kind == _DROP_TERMINAL:
-                continue
-            later_anchor_resolved = any(
-                later >= 0 for later in positions[index + 1 :]
-            )
-            if not later_anchor_resolved:
-                self._deferred_text = delta_text[consumed:]
-                consumed = len(delta_text)
-            self._deferred_terminals.append(anchor)
+            return None
 
         if consumed < len(delta_text):
             result.append(_TextSegment(delta_text[consumed:]))
         return result
-
-    def _defer_terminals(self, decoded: Sequence[_Segment]) -> None:
-        self._deferred_terminals.extend(
-            segment
-            for segment in decoded
-            if isinstance(segment, _TerminalSegment)
-            and (segment.kind != _DROP_TERMINAL or segment.text)
-        )
 
 
 class DeepSeekV4ReasoningParser:
