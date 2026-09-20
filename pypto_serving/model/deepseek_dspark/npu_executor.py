@@ -38,6 +38,7 @@ from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSPARK_FWD_NUM_LAYERS,
     DSPARK_NOISE_TOKEN_ID,
+    DSPARK_RANKS,
     DSPARK_SPECULATIVE_TOKENS,
     DSparkCacheLayout,
     DSparkCompiledKernels,
@@ -201,6 +202,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         device_ids: Sequence[int] | None = None,
         pypto_build_dir: str = "build_output",
         use_compile_cache: bool = False,
+        cache_ranks: int = DSPARK_RANKS,
         compile_kernels: bool = False,
         num_speculative_tokens: int = 0,
     ) -> None:
@@ -215,6 +217,10 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         self._kernel_dir = _find_pypto_lib_dspark_dir()
         self._compile_kernels = bool(compile_kernels)
         self._num_speculative_tokens = int(num_speculative_tokens)
+        # The serving topology is flag-driven: --ep is the rank count and this
+        # layout freezes every rank-derived axis (kernel import arguments,
+        # scheduler cache partitions, packed-prefill capacity) from it.
+        self._topology_layout = DSparkCacheLayout.for_ranks(cache_ranks)
         if self._num_speculative_tokens not in (0, DSPARK_SPECULATIVE_TOKENS):
             raise ValueError(
                 "DSpark speculation is fixed at K="
@@ -238,7 +244,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         """Global packed-prefill request capacity."""
         return min(
             (compiled.layout.prefill_batch for compiled in self._compiled.values()),
-            default=DSparkCacheLayout().prefill_batch,
+            default=self._topology_layout.prefill_batch,
         )
 
     @property
@@ -246,12 +252,12 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         # Admission must fit the metadata buffers of every registered model.
         return min(
             (compiled.layout.prefill_requests for compiled in self._compiled.values()),
-            default=DSparkCacheLayout().prefill_requests,
+            default=self._topology_layout.prefill_requests,
         )
 
     @property
     def max_prefill_tokens_per_partition(self) -> int:
-        return DSparkCacheLayout().prefill_tokens
+        return self._topology_layout.prefill_tokens
 
     @property
     def supports_device_sampling(self) -> bool:
@@ -317,8 +323,14 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                 "DeepSeekV4DSparkPyptoExecutor requires the W8A8 compressed-tensors checkpoint"
             )
         layout = DSparkCacheLayout(
-            prefill_batch=min(model.runtime.max_batch_size, DSparkCacheLayout().prefill_batch),
-            prefill_requests=min(model.runtime.max_batch_size, DSparkCacheLayout().prefill_requests),
+            ranks=self._topology_layout.ranks,
+            partitions=self._topology_layout.partitions,
+            prefill_batch=min(
+                model.runtime.max_batch_size, self._topology_layout.prefill_batch
+            ),
+            prefill_requests=min(
+                model.runtime.max_batch_size, self._topology_layout.prefill_requests
+            ),
         )
         layout.validate_runtime(model.config, model.runtime, self._device_ids)
         compress_ratios = tuple(int(ratio) for ratio in metadata["compress_ratios"])
