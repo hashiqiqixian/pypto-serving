@@ -22,8 +22,13 @@ DEVICE_READY_RE = re.compile(r"\[chip_process pid=(?P<pid>\d+) dev=(?P<device>\d
 COLORS = {
     "prefill.dspark": "rail_response",
     "decode.main+verify": "good",
+    "decode.main+verify+drafter+markov+state_commit": "good",
     "dspark.drafter": "rail_load",
     "dspark.markov": "rail_animation",
+    "dspark.drafter+markov+state_commit": "rail_load",
+    "dspark.state_prepare": "thread_state_iowait",
+    "dspark.state_accept": "cq_build_running",
+    "dspark.state_commit": "cq_build_passed",
 }
 
 

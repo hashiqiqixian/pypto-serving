@@ -269,6 +269,8 @@ class WorkerProcess:
         ] = queue.Queue(maxsize=_DECODE_PIPELINE_SLOTS)
         output_work_queue: queue.Queue[object] = queue.Queue()
         slot_ownership = [threading.Semaphore(1) for _ in range(_DECODE_PIPELINE_SLOTS)]
+        self._pending_decode_condition = threading.Condition()
+        self._pending_decode_request_counts: dict[str, int] = {}
         output_thread = threading.Thread(
             target=self._output_reclaim_loop,
             args=(output_work_queue, slot_ownership),
@@ -367,6 +369,7 @@ class WorkerProcess:
                 continue
             assert isinstance(cmd, StepCommand)
             try:
+                self._wait_for_pending_decode_reclaims(cmd.finished_request_ids)
                 self._apply_command_lifecycle(cmd, release_cache_entries)
             except Exception as exc:
                 logger.error("Worker command lifecycle failed: %s", exc, exc_info=True)
@@ -394,6 +397,7 @@ class WorkerProcess:
                             dispatch_batch,
                             prepared.prepared,
                         )
+                    self._track_pending_decode_requests(cmd.decode_requests)
                     output_work_queue.put(
                         _PendingDecodeOutput(
                             cmd=cmd,
@@ -443,13 +447,52 @@ class WorkerProcess:
                 result = work.result
                 buffer_slot = work.buffer_slot
             elif isinstance(work, _PendingDecodeOutput):
-                result = self._reclaim_pending_decode(work)
+                try:
+                    result = self._reclaim_pending_decode(work)
+                finally:
+                    self._finish_pending_decode_reclaims(work.scheduled)
                 buffer_slot = work.buffer_slot
             else:
                 raise TypeError(f"unexpected output work item: {type(work).__name__}")
             if buffer_slot is not None:
                 slot_ownership[buffer_slot].release()
             self.output_queue.put(encode_result(result))
+
+    def _track_pending_decode_requests(self, requests: list[DecodeRequest]) -> None:
+        """Retain request lifecycle state until this decode is reclaimed."""
+        request_ids = {request.request_id for request in requests}
+        with self._pending_decode_condition:
+            for request_id in request_ids:
+                self._pending_decode_request_counts[request_id] = (
+                    self._pending_decode_request_counts.get(request_id, 0) + 1
+                )
+
+    def _finish_pending_decode_reclaims(
+        self, requests: tuple[DecodeRequest, ...]
+    ) -> None:
+        """Drop one pending reference per request and wake lifecycle release."""
+        request_ids = {request.request_id for request in requests}
+        with self._pending_decode_condition:
+            for request_id in request_ids:
+                count = self._pending_decode_request_counts.get(request_id, 0)
+                if count <= 1:
+                    self._pending_decode_request_counts.pop(request_id, None)
+                else:
+                    self._pending_decode_request_counts[request_id] = count - 1
+            self._pending_decode_condition.notify_all()
+
+    def _wait_for_pending_decode_reclaims(self, request_ids: list[str]) -> None:
+        """Wait before releasing state still referenced by a pending decode."""
+        if not request_ids:
+            return
+        finished = set(request_ids)
+        with self._pending_decode_condition:
+            self._pending_decode_condition.wait_for(
+                lambda: not any(
+                    request_id in self._pending_decode_request_counts
+                    for request_id in finished
+                )
+            )
 
     def _can_split_decode_output(
         self,

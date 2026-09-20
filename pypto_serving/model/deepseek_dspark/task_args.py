@@ -62,6 +62,7 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSPARK_SAMPLED_IDS_PAD,
     DSPARK_SLIDING_WINDOW,
     DSPARK_VOCAB_SIZE,
+    _DSPARK_FUSED_INTERNAL_PREPARE_NAMES,
 )
 from pypto_serving.model.deepseek_dspark.weight_spec import (  # noqa: PLC0415 -- packing dims
     DSPARK_O_GROUPS,
@@ -72,6 +73,7 @@ if TYPE_CHECKING:
     from pypto_serving.model.deepseek_dspark.npu_runner import DSparkModelRunner
 
 __all__ = [
+    "decode_scratch_specs",
     "decode_task_args",
     "drafter_scratch_specs",
     "drafter_task_args",
@@ -305,13 +307,10 @@ def _decode_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
 # Pool names the decode ABI spells differently from prefill's.
 _DECODE_CACHE_POOL_NAMES = ("raw_kv_pool", "csa_idx_kv_cache", "csa_idx_kv_scale")
 
-def decode_task_args(runner: DSparkModelRunner) -> TaskArgs:
-    """Build the ``TaskArgs`` for the packed ``l3_decode_fwd`` dispatch."""
-    layout = runner._compiled.layout
-    slot_specs = _decode_slots(layout)
-    static_weights = set(_PREFILL_STATIC_WEIGHT_NAMES)
-    ranks = layout.ranks
-    scratch = {
+
+def decode_scratch_specs(ranks: int) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    """Device-resident decode workspaces shared by ordered decode runs."""
+    return {
         "hidden_workspace": (
             (ranks, DSPARK_DECODE_LOCAL_TOKENS, DSPARK_HIDDEN_SIZE), torch.bfloat16,
         ),
@@ -349,8 +348,22 @@ def decode_task_args(runner: DSparkModelRunner) -> TaskArgs:
         ),
     }
 
+
+def decode_task_args(runner: DSparkModelRunner) -> TaskArgs:
+    """Build the ``TaskArgs`` for the packed ``l3_decode_fwd`` dispatch."""
+    layout = runner._compiled.layout
+    slot_specs = _decode_slots(layout)
+    static_weights = set(_PREFILL_STATIC_WEIGHT_NAMES)
+    ranks = layout.ranks
+    scratch = decode_scratch_specs(ranks)
+
     ta = TaskArgs(stacked=True)
     for name in _DECODE_TENSOR_ORDER:
+        if (
+            runner._compiled.decode_full_fused
+            and name in _DSPARK_FUSED_INTERNAL_PREPARE_NAMES
+        ):
+            continue
         if name in slot_specs:
             dtype, shape = slot_specs[name]
             ta.add_slot(Slot(name, Placement.HOST_SHARED, dtype, lambda _, s=shape: s))

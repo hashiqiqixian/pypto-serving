@@ -95,18 +95,55 @@ def classify_callables(invocations: list) -> tuple[dict[str, str], dict[str, int
         for hid in counts
     }
     # DSpark first invokes prefill, seeds the drafter and Markov sampler, then
-    # starts target decode. Classify the four compiled programs by first-use
-    # order rather than brittle invocation-count ratios.
+    # starts target decode. The device-state variant inserts prepare, accept,
+    # and commit programs around target decode. Classify both layouts by
+    # first-use order rather than brittle invocation-count ratios.
     ordered_hids = sorted(counts, key=first_ts.get)
-    if len(ordered_hids) != 4:
+    if len(ordered_hids) == 3:
+        prefill_hid, draft_hid, decode_hid = ordered_hids
+        labels = {
+            prefill_hid: "prefill.dspark",
+            draft_hid: "dspark.drafter+markov+state_commit",
+            decode_hid: "decode.main+verify+drafter+markov+state_commit",
+        }
+    elif len(ordered_hids) == 4:
+        prefill_hid, drafter_hid, markov_hid, decode_hid = ordered_hids
+        labels = {
+            prefill_hid: "prefill.dspark",
+            decode_hid: "decode.main+verify",
+            drafter_hid: "dspark.drafter",
+            markov_hid: "dspark.markov",
+        }
+    elif len(ordered_hids) == 5:
+        prefill_hid, drafter_hid, markov_hid, decode_hid, state_commit_hid = ordered_hids
+        labels = {
+            prefill_hid: "prefill.dspark",
+            drafter_hid: "dspark.drafter",
+            markov_hid: "dspark.markov",
+            decode_hid: "decode.main+verify",
+            state_commit_hid: "dspark.state_commit",
+        }
+    elif len(ordered_hids) == 7:
+        (
+            prefill_hid,
+            drafter_hid,
+            markov_hid,
+            state_prepare_hid,
+            decode_hid,
+            state_accept_hid,
+            state_commit_hid,
+        ) = ordered_hids
+        labels = {
+            prefill_hid: "prefill.dspark",
+            decode_hid: "decode.main+verify",
+            drafter_hid: "dspark.drafter",
+            markov_hid: "dspark.markov",
+            state_prepare_hid: "dspark.state_prepare",
+            state_accept_hid: "dspark.state_accept",
+            state_commit_hid: "dspark.state_commit",
+        }
+    else:
         raise RuntimeError(f"cannot classify DSpark single-batch callables: {counts}")
-    prefill_hid, drafter_hid, markov_hid, decode_hid = ordered_hids
-    labels = {
-        prefill_hid: "prefill.dspark",
-        decode_hid: "decode.main+verify",
-        drafter_hid: "dspark.drafter",
-        markov_hid: "dspark.markov",
-    }
     return labels, dict(counts)
 
 
