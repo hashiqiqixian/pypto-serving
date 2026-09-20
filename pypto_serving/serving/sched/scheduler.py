@@ -300,8 +300,13 @@ class Scheduler:
                 continue
 
             is_prefill = request.is_prefill
+            # _limit_scheduled_tokens bounded num_new by the remaining context;
+            # after the positive check above, this remainder cannot be negative.
             speculative_tokens = (
-                self.config.num_speculative_tokens
+                min(
+                    self.config.num_speculative_tokens,
+                    self.config.max_seq_len - request.num_computed_tokens - num_new,
+                )
                 if not is_prefill and request.temperature <= 0.0
                 else 0
             )
@@ -567,7 +572,7 @@ class Scheduler:
                 limit = min(limit, chunk_limit)
             if self._requires_single_prefill_dispatch() and needed > limit:
                 return 0
-        return min(needed, limit)
+        return max(0, min(needed, limit, self.config.max_seq_len - request.num_computed_tokens))
 
     def _grouped_cache_phase(self) -> str | None:
         """Choose one homogeneous kernel phase and rotate fairly."""
@@ -676,7 +681,12 @@ class Scheduler:
         """
         if scheduled.is_prefill or request.temperature > 0.0:
             return 0
-        return self.config.num_speculative_tokens
+        # Use the dispatch snapshot: async advancement may already have changed
+        # the live request. Never reserve KV or placeholders beyond the ceiling.
+        return max(0, min(
+            self.config.num_speculative_tokens,
+            self.config.max_seq_len - scheduled.num_computed_tokens - scheduled.num_new_tokens,
+        ))
 
     def update_from_output(
         self,
@@ -794,11 +804,10 @@ class Scheduler:
         but still publishes its confirmed blocks.
 
         A single-token (Qwen) step reserves exactly one slot, so the release
-        matches one-for-one. Speculative / MTP decode reserves the upper bound
-        (``1 + num_speculative_tokens``) because the accepted count is unknown at
-        dispatch; if fewer tokens come back — through rejection or an early EOS —
-        the shortfall is subtracted from ``num_computed_tokens`` here so the
-        request's accounting ends up identical to the synchronous path.
+        matches one-for-one. Speculative / MTP decode reserves a context-bounded
+        estimate because the accepted count is unknown at dispatch. An earlier
+        rejection can move this step's actual start back and allow more tokens
+        than reserved. Reconcile both directions to match the synchronous path.
         """
         # This step reserved placeholders iff it sampled: a decode step, or a
         # prefill chunk that completed the prompt. num_computed_tokens was already
@@ -850,18 +859,10 @@ class Scheduler:
             request.num_output_placeholders = max(
                 0, request.num_output_placeholders - reserved
             )
-            # Reclaim only the SPECULATIVE positions that produced no retained
-            # token. advance_after_schedule added `reserved - 1` extra positions
-            # on top of scheduled.num_new_tokens; the latter is this step's real
-            # KV work (a prefill chunk, or the decode's own token) and must never
-            # be reverted — doing so would re-schedule the same prefill chunk and
-            # decode it twice.
-            speculative_positions = reserved - 1
-            unused_speculative = max(0, speculative_positions - max(0, retained_tokens - 1))
-            if unused_speculative > 0:
-                request.num_computed_tokens = max(
-                    0, request.num_computed_tokens - unused_speculative
-                )
+            # Adjust only this step's speculative positions, preserving its
+            # base KV work and every other in-flight step's reservation.
+            accepted_speculative = max(0, retained_tokens - 1)
+            request.num_computed_tokens += accepted_speculative - (reserved - 1)
 
     def _release_scheduled_group_blocks(self, scheduled: ScheduledRequest) -> None:
         if not scheduled.group_blocks_retained:

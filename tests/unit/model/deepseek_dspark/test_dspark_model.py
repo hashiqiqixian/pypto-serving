@@ -136,6 +136,7 @@ def test_packed_prefill_executor_limits_follow_runtime(monkeypatch, max_batch_si
         config=SimpleNamespace(
             hidden_size=4096, num_hidden_layers=43, num_attention_heads=64,
             num_key_value_heads=1, head_dim=512, vocab_size=129280,
+            max_position_embeddings=1_048_576,
         ),
         runtime=SimpleNamespace(max_batch_size=max_batch_size, page_size=32, max_seq_len=1024),
         extra={
