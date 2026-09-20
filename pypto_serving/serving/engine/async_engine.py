@@ -22,6 +22,7 @@ from typing import Callable
 from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, GenerateResult, RuntimeConfig
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.serving.reasoning import OutputParserSpec, create_output_parser
 from pypto_serving.serving.utils.env import (
     worker_init_timeout_seconds,
     worker_step_timeout_seconds,
@@ -144,12 +145,14 @@ class _RequestContext:
     detok_text: str = ""
     detok_prefix_offset: int = 0
     detok_read_offset: int = 0
+    output_parser: object | None = None
 
 
 @dataclass
 class TokenOutput:
     token_id: int | None = None
     text: str = ""
+    reasoning: str = ""
     finished: bool = False
     finish_reason: str = ""
     # Authoritative token counts from the engine, so the HTTP layer can report
@@ -384,6 +387,7 @@ class ReplicaEngineCore:
         *,
         on_queued: Callable[[], None] | None = None,
         prompt_token_ids: Sequence[int] | None = None,
+        output_parser_spec: OutputParserSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Add a request and yield token outputs as they are generated."""
         with profile_span(
@@ -404,7 +408,11 @@ class ReplicaEngineCore:
                 seed=config.seed,
             )
 
-            ctx = _RequestContext(request=request, stream=getattr(config, "stream", True))
+            ctx = _RequestContext(
+                request=request,
+                stream=getattr(config, "stream", True),
+                output_parser=create_output_parser(output_parser_spec, self.tokenizer),
+            )
             self._request_contexts[request_id] = ctx
             self.scheduler.add_request(request)
             logger.info(
@@ -841,6 +849,14 @@ class ReplicaEngineCore:
                 text = self._finalize_detokenization(ctx)
                 self._schedule_worker_free(req_output.request_id)
 
+            # Stop detection above operates on the original generated text.
+            # Semantic parsing only changes the public presentation channels.
+            reasoning = ""
+            if ctx.output_parser is not None:
+                parsed = ctx.output_parser.parse(ctx.request.output_token_ids)
+                text = parsed.content
+                reasoning = parsed.reasoning
+
             # Non-streaming requests only need the final output: suppress
             # intermediate ones to save a queue push and HTTP-coroutine wake-up
             # per token. Detok + stop detection above still ran this step, so the
@@ -851,6 +867,7 @@ class ReplicaEngineCore:
             token_output = TokenOutput(
                 token_id=req_output.new_token_id,
                 text=text,
+                reasoning=reasoning,
                 finished=req_output.finished,
                 finish_reason=req_output.finish_reason,
                 prompt_tokens=ctx.request.num_prompt_tokens,
@@ -1108,6 +1125,8 @@ class AsyncLLMEngine:
         request_id: str,
         prompt: str,
         config,
+        *,
+        output_parser_spec: OutputParserSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         replica_idx = self._select_replica()
         prompt_token_ids = self._tokenize_prompt(prompt)
@@ -1128,13 +1147,24 @@ class AsyncLLMEngine:
 
         try:
             core = self._cores[replica_idx]
-            async for output in core.add_request(
-                request_id,
-                prompt,
-                config,
-                on_queued=clear_route_extra_load,
-                prompt_token_ids=prompt_token_ids,
-            ):
+            if output_parser_spec is None:
+                outputs = core.add_request(
+                    request_id,
+                    prompt,
+                    config,
+                    on_queued=clear_route_extra_load,
+                    prompt_token_ids=prompt_token_ids,
+                )
+            else:
+                outputs = core.add_request(
+                    request_id,
+                    prompt,
+                    config,
+                    on_queued=clear_route_extra_load,
+                    prompt_token_ids=prompt_token_ids,
+                    output_parser_spec=output_parser_spec,
+                )
+            async for output in outputs:
                 yield output
         finally:
             self._request_to_replica.pop(request_id, None)

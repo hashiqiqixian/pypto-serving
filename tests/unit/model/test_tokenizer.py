@@ -60,6 +60,18 @@ def test_deepseek_v4_enables_thinking_with_vllm_compatible_kwarg():
     assert prompt.endswith("<｜Assistant｜><think>")
 
 
+def test_deepseek_v4_reasoning_none_overrides_enable_thinking():
+    adapter = DeepSeekV4TokenizerAdapter(tokenizer=object())
+
+    prompt = adapter.apply_chat_template(
+        [{"role": "user", "content": "What is 1+1?"}],
+        enable_thinking=True,
+        reasoning_effort="none",
+    )
+
+    assert prompt.endswith("<｜Assistant｜></think>")
+
+
 def test_deepseek_v4_multiturn_thinking_only_marks_latest_user_turn():
     prompt = encode_messages([
         {"role": "system", "content": "Be concise."},

@@ -19,6 +19,7 @@ from typing import Literal
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine
+from pypto_serving.serving.reasoning import OutputParserSpec
 from pypto_serving.tools.profile import (
     get_profiler,
     merge_profile,
@@ -61,6 +62,7 @@ class CompletionRequest(BaseModel):
 class ChatMessage(BaseModel):
     role: str
     content: str
+    reasoning: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -75,6 +77,7 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     reasoning_effort: ReasoningEffort | None = None
     chat_template_kwargs: dict | None = None
+    include_reasoning: bool = True
 
 
 class CompletionChoice(BaseModel):
@@ -279,6 +282,7 @@ class ServingServer:
             self._resolve_generate_config(request),
             ignore_eos=self.generate_config.ignore_eos,
         )
+        output_parser_spec = self._output_parser_spec(request)
 
         with profile_span(
             "http.chat_completions",
@@ -287,16 +291,30 @@ class ServingServer:
         ):
             if request.stream:
                 return StreamingResponse(
-                    self._stream_chat_completion(request_id, prompt, config, request.model or self.model_id),
+                    self._stream_chat_completion(
+                        request_id,
+                        prompt,
+                        config,
+                        request.model or self.model_id,
+                        output_parser_spec=output_parser_spec,
+                    ),
                     media_type="text/event-stream",
                 )
 
             full_text = ""
+            full_reasoning = ""
             finish_reason = ""
             usage = None
-            async for output in self.engine.add_request(request_id, prompt, config):
+            async for output in self.engine.add_request(
+                request_id,
+                prompt,
+                config,
+                output_parser_spec=output_parser_spec,
+            ):
                 if output.text:
                     full_text = output.text
+                if output.reasoning:
+                    full_reasoning = output.reasoning
                 if output.finished:
                     finish_reason = self._map_finish_reason(output.finish_reason)
                     usage = ResponseUsage(
@@ -311,7 +329,11 @@ class ServingServer:
                 created=int(time.time()),
                 model=request.model or self.model_id,
                 choices=[ChatCompletionChoice(
-                    message=ChatMessage(role="assistant", content=full_text),
+                    message=ChatMessage(
+                        role="assistant",
+                        content=full_text,
+                        reasoning=full_reasoning or None,
+                    ),
                     finish_reason=finish_reason,
                 )],
                 usage=usage,
@@ -361,13 +383,31 @@ class ServingServer:
                     break
 
     async def _stream_chat_completion(
-        self, request_id: str, prompt: str, config: GenerateConfig, model: str
+        self,
+        request_id: str,
+        prompt: str,
+        config: GenerateConfig,
+        model: str,
+        *,
+        output_parser_spec: OutputParserSpec | None = None,
     ):
         with profile_span("http.stream_chat_completion", cat="request", args={"request_id": request_id}):
             prev_text = ""
-            async for output in self.engine.add_request(request_id, prompt, config):
+            prev_reasoning = ""
+            async for output in self.engine.add_request(
+                request_id,
+                prompt,
+                config,
+                output_parser_spec=output_parser_spec,
+            ):
                 delta = output.text[len(prev_text):] if output.text else ""
                 prev_text = output.text or prev_text
+                reasoning_delta = (
+                    output.reasoning[len(prev_reasoning):]
+                    if output.reasoning
+                    else ""
+                )
+                prev_reasoning = output.reasoning or prev_reasoning
                 finish_reason = self._map_finish_reason(output.finish_reason) if output.finished else None
 
                 chunk = ChatCompletionResponse(
@@ -376,7 +416,11 @@ class ServingServer:
                     created=int(time.time()),
                     model=model,
                     choices=[ChatCompletionChoice(
-                        delta=ChatMessage(role="assistant", content=delta),
+                        delta=ChatMessage(
+                            role="assistant",
+                            content=delta,
+                            reasoning=reasoning_delta or None,
+                        ),
                         finish_reason=finish_reason,
                     )],
                 )
@@ -425,11 +469,40 @@ class ServingServer:
         if chat_template_kwargs:
             kwargs.update(chat_template_kwargs)
         if reasoning_effort is not None:
-            kwargs.setdefault("enable_thinking", reasoning_effort != "none")
+            if reasoning_effort == "none":
+                kwargs["enable_thinking"] = False
+                kwargs["thinking"] = False
+            else:
+                kwargs.setdefault("enable_thinking", True)
             kwargs["reasoning_effort"] = reasoning_effort
         kwargs["tokenize"] = False
         kwargs["add_generation_prompt"] = True
         return self.engine.tokenizer.apply_chat_template(hf_messages, **kwargs)
+
+    def _output_parser_spec(
+        self,
+        request: ChatCompletionRequest,
+    ) -> OutputParserSpec | None:
+        """Freeze model-output semantics before generation starts."""
+        parser_id = getattr(self.engine.tokenizer, "output_parser_id", None)
+        if not parser_id:
+            return None
+        kwargs = dict(request.chat_template_kwargs or {})
+        if request.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = request.reasoning_effort
+            if request.reasoning_effort == "none":
+                kwargs["enable_thinking"] = False
+                kwargs["thinking"] = False
+            else:
+                kwargs.setdefault("enable_thinking", True)
+        thinking = bool(
+            kwargs.get("thinking", False) or kwargs.get("enable_thinking", False)
+        ) and kwargs.get("reasoning_effort") != "none"
+        return OutputParserSpec(
+            parser_id=str(parser_id),
+            initial_state="reasoning" if thinking else "content",
+            include_reasoning=request.include_reasoning,
+        )
 
     @staticmethod
     def _map_finish_reason(reason: str) -> str:
