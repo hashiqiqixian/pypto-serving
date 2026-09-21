@@ -40,6 +40,33 @@ _DENSE_NAMES = {
 }
 
 
+def pack_native_matrix(store, name: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack one TP1 FP8 projection or retain an expert's exact FP4 bytes."""
+    if store.world_size != 1:
+        raise ValueError("native matrix packing requires TP1")
+    fmt = store.matrix_format(name)
+    if fmt == "fp4":
+        return store.packed_fp4(name)
+    if fmt != "fp8":
+        raise ValueError("native matrix packing requires FP8 or FP4 weights")
+    from models.deepseek_v4_1_flash.quantization import pack_mx_b_scale
+
+    rows, width = store.matrix_shape(name)
+    if width % 64 or rows % 128:
+        raise ValueError("native shared projection requires K divisible by 64 and N by 128")
+    # Include both scale layouts and conservative tile/conversion scratch.
+    store._budget(width * rows * 2 + width // 32 * rows * 2)
+    payload = torch.empty((width, rows), dtype=torch.float8_e4m3fn)
+    codes = torch.empty((width // 32, rows), dtype=torch.uint8)
+    for row, column, values, factors in store.matrix_tiles(name):
+        end = row + len(values)
+        if values.shape[1] != 32 or factors is None:
+            raise ValueError("native projection requires normalized K32 tiles")
+        payload[column:column + 32, row:end].copy_(values.T.to(torch.float8_e4m3fn))
+        codes[column // 32, row:end].copy_((factors.contiguous().view(torch.int32) >> 23).to(torch.uint8))
+    return payload, pack_mx_b_scale(codes).view(torch.float8_e8m0fnu)
+
+
 def pack_native_attention_weights(
     store: DeepSeekV41TensorStore, layer_id: int, ratio: int, names: Collection[str],
 ) -> dict[str, torch.Tensor]:

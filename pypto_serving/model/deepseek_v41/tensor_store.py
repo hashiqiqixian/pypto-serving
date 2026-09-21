@@ -237,6 +237,29 @@ class DeepSeekV41TensorStore:
             raise ValueError("a quantization scale is not a matrix weight")
         return formats[spec.dtype]
 
+    def packed_fp4(self, name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read one owned expert matrix without expanding its checkpoint nibbles.
+
+        This TP1 bring-up API bounds the complete returned bundle and read scratch.
+        It deliberately rejects tensor sharding; expert ownership is still checked.
+        """
+        if self.world_size != 1:
+            raise ValueError("native packed expert loading currently requires TP1")
+        name = self._name(name)
+        if self.matrix_format(name) != "fp4":
+            raise ValueError("packed_fp4 requires a checkpoint FP4 expert matrix")
+        rows, width = self.matrix_shape(name)
+        scale_name = self._name(name.removesuffix(".weight") + ".scale")
+        row_bytes = width // 2 + width // 32
+        self._budget(rows * row_bytes + min(rows, self.out_tile_rows) * row_bytes * 32)
+        payload = torch.empty((rows, width // 2), dtype=torch.uint8)
+        scales = torch.empty((rows, width // 32), dtype=torch.float8_e8m0fnu)
+        for start in range(0, rows, self.out_tile_rows):
+            end = min(rows, start + self.out_tile_rows)
+            payload[start:end].copy_(self._read(name, (slice(start, end), slice(0, width // 2))).view(torch.uint8))
+            scales[start:end].copy_(self._read(scale_name, (slice(start, end), slice(0, width // 32))))
+        return payload, scales
+
     def matrix_tiles(self, name: str) -> Iterator[tuple[int, int, torch.Tensor, torch.Tensor | None]]:
         """Yield local offsets, normalized [Ntile,Ktile] values and per-row scales.
 

@@ -26,7 +26,7 @@ import torch
 
 from .attention import Attention, SharedAttention
 from .npu_executor import V41BackendCapabilities
-from .numerics import ModelMath, TensorOps, rms_norm
+from .numerics import ModelMath, TensorOps
 from .packed_cache import PackedPagePool, PackedRows
 
 
@@ -84,6 +84,7 @@ class DeepSeekV41Backend:
         self._ticket: _Batch | None = None
         self._closed = False
         self.attention_provider = None
+        self.model_provider = None
         self.capabilities = V41BackendCapabilities(
             world_size=ops.world_size,
             max_chunk_tokens=runtime.max_prefill_tokens_per_request or runtime.max_num_batched_tokens,
@@ -169,6 +170,8 @@ class DeepSeekV41Backend:
     @torch.inference_mode()
     def embed(self, ticket, context) -> _Hidden:
         self._check(ticket, context)
+        if self.model_provider is not None and getattr(context.work, "multimodal", None) is not None:
+            raise ValueError("native TP1 backbone supports text target inference only")
         ids = torch.tensor(context.work.token_ids, dtype=torch.long, device=self.ops.device)
         value = self.ops.embedding("embed.weight", ids)
         multimodal = getattr(context.work, "multimodal", None)
@@ -223,7 +226,7 @@ class DeepSeekV41Backend:
     def head(self, ticket, state: _Hidden, context) -> torch.Tensor:
         self._check(ticket, context)
         collapsed = self.math.hc_pre(state.value, state.pre_mix)
-        hidden = rms_norm(collapsed[-1:], self.ops.weight("norm.weight"), self.math.eps)
+        hidden = self.math.normalize(collapsed[-1:], "norm.weight")
         logits = self.ops.all_gather(self.ops.linear(hidden.float(), "head.weight"))[0]
         if logits.shape != (self.config.vocab_size,) or not bool(torch.isfinite(logits).all()):
             raise ValueError("V4.1 head produced invalid vocabulary logits")
@@ -307,6 +310,8 @@ class DeepSeekV41Backend:
             result["native_attention"] = native
             result["cache_bytes"] += native["cache_bytes"]
             result["journal_bytes"] += native["journal_bytes"]
+        if self.model_provider is not None:
+            result["native_backbone"] = self.model_provider.diagnostics()
         npu = getattr(torch, "npu", None)
         if self.ops.device.type == "npu" and npu is not None:
             for name in ("memory_allocated", "memory_reserved", "max_memory_allocated"):
@@ -318,8 +323,12 @@ class DeepSeekV41Backend:
     def close(self) -> None:
         try:
             try:
-                if self.attention_provider is not None:
-                    self.attention_provider.close()
+                try:
+                    if self.model_provider is not None:
+                        self.model_provider.close()
+                finally:
+                    if self.attention_provider is not None:
+                        self.attention_provider.close()
             finally:
                 if self.ops.matmul_provider is not None:
                     self.ops.matmul_provider.close()
