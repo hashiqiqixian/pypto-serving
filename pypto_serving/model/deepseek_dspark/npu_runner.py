@@ -1089,6 +1089,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._global_weights: Any | None = None
         self._static_final_norm_weight: torch.Tensor | None = None
         self._static_lm_head_weight: torch.Tensor | None = None
+        self._static_lm_head_device_weight: StackedDeviceTensor | None = None
         self._hc_head_buffers: dict[str, torch.Tensor] | None = None
         self._stacked_host_weights: dict[str, torch.Tensor] | None = None
         self._stacked_prefill_host_weights: dict[str, torch.Tensor] | None = None
@@ -1868,8 +1869,10 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             )
         return self._static_final_norm_weight
 
-    def _static_lm_head_weight_tensor(self) -> torch.Tensor:
+    def _static_lm_head_weight_tensor(self) -> torch.Tensor | StackedDeviceTensor:
         """One TP vocab shard per rank: rank r consumes shard ``r % tp``."""
+        if self._static_lm_head_device_weight is not None:
+            return self._static_lm_head_device_weight
         if self._static_lm_head_weight is None:
             global_weights = self.load_packed_global_weights()
             self._ensure_shared_host_allocation_before_worker("lm_head_weight")
@@ -1881,6 +1884,20 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 torch.stack(rank_shards, dim=0).contiguous()
             )
         return self._static_lm_head_weight
+
+    def _materialize_lm_head_device_weight(self, worker: Any) -> StackedDeviceTensor:
+        """Upload the shared TP LM-head shards once for target and drafter use."""
+        stacked = self._static_lm_head_device_weight
+        if stacked is not None:
+            return stacked
+        host = self._static_lm_head_weight
+        if host is None:
+            raise RuntimeError("DSpark LM-head Host shards are not staged")
+        with profile_span("DSparkModelRunner.upload_lm_head", cat="executor"):
+            stacked = worker.alloc_stacked_tensor(host)
+        self._static_lm_head_device_weight = stacked
+        self._static_lm_head_weight = None
+        return stacked
 
     @staticmethod
     def _static_device_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -1923,6 +1940,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 self._drafter_device_weights = self._upload_weight_group(worker, host_weights)
             self._drafter_host_weights = None
         self._materialize_embedding_device_weight()
+        self._materialize_lm_head_device_weight(worker)
         if self._compiled.decode_full_fused:
             self._materialize_dspark_rope_tables()
         for task_args in (self._prefill_task_args, *self._decode_task_args):
@@ -5550,6 +5568,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             self._device_scratch.clear()
             self._decode_device_cache = None
             self._global_weights = None
+            self._static_lm_head_weight = None
+            self._static_lm_head_device_weight = None
             self._hc_head_buffers = None
             self._l3_shared_buffers_ready = False
             self._l3_static_tensors.clear()
