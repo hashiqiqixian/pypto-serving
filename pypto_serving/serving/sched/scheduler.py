@@ -12,9 +12,11 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
+from pypto_serving.config.types import KVCacheGroupSpec
 from pypto_serving.serving.memory.kv_cache import KVCacheCapacityError, KvCacheManager
 
 logger = logging.getLogger(__name__)
@@ -52,14 +54,22 @@ class SchedulerConfig:
     enable_chunk_prefill: bool = True
     num_speculative_tokens: int = 0
     supports_chunked_prefill_with_speculation: bool = True
+    speculative_prefix_cache_replay_tokens: int = 0
     requires_homogeneous_prefill_decode: bool = False
     # Async (pipelined) scheduling: schedule step N+1 before step N's sampled
     # token returns, advancing request state optimistically via placeholders.
     async_scheduling: bool = False
 
     def __post_init__(self) -> None:
+        if (
+            not isinstance(self.speculative_prefix_cache_replay_tokens, int)
+            or isinstance(self.speculative_prefix_cache_replay_tokens, bool)
+        ):
+            raise ValueError("speculative_prefix_cache_replay_tokens must be a non-boolean integer")
         if self.num_speculative_tokens < 0:
             raise ValueError("num_speculative_tokens must be non-negative")
+        if self.speculative_prefix_cache_replay_tokens < 0:
+            raise ValueError("speculative_prefix_cache_replay_tokens must be non-negative")
         if self.num_speculative_tokens + 1 > self.max_num_scheduled_tokens:
             raise ValueError(
                 "max_num_scheduled_tokens must fit one decode token plus "
@@ -80,6 +90,23 @@ class SchedulerConfig:
             raise ValueError(
                 f"long_prefill_token_threshold must be one of ({choices}), "
                 f"got {self.long_prefill_token_threshold}"
+            )
+
+    def validate_cache_groups(self, groups: Sequence[KVCacheGroupSpec]) -> None:
+        """Require enough replay to rebuild non-EAGLE rolling history."""
+        if (
+            not groups
+            or not self.enable_prefix_cache
+            or self.num_speculative_tokens <= 0
+            or any(group.is_eagle_group for group in groups)
+        ):
+            return
+        minimum_replay = max(1, *(group.sliding_window or 0 for group in groups))
+        if self.speculative_prefix_cache_replay_tokens < minimum_replay:
+            raise ValueError(
+                "Grouped speculative/MTP prefix caching requires an EAGLE cache group "
+                f"or speculative_prefix_cache_replay_tokens >= {minimum_replay} "
+                "to rebuild the full rolling window"
             )
 
 
@@ -180,15 +207,7 @@ class Scheduler:
     def __init__(self, config: SchedulerConfig, kv_cache_manager: KvCacheManager) -> None:
         self.config = config
         self.kv_cache_manager = kv_cache_manager
-        if (
-            self.kv_cache_manager.has_groups
-            and self.config.enable_prefix_cache
-            and self.config.num_speculative_tokens > 0
-            and not self.kv_cache_manager.has_eagle_groups
-        ):
-            raise ValueError(
-                "Grouped speculative/MTP prefix caching requires an EAGLE cache group"
-            )
+        self.config.validate_cache_groups(self.kv_cache_manager.group_specs)
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
         self.requests: dict[str, Request] = {}
@@ -394,7 +413,11 @@ class Scheduler:
                     ) = self.kv_cache_manager.acquire_group_prefix_blocks(
                         request.request_id,
                         request.group_block_hashes,
-                        max_cache_hit_tokens=max(0, request.num_prompt_tokens - 1),
+                        max_cache_hit_tokens=max(
+                            0,
+                            request.num_prompt_tokens
+                            - max(1, self.config.speculative_prefix_cache_replay_tokens),
+                        ),
                     )
                     request.num_group_blocks_cached = (
                         self.kv_cache_manager.published_group_block_counts(

@@ -163,6 +163,8 @@ DSPARK_DRAFTER_CONTEXT_BUCKETS = (32, 64, 96, 128)
 
 # ---- paging ----
 DSPARK_BLOCK_SIZE = 32
+DSPARK_COMPRESSED_BLOCK_TOKENS = 128
+DSPARK_HCA_CMP_STORAGE_BLOCK_SIZE = DSPARK_COMPRESSED_BLOCK_TOKENS // 128
 DSPARK_SLIDING_WINDOW = 128
 DSPARK_C128_STATE_PAGE_TOKENS = 8
 DSPARK_C4_STATE_PAGE_TOKENS = 2
@@ -235,15 +237,11 @@ DSPARK_MAX_SEQ_LEN = 1_048_576
 DSPARK_DECODE_ORI_TABLE_BLOCKS = 32768
 DSPARK_DECODE_CMP_C4_TABLE_BLOCKS = 8192
 DSPARK_DECODE_IDX_TABLE_BLOCKS = 8192
-# The HCA cmp table's depth dim is dynamic (CMP_TABLE_BLOCKS_DYN); 256 pages
-# cover the full 1M context (1048576 / 128-token compression / 32 rows = 256 blocks).
-DSPARK_DECODE_HCA_CMP_TABLE_BLOCKS = 256
+# HCA stores one compressed row per 128-source-token page, matching MTP.
+# The table depth is dynamic (CMP_TABLE_BLOCKS_DYN).
+DSPARK_DECODE_HCA_CMP_TABLE_BLOCKS = DSPARK_MAX_SEQ_LEN // DSPARK_COMPRESSED_BLOCK_TOKENS
 DSPARK_DECODE_HCA_STATE_TABLE_BLOCKS = 131072
 DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS = 8
-# Anchor-independent physical-ring descriptors consumed by device prepare.
-# The device lowers these to the target kernels' small transaction tables.
-DSPARK_DECODE_GROUP_HCA_STATE_BLOCKS = 256
-DSPARK_DECODE_GROUP_CSA_STATE_BLOCKS = 260
 
 # ---- prefill geometry ----
 DSPARK_PREFILL_MAX_TOKENS = 8192
@@ -253,7 +251,7 @@ DSPARK_PREFILL_LOCAL_TOKENS = DSPARK_PREFILL_DISPATCH_TOKENS // DSPARK_TP_SIZE
 DSPARK_PREFILL_MAX_BATCH = DSPARK_CACHE_PARTITIONS * DSPARK_DECODE_BATCH
 DSPARK_PREFILL_MAX_CONTEXT_TOKENS = 1_048_576
 DSPARK_PREFILL_ORI_TABLE_BLOCKS = 32768
-DSPARK_PREFILL_HCA_CMP_TABLE_BLOCKS = 256
+DSPARK_PREFILL_HCA_CMP_TABLE_BLOCKS = 8192
 DSPARK_PREFILL_CSA_CMP_TABLE_BLOCKS = 8192
 DSPARK_PREFILL_IDX_TABLE_BLOCKS = 8192
 DSPARK_PREFILL_HCA_STATE_TABLE_BLOCKS = 131072
@@ -313,20 +311,6 @@ _PREFILL_LOCAL_DYNAMIC_NAMES = frozenset(
 )
 
 # ---- per-request ring sizes (scheduler-visible blocks per sequence) ----
-# Prefill publishes the entire CP tile before attention reads any history.
-# Keep its maximum tile plus W-1 history rows, with one extra page for an
-# unaligned start; a decode-sized ring overwrites live KV from the next chunk.
-# The HCA state ring covers one full 128-token
-# compression window plus its 512-row prefill tile. The CSA working ring likewise
-# preserves the prefill tile plus the eight rows needed by the next ratio-4 pool.
-DSPARK_ORI_RING_BLOCKS = (
-    math.ceil(
-        (DSPARK_SLIDING_WINDOW - 1 + max(DSPARK_PREFILL_MAX_TOKENS, DSPARK_DECODE_SEQ))
-        / DSPARK_BLOCK_SIZE
-    ) + 1
-)
-DSPARK_HCA_STATE_RING_BLOCKS = 256
-DSPARK_CSA_STATE_RING_BLOCKS = 260
 # Decode keeps its eight-row mathematical CSA window and the eager S=8 writes
 # in separate halves of a 16-row transaction ring.
 DSPARK_CSA_DECODE_STATE_RING_TOKENS = (
@@ -348,6 +332,7 @@ def build_dspark_cache_group_specs(
     compress_ratios: Sequence[int] | None = None,
     *,
     max_seq_len: int = DSPARK_MAX_SEQ_LEN,
+    max_prefill_tokens: int = DSPARK_PREFILL_MAX_TOKENS,
 ) -> tuple[KVCacheGroupSpec, ...]:
     """Describe the seven DSpark cache families as scheduler-visible groups.
 
@@ -355,7 +340,9 @@ def build_dspark_cache_group_specs(
     ranks of one group hold identical replicated pools, so a block allocated in
     partition g exists -- with the same id -- on every rank of group g.
     """
-    max_seq_len = int(max_seq_len)
+    for name, value in (("max_seq_len", max_seq_len), ("max_prefill_tokens", max_prefill_tokens)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{name} must be a non-boolean integer")
     if max_seq_len <= 0:
         raise ValueError("max_seq_len must be positive")
     if max_seq_len > DSPARK_MAX_SEQ_LEN:
@@ -363,6 +350,15 @@ def build_dspark_cache_group_specs(
             f"DSpark decode cache tables support at most max_seq_len={DSPARK_MAX_SEQ_LEN}, "
             f"got {max_seq_len}"
         )
+    if not 0 < max_prefill_tokens <= DSPARK_PREFILL_MAX_TOKENS:
+        raise ValueError(f"max_prefill_tokens must be in [1, {DSPARK_PREFILL_MAX_TOKENS}]")
+    # Prefill publishes its entire chunk before reading the historical window.
+    # Keep both resident, including a boundary page for unaligned chunks.
+    in_flight_tokens = max(min(max_prefill_tokens, max_seq_len), DSPARK_DECODE_SEQ)
+
+    def ring_blocks(history: int, page_tokens: int) -> int:
+        return math.ceil((history - 1 + in_flight_tokens) / page_tokens) + 1
+
     all_layers = tuple(range(int(num_hidden_layers)))
     ratios = tuple(int(ratio) for ratio in (compress_ratios or ()))[:num_hidden_layers]
     csa_layers = tuple(index for index, ratio in enumerate(ratios) if ratio == 4) or all_layers
@@ -396,7 +392,7 @@ def build_dspark_cache_group_specs(
             sliding_window=sliding_window,
         )
 
-    c128_blocks_per_seq = math.ceil(max_seq_len / (128 * DSPARK_BLOCK_SIZE))
+    c128_blocks_per_seq = math.ceil(max_seq_len / DSPARK_COMPRESSED_BLOCK_TOKENS)
     c4_blocks_per_seq = math.ceil(max_seq_len / (4 * DSPARK_BLOCK_SIZE))
 
     return (
@@ -406,13 +402,13 @@ def build_dspark_cache_group_specs(
             block_size=DSPARK_BLOCK_SIZE,
             element_bytes=2,
             row_width=DSPARK_HEAD_DIM,
-            max_blocks_per_seq=DSPARK_ORI_RING_BLOCKS,
+            max_blocks_per_seq=ring_blocks(DSPARK_SLIDING_WINDOW, DSPARK_BLOCK_SIZE),
             sliding_window=DSPARK_SLIDING_WINDOW,
         ),
         group(
             "cmp_c128",
             hca_layers,
-            block_size=128 * DSPARK_BLOCK_SIZE,
+            block_size=DSPARK_COMPRESSED_BLOCK_TOKENS,
             element_bytes=2,
             row_width=DSPARK_HEAD_DIM,
             max_blocks_per_seq=c128_blocks_per_seq,
@@ -443,7 +439,7 @@ def build_dspark_cache_group_specs(
             block_size=DSPARK_C128_STATE_PAGE_TOKENS,
             element_bytes=4,
             row_width=DSPARK_HCA_STATE_DIM,
-            max_blocks_per_seq=DSPARK_HCA_STATE_RING_BLOCKS,
+            max_blocks_per_seq=ring_blocks(DSPARK_SLIDING_WINDOW, DSPARK_C128_STATE_PAGE_TOKENS),
             sliding_window=DSPARK_SLIDING_WINDOW,
         ),
         group(
@@ -452,8 +448,8 @@ def build_dspark_cache_group_specs(
             block_size=DSPARK_C4_STATE_PAGE_TOKENS,
             element_bytes=4,
             row_width=DSPARK_CSA_STATE_DIM,
-            max_blocks_per_seq=DSPARK_CSA_STATE_RING_BLOCKS,
-            sliding_window=DSPARK_C4_STATE_PAGE_TOKENS * DSPARK_CSA_STATE_RING_BLOCKS,
+            max_blocks_per_seq=ring_blocks(8, DSPARK_C4_STATE_PAGE_TOKENS),
+            sliding_window=8,
         ),
         group(
             "csa_inner_state",
@@ -461,8 +457,8 @@ def build_dspark_cache_group_specs(
             block_size=DSPARK_C4_STATE_PAGE_TOKENS,
             element_bytes=4,
             row_width=DSPARK_CSA_INNER_STATE_DIM,
-            max_blocks_per_seq=DSPARK_CSA_STATE_RING_BLOCKS,
-            sliding_window=DSPARK_C4_STATE_PAGE_TOKENS * DSPARK_CSA_STATE_RING_BLOCKS,
+            max_blocks_per_seq=ring_blocks(8, DSPARK_C4_STATE_PAGE_TOKENS),
+            sliding_window=8,
         ),
     )
 
@@ -737,11 +733,12 @@ class DSparkCacheMetadataBuilder:
             else:
                 boundary = boundary & (columns < int(commit_tokens))
         cache_col = positions_i64 // compress_ratio
-        logical = cache_col // self.layout.block_size
+        storage_block_size = DSPARK_COMPRESSED_BLOCK_TOKENS // compress_ratio
+        logical = cache_col // storage_block_size
         depth = table.shape[-1]
         gathered = self._gather_table(table, logical)
         valid = boundary & (logical < depth) & (gathered >= 0)
-        slot = gathered * self.layout.block_size + cache_col % self.layout.block_size
+        slot = gathered * storage_block_size + cache_col % storage_block_size
         return torch.where(valid, slot, torch.full_like(slot, -1))
 
     def state_slot_mapping(
@@ -1200,6 +1197,10 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             config.num_hidden_layers,
             self._compiled.compress_ratios,
             max_seq_len=runtime.max_seq_len,
+            max_prefill_tokens=min(
+                runtime.max_prefill_tokens_per_request or DSPARK_PREFILL_MAX_TOKENS,
+                runtime.max_num_batched_tokens,
+            ),
         )
         names = tuple(spec.name for spec in specs)
         if names != DSPARK_CACHE_GROUP_NAMES:
@@ -1213,6 +1214,13 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 f"DSpark KV cache groups must use {DSPARK_CACHE_PARTITIONS} partitions"
             )
         return tuple(specs)
+
+    def _decode_state_table_depth(self, group_name: str) -> int:
+        """Use the scheduler's physical ring period for device-side modulo."""
+        specs = self._cache_group_specs or build_dspark_cache_group_specs(
+            DSPARK_FWD_NUM_LAYERS, self._compiled.compress_ratios,
+        )
+        return next(spec.max_blocks_per_seq for spec in specs if spec.name == group_name)
 
     def _compute_kv_cache_capacity_slots(self, runtime: RuntimeConfig) -> int:
         """Compute per-partition request slots from the per-device budget."""
@@ -1442,6 +1450,10 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         """Allocate every CPU tensor visible to the L3 worker before it forks."""
         if self._l3_shared_buffers_ready:
             return
+        # Weight preparation can allocate these buffers before init_kv_cache.
+        # Both phases must use the same configured physical ring periods.
+        if not self._cache_group_specs:
+            self._cache_group_specs = self._resolve_cache_group_specs(model.config, model.runtime)
         with profile_span("DSparkModelRunner.prepare.load_global_weights", cat="executor"):
             self.load_packed_global_weights()
         with profile_span("DSparkModelRunner.prepare.load_stacked_weights", cat="executor"):
@@ -1665,7 +1677,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                             (
                                 ranks,
                                 self._compiled.layout.decode_batch,
-                                DSPARK_DECODE_GROUP_HCA_STATE_BLOCKS,
+                                self._decode_state_table_depth("hca_state"),
                             ),
                             torch.int32,
                             name="dspark_group_hca_state_block_tables",
@@ -1674,7 +1686,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                             (
                                 ranks,
                                 self._compiled.layout.decode_batch,
-                                DSPARK_DECODE_GROUP_CSA_STATE_BLOCKS,
+                                self._decode_state_table_depth("csa_state"),
                             ),
                             torch.int32,
                             name="dspark_group_csa_state_block_tables",
@@ -1683,7 +1695,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                             (
                                 ranks,
                                 self._compiled.layout.decode_batch,
-                                DSPARK_DECODE_GROUP_CSA_STATE_BLOCKS,
+                                self._decode_state_table_depth("csa_state"),
                             ),
                             torch.int32,
                             name="dspark_group_csa_inner_state_block_tables",
@@ -2142,7 +2154,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 torch.bfloat16,
             ),
             "hca_cmp_kv": packed(
-                "cmp_c128", DSPARK_HCA_NUM_LAYERS, layout.block_size, (1, DSPARK_HEAD_DIM),
+                "cmp_c128", DSPARK_HCA_NUM_LAYERS, DSPARK_HCA_CMP_STORAGE_BLOCK_SIZE,
+                (1, DSPARK_HEAD_DIM),
                 torch.bfloat16,
             ),
             "csa_cmp_kv": packed(
@@ -3620,7 +3633,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             (
                 layout.ranks,
                 layout.decode_batch,
-                DSPARK_DECODE_GROUP_HCA_STATE_BLOCKS,
+                self._decode_state_table_depth("hca_state"),
             ),
             -1,
             dtype=torch.int32,
@@ -3629,7 +3642,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             (
                 layout.ranks,
                 layout.decode_batch,
-                DSPARK_DECODE_GROUP_CSA_STATE_BLOCKS,
+                self._decode_state_table_depth("csa_state"),
             ),
             -1,
             dtype=torch.int32,
@@ -3766,7 +3779,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 [
                     builder.ring_table(
                         blocks(row, "hca_state"),
-                        depth=DSPARK_DECODE_GROUP_HCA_STATE_BLOCKS,
+                        depth=self._decode_state_table_depth("hca_state"),
                     )
                     for row in range(group_batch)
                 ]
@@ -3775,7 +3788,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 [
                     builder.ring_table(
                         blocks(row, "csa_state"),
-                        depth=DSPARK_DECODE_GROUP_CSA_STATE_BLOCKS,
+                        depth=self._decode_state_table_depth("csa_state"),
                     )
                     for row in range(group_batch)
                 ]
@@ -3784,7 +3797,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 [
                     builder.ring_table(
                         blocks(row, "csa_inner_state"),
-                        depth=DSPARK_DECODE_GROUP_CSA_STATE_BLOCKS,
+                        depth=self._decode_state_table_depth("csa_state"),
                     )
                     for row in range(group_batch)
                 ]
@@ -4503,6 +4516,10 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             entry = {}
             for name in DSPARK_CACHE_GROUP_NAMES:
                 blocks = tuple(int(block_id) for block_id in row[name])
+                # Immutable prefix pages may be shared across requests, but
+                # two logical pages of the same request must never alias.
+                if len(blocks) != len(set(blocks)):
+                    raise ValueError("a grouped KV row must not repeat physical blocks")
                 if any(block_id < 0 or block_id >= self._cache_group_num_blocks[name] for block_id in blocks):
                     raise ValueError(
                         f"grouped KV block IDs for {name} must be in "
@@ -5001,6 +5018,15 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     f"DSpark seeding requires a captured prompt tail for {request_id!r}"
                 )
             anchor = int(state.prefill_tail_positions[-1].item())
+            expected_positions = torch.arange(
+                max(0, anchor + 1 - DSPARK_SLIDING_WINDOW), anchor + 1,
+                dtype=torch.int64,
+            )
+            if not torch.equal(state.prefill_tail_positions, expected_positions):
+                raise RuntimeError(
+                    f"DSpark seeding requires the complete prompt tail for {request_id!r}; "
+                    "prefix-cache hits must replay the drafter sliding window"
+                )
             state.prompt_len = anchor + 1
             state.committed_count = state.prompt_len
             if anchor + DSPARK_DRAFTER_QUERY_WIDTH >= max_position:

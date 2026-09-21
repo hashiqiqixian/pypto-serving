@@ -28,11 +28,12 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSparkDrafterRequestRow,
     DSparkModelRunner,
     DSparkRopeTables,
+    DSparkCacheMetadataBuilder,
+    build_dspark_cache_group_specs,
 )
 
 
-def _runner(*, speculative: bool = False) -> DSparkModelRunner:
-    max_position = 512
+def _runner(*, speculative: bool = False, max_position: int = 512) -> DSparkModelRunner:
     rows = torch.arange(max_position * 64, dtype=torch.float32).reshape(max_position, 64)
     rope = DSparkRopeTables(
         max_position=max_position,
@@ -113,7 +114,7 @@ def _block_rows(count: int) -> list[dict[str, list[int]]]:
         rows.append(
             {
                 "ori": [(request + offset) % 8 for offset in range(6)],
-                "cmp_c128": [request % 4],
+                "cmp_c128": [request % 8, (request + 1) % 8],
                 "cmp_c4": [request % 8, (request + 1) % 8],
                 "idx": [request % 8, (request + 1) % 8],
                 "hca_state": [request % 8],
@@ -640,6 +641,221 @@ def test_accept_dspark_tokens_semantics() -> None:
     # A draft row matching the bonus position cannot over-run the window.
     with pytest.raises(ValueError, match="ran past"):
         _accept_dspark_tokens([10, 11, 12, 13, 14, 15, 16, 17], draft + [17])
+
+
+def test_grouped_metadata_allows_shared_prefix_but_rejects_row_aliases():
+    runner = _runner()
+    row = _block_rows(1)[0]
+    normalized = runner._normalize_group_block_ids([row, row], actual_batch=2)
+    assert normalized[0] == normalized[1]
+    with pytest.raises(ValueError, match="must not repeat physical blocks"):
+        runner._normalize_group_block_ids([{**row, "ori": [0, 0]}], actual_batch=1)
+
+
+@pytest.mark.parametrize("compress_ratio", [4, 128])
+def test_compressed_slots_use_source_token_pages_and_mask_uncommitted_rows(compress_ratio):
+    builder = DSparkCacheMetadataBuilder()
+    positions = torch.arange(124, 264).repeat(2, 1)
+    table = torch.tensor([[7, 2, 9], [4, 8, 1]], dtype=torch.int32)
+    commits = torch.tensor([132, 131])
+    slots = builder.compressed_slot_mapping(
+        positions, table, compress_ratio=compress_ratio, commit_tokens=commits,
+    )
+    expected = torch.full_like(positions, -1)
+    for request in range(2):
+        for offset in range(commits[request]):
+            position = positions[request, offset].item()
+            if (position + 1) % compress_ratio == 0:
+                page, intra = divmod(position, 128)
+                expected[request, offset] = (
+                    table[request, page] * (128 // compress_ratio) + intra // compress_ratio
+                )
+    torch.testing.assert_close(slots, expected)
+
+
+def test_compressed_device_pages_match_scheduler_byte_accounting(monkeypatch):
+    from pypto_serving.model.deepseek_dspark.npu_runner import (
+        DSPARK_FWD_NUM_LAYERS, DSPARK_CSA_NUM_LAYERS, DSPARK_HCA_NUM_LAYERS,
+    )
+
+    runner = _runner()
+    monkeypatch.setattr(
+        runner, "_alloc_empty_stacked_tensor",
+        lambda shape, dtype: SimpleNamespace(shape=shape, dtype=dtype),
+    )
+    cache = runner._materialize_decode_device_cache()
+    ratios = (0,) * (DSPARK_FWD_NUM_LAYERS - DSPARK_CSA_NUM_LAYERS - DSPARK_HCA_NUM_LAYERS)
+    ratios += (4,) * DSPARK_CSA_NUM_LAYERS + (128,) * DSPARK_HCA_NUM_LAYERS
+    groups = {g.name: g for g in build_dspark_cache_group_specs(DSPARK_FWD_NUM_LAYERS, ratios)}
+    for name, tensor_names, rows in (
+        ("cmp_c128", ("hca_cmp_kv",), 1),
+        ("cmp_c4", ("csa_cmp_kv",), 32),
+        ("idx", ("idx_kv_cache", "idx_kv_scale"), 32),
+    ):
+        group = groups[name]
+        assert group.spec.token_capacity == 128
+        assert group.max_blocks_per_seq * 128 >= 16384
+        page_bytes = 0
+        for tensor_name in tensor_names:
+            tensor = cache[tensor_name]
+            assert tensor.shape[2] == rows
+            page_bytes += (
+                len(group.layer_indices) * rows * tensor.shape[3] * tensor.shape[4]
+                * torch.empty((), dtype=tensor.dtype).element_size()
+            )
+        assert group.spec.page_size_bytes == page_bytes
+
+
+@pytest.mark.parametrize("max_seq_len", [16384, 16385, 1_048_576])
+def test_long_context_compressed_pools_cover_the_configured_limit(max_seq_len):
+    from pypto_serving.serving.memory.kv_cache import KvCacheManager
+
+    specs = build_dspark_cache_group_specs(3, (0, 4, 128), max_seq_len=max_seq_len)
+    manager = KvCacheManager(block_size=32, enable_prefix_cache=True)
+    manager.init_groups(specs, max_batch_size=4)
+    blocks = manager.ensure_group_blocks("long", max_seq_len, partition=0)
+    for name in ("cmp_c128", "cmp_c4", "idx"):
+        assert len(blocks[name]) == (max_seq_len + 127) // 128
+    builder = DSparkCacheMetadataBuilder()
+    position = (max_seq_len // 128) * 128 - 1
+    table = builder.absolute_table(
+        blocks["cmp_c128"], depth=runner_module.DSPARK_DECODE_HCA_CMP_TABLE_BLOCKS,
+    )
+    slot = builder.compressed_slot_mapping(
+        torch.tensor([[position]]), table.unsqueeze(0), compress_ratio=128,
+    )
+    assert slot.item() == blocks["cmp_c128"][position // 128]
+
+
+@pytest.mark.parametrize("chunk_tokens", [128, 8192])
+def test_fused_state_descriptors_match_prefill_rings_through_1m(chunk_tokens):
+    runner = _runner()
+    runner._compiled.decode_full_fused = True
+    runner._cache_group_specs = build_dspark_cache_group_specs(
+        3, (0, 4, 128), max_prefill_tokens=chunk_tokens,
+    )
+    runner._cache_group_num_blocks = {name: 32768 for name in DSPARK_CACHE_GROUP_NAMES}
+    blocks = {
+        spec.name: list(range(spec.max_blocks_per_seq, 0, -1))
+        for spec in runner._cache_group_specs
+    }
+    short_blocks = {spec.name: blocks[spec.name][:1] for spec in runner._cache_group_specs}
+    batch = DecodeBatch(
+        request_ids=["long-prefix", "short"],
+        token_ids=torch.tensor([[10], [20]]), hidden_states=None,
+        seq_lens=torch.tensor([1_048_568, 1], dtype=torch.int32),
+        block_ids_by_group=[blocks, short_blocks], cache_partitions=[0, 0],
+    )
+    plan = runner._prepare_decode_plan(batch, buffer_slot=0)
+    for name, descriptors, page_tokens in (
+        ("hca_state", plan.group_hca_state_block_tables, 8),
+        ("csa_state", plan.group_csa_state_block_tables, 2),
+        ("csa_inner_state", plan.group_csa_inner_state_block_tables, 2),
+    ):
+        ring = blocks[name]
+        assert descriptors.shape[-1] == len(ring)
+        # Include the old fixed-table wrap, the actual ring wrap, and the 1M tail.
+        positions = torch.tensor([519, 520, 2047, 2048, 8192, len(ring) * page_tokens, 1_048_575])
+        expected = runner.cache_metadata.ring_slot_mapping(
+            positions.unsqueeze(0), [ring], block_size=page_tokens,
+        )[0]
+        actual = descriptors[0, 0, (positions // page_tokens) % descriptors.shape[-1]]
+        actual = actual.to(torch.int64) * page_tokens + positions % page_tokens
+        torch.testing.assert_close(actual, expected)
+        # A short request has not wrapped its ring and can share the descriptor width.
+        assert descriptors[0, runner._compiled.layout.decode_local_batch, 0] == short_blocks[name][0]
+
+
+@pytest.mark.parametrize("chunk_tokens", [1, 128, 512, 8192])
+@pytest.mark.parametrize("chunk_start", [4096, 4097, 4127])
+def test_prefill_ring_keeps_history_and_entire_chunk_disjoint(chunk_tokens, chunk_start):
+    specs = build_dspark_cache_group_specs(3, (0, 4, 128), max_prefill_tokens=chunk_tokens)
+    builder = DSparkCacheMetadataBuilder()
+    for spec in specs:
+        if spec.sliding_window is None:
+            continue
+        page_tokens = spec.spec.token_capacity
+        table = builder.ring_table(
+            range(spec.max_blocks_per_seq), depth=16384 // page_tokens,
+        )
+        positions = torch.arange(
+            chunk_start - spec.sliding_window + 1, chunk_start + max(chunk_tokens, 8),
+        )
+        slots = builder.paged_slot_mapping(positions, table, block_size=page_tokens)
+        assert bool((slots >= 0).all()), spec.name
+        assert slots.unique().numel() == positions.numel(), spec.name
+
+
+@pytest.mark.parametrize("cached_tokens", [128, 4096, 16384])
+def test_cached_suffix_prefill_uses_absolute_positions_and_new_compressed_page(cached_tokens):
+    max_position = max(8192, cached_tokens + 128)
+    runner = _runner(max_position=max_position)
+    runner._cache_group_num_blocks = {name: 1024 for name in DSPARK_CACHE_GROUP_NAMES}
+    blocks = {
+        "ori": [21, 22, 23, 24, 25, 26],
+        "cmp_c128": list(range(cached_tokens // 128)) + [511],
+        "cmp_c4": list(range(80, 81 + cached_tokens // 128)),
+        "idx": list(range(160, 161 + cached_tokens // 128)),
+        "hca_state": list(range(256)),
+        "csa_state": list(range(260)),
+        "csa_inner_state": list(range(260)),
+    }
+    batch = PrefillBatch(
+        request_ids=["hit"], token_ids=torch.arange(128),
+        input_embeddings=torch.ones((128, 4)), seq_lens=[cached_tokens + 128],
+        chunk_lens=[128], chunk_offsets=[0], chunk_starts=[cached_tokens],
+        block_ids_by_group=[blocks], cache_partitions=[2],
+    )
+    inputs = runner.prepare_prefill_inputs(
+        SimpleNamespace(runtime=SimpleNamespace(max_seq_len=max_position)), batch,
+    )
+    assert inputs.position_ids_full[8].tolist() == list(range(cached_tokens, cached_tokens + 128))
+    pages = blocks["cmp_c128"]
+    assert inputs.block_tables["hca_cmp_block_table"][8, 0, :len(pages)].tolist() == pages
+    mapping = inputs.slot_mappings["hca_cmp_slot_mapping_full"][8]
+    assert bool((mapping[:127] == -1).all())
+    assert mapping[127].item() == 511
+    for name in ("csa_cmp_slot_mapping_full", "csa_idx_slot_mapping_full"):
+        slots = inputs.slot_mappings[name][8]
+        page = blocks["cmp_c4" if name.startswith("csa_cmp") else "idx"][-1]
+        assert slots[3::4].tolist() == list(range(page * 32, (page + 1) * 32))
+    for slots in inputs.slot_mappings.values():
+        assert bool((slots[:8] == -1).all())
+        assert bool((slots[12:] == -1).all())
+
+
+@pytest.mark.parametrize("tail_tokens", [1, 127, 128])
+def test_prefix_cache_drafter_seeding_requires_replayed_window(monkeypatch, tail_tokens):
+    runner = _runner(speculative=True, max_position=8192)
+    monkeypatch.setattr(runner, "_initialize_dspark_device_state", lambda state: None)
+    state = runner._reserve_drafter_state("hit", group=2, prompt_len=0)
+    # Rebuild the tail over multiple suffix chunks with absolute positions.
+    for offset in range(0, tail_tokens, 32):
+        count = min(32, tail_tokens - offset)
+        runner._append_prefill_tail(
+            state,
+            torch.full((count, task_args_module.DSPARK_MAIN_HIDDEN_DIM), 3, dtype=torch.bfloat16),
+            4096 + offset,
+        )
+    dispatches = []
+    monkeypatch.setattr(
+        runner, "_run_drafter_and_markov",
+        lambda batch, context_rows: dispatches.append((batch, context_rows)),
+    )
+    if tail_tokens < 128:
+        with pytest.raises(RuntimeError, match="complete prompt tail"):
+            runner.finalize_prefill(["hit"], [42])
+        assert not dispatches
+        return
+
+    runner.finalize_prefill(["hit"], [42])
+    assert dispatches == [(4, 32)]
+    assert state.prompt_len == state.committed_count == 4224
+    assert len(state.pending_draft_tokens) == 7
+    context = runner._drafter_context_staging[32]
+    assert context["context_group_position_ids"][8].tolist() == list(range(4096, 4224))
+    slots = context["context_group_slot_mapping"][8]
+    assert bool((slots >= 0).all())
 
 
 def test_run_decode_accepts_and_redrafts(monkeypatch) -> None:

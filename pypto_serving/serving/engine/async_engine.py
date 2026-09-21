@@ -189,15 +189,6 @@ class ReplicaEngineCore:
             block_size=block_size,
             enable_prefix_cache=self.config.enable_prefix_cache,
         )
-        if (
-            runtime.kv_cache_groups
-            and self.config.enable_prefix_cache
-            and runtime.num_speculative_tokens > 0
-            and not any(group.is_eagle_group for group in runtime.kv_cache_groups)
-        ):
-            raise ValueError(
-                "DeepSeek grouped MTP prefix caching requires an EAGLE cache group"
-            )
         self._async_scheduling = self.config.resolve_async_scheduling()
         scheduler_config = SchedulerConfig(
             max_num_running_reqs=self.config.max_num_running_reqs,
@@ -212,11 +203,14 @@ class ReplicaEngineCore:
             supports_chunked_prefill_with_speculation=(
                 runtime.supports_chunked_prefill_with_speculation
             ),
+            speculative_prefix_cache_replay_tokens=runtime.speculative_prefix_cache_replay_tokens,
             requires_homogeneous_prefill_decode=(
                 runtime.requires_homogeneous_prefill_decode
             ),
             async_scheduling=self._async_scheduling,
         )
+        # Validate before worker startup, while the manager's pools are still lazy.
+        scheduler_config.validate_cache_groups(runtime.kv_cache_groups)
         self.scheduler = Scheduler(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)
 
         self._request_contexts: dict[str, _RequestContext] = {}

@@ -6,9 +6,8 @@ deployment of the DeepSeek-V4-Flash W8A8 checkpoint with the DSpark decode
 tile (64 requests x 8 rows per TP group), block size 32, and the paged
 full-context prefill tables.
 
-The current milestone serves the **target model only** -- prefill, decode, and
-greedy generation without speculation. The DSpark drafter chain is a
-subsequent milestone; see "Drafter roadmap" below.
+Serving supports target-only greedy generation (K=0) and the DSpark
+speculative chain (K=7), including grouped prefix caching for both modes.
 
 ## Topology and selection
 
@@ -35,13 +34,43 @@ Validated constraints (enforced at startup):
 - Exactly 16 devices with `--dp 4 --ep 16 --tp 4`. The 16 ranks form 4 TP
   groups; `moe.py` rescales `n_routed_experts` by `EP/16`, so other EP values
   compile a wrong expert view.
-- `--block-size 32` (the DSpark page size; the MTP variant uses 128).
+- `--block-size 32` for raw KV pages. Compressed pages cover 128 source
+  tokens, matching MTP: one HCA row or 32 C4/indexer rows per page.
 - `--max-num-seqs` at most 256 (64 requests per TP group).
 - `--max-model-len` at most 1,048,576, including prompt and generated output.
   Prefill chunks long prompts through the 8192-token dispatch bound. Serving
   sizes the full-history compressed and index pools from the configured limit,
   while the raw KV and compressor-state pools remain bounded rings.
-- Prefix caching is forced off for now.
+- Prefix caching supports both K=0 and K=7 via `--enable-prefix-caching`.
+  Grouped hits align to 128 source tokens (one full HCA compressed page).
+  K=0 leaves at least one token for prefill; K=7 leaves at least 128 tokens
+  to rebuild the drafter context, so its first possible hit needs a prompt
+  of at least 256 tokens. K=0 needs at least 129 tokens.
+
+## Prefix caching
+
+The HCA cache layout changes the prefill/decode kernel ABI. On the first
+launch after upgrading, omit `--use-compile-cache` to regenerate both graphs.
+
+The seven target cache families use the shared grouped prefix-cache manager.
+Lookup selects the TP partition with the longest reusable prefix, sharing
+full compressed-history pages and the immutable rolling tail. The allocator
+detaches rolling write destinations before continuing a shared prefix.
+Rolling pool capacities include both the configured prefill chunk and the
+historical window, because prefill writes its whole chunk before attention
+reads the prefix. The pool budget follows the active chunk limit; the CSA
+lookup requires only its eight-token historical tail. The fused decode state
+descriptors use the same physical ring lengths as the scheduler, so device-side
+modulo stays aligned after wraparound, including after a prefix-cache hit.
+
+The drafter's private caches are rebuilt rather than shared. K=7 sets
+`speculative_prefix_cache_replay_tokens=128` in the runtime contract; the
+scheduler caps the hit before rounding down to the grouped page alignment.
+Suffix prefill may span several chunks. Its last 128 hidden rows and absolute
+positions seed a fresh drafter lease through the normal prefill-finalization
+path. The runner rejects an incomplete tail instead of reading stale private
+KV from a previous lease. A prefix leaving fewer than 128 suffix tokens falls
+back to an earlier aligned hit or a cold prefill.
 
 The checkpoint's `max_position_embeddings` must cover the requested Serving limit.
 
@@ -52,10 +81,10 @@ The checkpoint's `max_position_embeddings` must cover the requested Serving limi
   rows on all four ranks, and decode rebuilds the group's whole KV stream
   from the gathered token rows each step (pypto-lib#1079).
 - **Long-context capacity is logical, not fully resident.** Ratio-128 history
-  grows to 256 pages per request at 1M; ratio-4 and index history grow to 8192
-  pages. Raw KV and HCA/CSA state remain rolling physical pools. Startup memory
-  admission still needs room for one complete logical-capacity request plus
-  scratch pages.
+  grows to 8192 single-row pages per request at 1M; ratio-4 and index
+  history also grow to 8192 pages. Raw KV and HCA/CSA state remain rolling
+  physical pools. Startup memory admission still needs room for one complete
+  logical-capacity request plus scratch pages.
 - **Block tables are staged at the kernels' frozen depths** (CSA compressed
   and indexer tables 8192 entries, HCA compress-state table 131072, CSA
   compress-state tables 524288, -1 past
@@ -140,10 +169,14 @@ python -m pytest tests/test_deepseek_dspark_accuracy.py -q
 ```
 
 `tests/test_deepseek_dspark_accuracy.py` starts the HTTP server on 16 borrowed
-devices, then checks greedy generation with two cases mirroring the MTP guard's
+devices, then checks greedy generation with two short cases mirroring the MTP guard's
 64-token prompt / 128-token gate (the same Palace Museum prompt, so both
 variants gate the same request shape): the target-only `K=0` contract and the
-`K=7` speculative chain. Greedy is the only sampling mode -- the kernels expose
+`K=7` speculative chain. Two additional prefix-cache cases compare cold and
+cached completions at K=0 and K=7 and require an observable 128-token cache
+hit. Run these alone with `-k prefix-cache`.
+
+Greedy is the only sampling mode -- the kernels expose
 device greedy sampling with no temperature ABI, so requests with
 `temperature > 0` fail with an explicit error.
 

@@ -160,6 +160,9 @@ class RuntimeConfig:
     # Whether speculative decoding can safely consume a prompt produced by
     # more than one prefill dispatch.
     supports_chunked_prefill_with_speculation: bool = True
+    # A nonzero window opts into grouped prefix caching with private draft
+    # caches rebuilt from this many freshly prefilled suffix tokens.
+    speculative_prefix_cache_replay_tokens: int = 0
     # Whether the kernel requires each scheduler step to contain prefill or
     # decode work, never both.
     requires_homogeneous_prefill_decode: bool = False
