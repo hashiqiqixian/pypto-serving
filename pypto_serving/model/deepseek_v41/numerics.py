@@ -257,6 +257,9 @@ class ModelMath:
         self.eps = float(self.text["rms_norm_eps"])
         self.hc = int(self.text["hc_mult"])
 
+    def normalize(self, x: torch.Tensor, name: str) -> torch.Tensor:
+        return rms_norm(x, self.ops.weight(name), self.eps)
+
     def hc_mixes(self, x: torch.Tensor, prefix: str) -> tuple[torch.Tensor, ...]:
         flat = x.flatten(-2).float()
         mixes = self.ops.linear(flat, prefix + "_fn")

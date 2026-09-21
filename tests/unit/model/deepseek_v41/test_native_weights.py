@@ -170,3 +170,61 @@ def test_scale_only_selection_does_not_return_a_payload(case, packing):
         assert result["wq_a_scale"].dtype == torch.float8_e8m0fnu
     finally:
         weights.close()
+
+
+@pytest.mark.parametrize("projection", ["w1", "w2", "w3"])
+def test_native_expert_preserves_checkpoint_nibbles_and_scales(case, packing, projection):
+    weights = _fixtures.store(case, out_tile_rows=32)
+    name = f"layers.0.ffn.experts.0.{projection}.weight"
+    try:
+        payload, scales = packing.pack_native_matrix(weights, name)
+        assert payload.dtype == torch.uint8
+        assert scales.dtype == torch.float8_e8m0fnu
+        assert torch.equal(payload, case.tensors[name].view(torch.uint8))
+        assert torch.equal(scales.view(torch.uint8),
+                           case.tensors[name.removesuffix(".weight") + ".scale"].view(torch.uint8))
+        assert all(ranges[0].stop - ranges[0].start <= 32 for _, ranges in case.reads)
+        payload.zero_()
+        again, _ = packing.pack_native_matrix(weights, name)
+        assert torch.equal(again, case.tensors[name].view(torch.uint8))
+    finally:
+        weights.close()
+
+
+def test_native_expert_budget_fails_before_payload_reads(case, packing):
+    weights = _fixtures.store(case, max_load_bytes=1)
+    try:
+        with pytest.raises(ValueError, match="budget"):
+            packing.pack_native_matrix(weights, "layers.0.ffn.experts.0.w1")
+        assert not case.reads
+    finally:
+        weights.close()
+
+
+def test_native_shared_projection_payload_and_scale_panel_order(packing):
+    rows, width = 128, 64
+    payload = torch.arange(rows * width).remainder(100).reshape(rows, width).to(torch.float8_e4m3fn)
+    codes = torch.arange(rows * (width // 32)).remainder(8).add(120).reshape(rows, width // 32).byte()
+
+    class Store:
+        world_size = 1
+
+        def matrix_format(self, name):
+            return "fp8"
+
+        def matrix_shape(self, name):
+            return rows, width
+
+        def _budget(self, size):
+            assert size < 1 << 20
+
+        def matrix_tiles(self, name):
+            for row in range(0, rows, 32):
+                for column in range(0, width, 32):
+                    values = payload[row:row + 32, column:column + 32].float()
+                    factors = torch.exp2(codes[row:row + 32, column // 32].float() - 127)
+                    yield row, column, values, factors
+
+    result, scales = packing.pack_native_matrix(Store(), "shared.w1")
+    assert torch.equal(result.view(torch.uint8), payload.T.contiguous().view(torch.uint8))
+    assert torch.equal(scales.view(torch.uint8), _mx_bytes(codes.T.contiguous()))
