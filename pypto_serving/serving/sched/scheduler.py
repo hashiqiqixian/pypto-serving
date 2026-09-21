@@ -133,6 +133,9 @@ class Request:
     group_block_hashes: dict[str, list[int]] = field(default_factory=dict)
     num_blocks_cached: int = 0  # Track how many blocks have been published to prefix cache
     num_group_blocks_cached: dict[str, int] = field(default_factory=dict)
+    # Earliest valid KV position after a model skips the beginning of a
+    # prefill chunk. Keep this across decode so partial pages stay unpublished.
+    group_cache_valid_from: dict[str, int] = field(default_factory=dict)
     # Async scheduling: tokens scheduled optimistically but not yet sampled.
     # Stands in for output tokens still in flight so the next schedule() advances
     # correctly; decremented as real tokens are applied in update_from_output.
@@ -738,6 +741,16 @@ class Scheduler:
                 continue
             if (
                 scheduled.is_prefill
+                and self.config.enable_prefix_cache
+                and self.kv_cache_manager.has_groups
+            ):
+                request.group_cache_valid_from = self.kv_cache_manager.group_cache_valid_from_after_prefill(
+                    scheduled.num_computed_tokens + scheduled.num_new_tokens,
+                    scheduled.num_new_tokens,
+                    request.group_cache_valid_from,
+                )
+            if (
+                scheduled.is_prefill
                 and scheduled.num_computed_tokens + scheduled.num_new_tokens
                 >= request.num_prompt_tokens
             ):
@@ -860,6 +873,7 @@ class Scheduler:
                         request.num_group_blocks_cached,
                         scheduled.block_ids_by_group,
                         scheduled.cache_partition,
+                        valid_from=request.group_cache_valid_from,
                     )
                 )
             else:
@@ -1017,6 +1031,7 @@ class Scheduler:
             request.allocated_group_block_ids = {}
         request.cache_partition = None
         request.num_group_blocks_cached = {}
+        request.group_cache_valid_from = {}
 
     def _cache_completed_blocks(
         self,
@@ -1037,6 +1052,7 @@ class Scheduler:
                 request.group_block_hashes,
                 confirmed_tokens,
                 request.num_group_blocks_cached,
+                valid_from=request.group_cache_valid_from,
             )
             return
         total_blocks_computed = min(
