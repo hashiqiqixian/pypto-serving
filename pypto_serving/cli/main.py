@@ -296,6 +296,11 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     # The serving contract is one overlapped worker group of 16 ranks with
     # expert parallelism spanning it, so the config collapses dp/tp to one.
     dspark_variant = model_family == "deepseek_v4" and model_variant == "dspark"
+    if dspark_variant:
+        # The dspark world size is flag-driven: --ep is the rank count and the
+        # executor freezes the kernel layout (import arguments, cache
+        # partitions, packed-prefill capacity) from it.
+        executor_kwargs["cache_ranks"] = args.expert_parallel_size
     parallel_config = ParallelConfig(
         data_parallel_size=1 if dspark_variant else args.data_parallel_size,
         tensor_parallel_size=1 if dspark_variant else args.tensor_parallel_size,
@@ -365,6 +370,7 @@ def _build_runtime_config(
         from pypto_serving.model.deepseek_dspark.npu_runner import (
             DSPARK_PREFILL_MAX_TOKENS,
             DSPARK_SLIDING_WINDOW,
+            DSPARK_TP_SIZE,
             build_dspark_cache_group_specs,
         )
 
@@ -383,6 +389,7 @@ def _build_runtime_config(
             compress_ratios,
             max_seq_len=args.max_model_len,
             max_prefill_tokens=max_prefill_tokens_per_request,
+            partitions=args.expert_parallel_size // DSPARK_TP_SIZE,
         )
         if num_speculative_tokens:
             speculative_prefix_cache_replay_tokens = DSPARK_SLIDING_WINDOW
@@ -711,27 +718,27 @@ def _validate_model_topology(
 def _validate_dspark_topology(args: argparse.Namespace) -> None:
     """Validate the configured TP4 DSpark serving topology from the flags."""
     from pypto_serving.model.deepseek_dspark.npu_runner import (
-        DSPARK_CACHE_PARTITIONS,
         DSPARK_DECODE_BATCH,
         DSPARK_MAX_SEQ_LEN,
         DSPARK_TP_SIZE,
     )
 
-    ranks = DSPARK_CACHE_PARTITIONS * DSPARK_TP_SIZE
-    if (
-        args.data_parallel_size != DSPARK_CACHE_PARTITIONS
-        or args.expert_parallel_size != ranks
-        or args.tensor_parallel_size != DSPARK_TP_SIZE
-    ):
-        raise ValueError(
-            "DSpark serving requires "
-            f"--dp {DSPARK_CACHE_PARTITIONS} --ep {ranks} --tp {DSPARK_TP_SIZE}"
-        )
+    # The deployment is TP4 with expert parallelism spanning the whole world:
+    # --ep is the rank count (16 in production, 8 on a half node) and --dp is
+    # the scheduler cache-partition count derived from it.
+    ranks = args.expert_parallel_size
+    partitions = ranks // DSPARK_TP_SIZE
+    if args.tensor_parallel_size != DSPARK_TP_SIZE:
+        raise ValueError(f"DSpark serving requires --tp {DSPARK_TP_SIZE}")
+    if ranks not in (2 * DSPARK_TP_SIZE, 4 * DSPARK_TP_SIZE):
+        raise ValueError("DSpark serving requires --ep 8 or --ep 16 (TP4, EP=ranks)")
+    if args.data_parallel_size != partitions:
+        raise ValueError(f"DSpark serving requires --dp {partitions} with --ep {ranks}")
     if len(parse_device_ids(args.devices, default_device=args.device)) != ranks:
         raise ValueError(f"DSpark serving requires exactly {ranks} NPU device ids")
     if args.block_size != 32:
         raise ValueError("DSpark kernels require --block-size 32")
-    max_global_batch = DSPARK_CACHE_PARTITIONS * DSPARK_DECODE_BATCH
+    max_global_batch = partitions * DSPARK_DECODE_BATCH
     if args.max_num_seqs > max_global_batch:
         raise ValueError(
             "DSpark decode kernels support at most "

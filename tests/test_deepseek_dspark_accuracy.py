@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -166,6 +167,41 @@ GREEDY_CASES = (
         for k in (0, 7)
     ),
 )
+
+
+# The one-server CI guard runs this prompt for its prefix-cache phase.  It is
+# deliberately a different text from the greedy palace prompt: its grouped
+# pages must be produced and hit by this phase's own repeated request, never
+# seeded by the earlier greedy request against the same server.
+_PREFIX_CACHE_PROMPT = (
+    "The Longevity Hill overlooks the Kunming Lake, and the Seventeen-Arch "
+    "Bridge joins the island with the eastern shore. " * 16
+)
+
+
+def _stream_server_log(log_path: Path) -> tuple[threading.Thread, threading.Event]:
+    """Echo the server log to stdout as it is written.
+
+    The log file stays the source of truth for the marker and hit assertions
+    (complete and ordered); this only makes the same lines visible to CI
+    reviewers live instead of hiding them in a pytest tmp_path.
+    """
+    stop = threading.Event()
+
+    def follow() -> None:
+        with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+            while True:
+                line = handle.readline()
+                if line:
+                    print(f"[dspark-server] {line}", end="", flush=True)
+                elif stop.is_set():
+                    return
+                else:
+                    time.sleep(0.5)
+
+    streamer = threading.Thread(target=follow, name="dspark-server-log", daemon=True)
+    streamer.start()
+    return streamer, stop
 
 
 def _task_devices() -> tuple[int, ...]:
@@ -322,6 +358,116 @@ def test_dspark_http_greedy_generation(tmp_path: Path, case: DSparkCase) -> None
             assert "DSpark speculation progress" in log_text, (
                 "no acceptance progress line in the server log"
             )
+    except BaseException:
+        _print_server_log(log_path)
+        raise
+
+
+def test_dspark_http_k7_one_server(tmp_path: Path) -> None:
+    """One K=7 server: cold greedy generation, then prefix cache.
+
+    The CI shape: boot one caching-enabled server, run the palace prompt cold
+    (the generation-correctness guard), then a deliberately different long
+    prompt twice so its grouped pages are produced and then hit by this
+    phase's own repeat -- never seeded by the greedy request.
+    """
+    model_dir_env = os.environ.get("PYPTO_DSV4_DSPARK_MODEL_DIR")
+    model_dir = Path(model_dir_env) if model_dir_env else DEFAULT_MODEL_DIR
+    if not model_dir.is_dir():
+        pytest.fail(
+            "DSpark W8A8 checkpoint not found (set PYPTO_DSV4_DSPARK_MODEL_DIR): "
+            f"{model_dir}"
+        )
+    devices = _task_devices()
+    port = _unused_local_port()
+    log_path = tmp_path / "dspark-k7-one-server.log"
+    deadline = time.monotonic() + OVERALL_TIMEOUT_SECONDS
+
+    try:
+        with log_path.open("w", encoding="utf-8") as server_log:
+            process = subprocess.Popen(
+                _server_command(
+                    model_dir,
+                    devices,
+                    port,
+                    num_speculative_tokens=7,
+                    enable_prefix_caching=True,
+                ),
+                cwd=ROOT,
+                stdout=server_log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                text=True,
+            )
+            streamer, stop_stream = _stream_server_log(log_path)
+            try:
+                _wait_for_health(process, port, deadline)
+
+                # Phase 1: cold greedy generation correctness.
+                response = _request_completion(
+                    process,
+                    port,
+                    deadline,
+                    prompt=_MTP_64_128.prompt,
+                    max_new_tokens=_MTP_64_128.max_new_tokens,
+                    model=MODEL_ID,
+                )
+                print(f"DSpark one-server greedy completion: {response}", flush=True)
+                assert response.get("model") == MODEL_ID
+                choices = response.get("choices")
+                assert isinstance(choices, list) and len(choices) == 1
+                assert choices[0].get("finish_reason") == "length"
+                usage = response.get("usage", {})
+                assert usage.get("prompt_tokens") == _MTP_64_128.prompt_tokens
+                assert usage.get("completion_tokens") == _MTP_64_128.max_new_tokens
+
+                # Phase 2: a different prompt, twice, to exercise prefix cache.
+                first = _request_completion(
+                    process,
+                    port,
+                    deadline,
+                    prompt=_PREFIX_CACHE_PROMPT,
+                    max_new_tokens=16,
+                    model=MODEL_ID,
+                )
+                print(f"DSpark one-server prefix-cache first: {first}", flush=True)
+                assert first["choices"][0]["finish_reason"] == "length"
+                first_usage = first.get("usage", {})
+                assert 256 <= first_usage.get("prompt_tokens", 0) < 4096
+                assert first_usage.get("completion_tokens") == 16
+                repeated = _request_completion(
+                    process,
+                    port,
+                    deadline,
+                    prompt=_PREFIX_CACHE_PROMPT,
+                    max_new_tokens=16,
+                    model=MODEL_ID,
+                )
+                assert repeated["usage"] == first_usage
+                assert repeated["choices"][0]["finish_reason"] == "length"
+                assert repeated["choices"][0]["text"] == first["choices"][0]["text"]
+            finally:
+                _stop_process_group(process)
+                # Give the writer a moment to flush the shutdown lines, then
+                # stop echoing; the file keeps everything for the assertions.
+                time.sleep(1.0)
+                stop_stream.set()
+                streamer.join(timeout=5)
+        _wait_for_device_reclaim(devices)
+
+        log_text = log_path.read_text(encoding="utf-8")
+        assert ONE_L2_COMPILE_MARKER in log_text, (
+            "the K=7 accuracy guard did not compile the fused one-L2 decode entry"
+        )
+        assert "DSpark speculation progress" in log_text, (
+            "no acceptance progress line in the server log"
+        )
+        hits = [
+            int(value) for value in re.findall(r"prefix_cache_hit_tokens=(\d+)", log_text)
+        ]
+        assert hits and max(hits) >= 128, "no grouped prefix-cache hit in the server log"
+        assert all(hit % 128 == 0 for hit in hits)
+        assert max(hits) <= first_usage["prompt_tokens"] - 128
     except BaseException:
         _print_server_log(log_path)
         raise

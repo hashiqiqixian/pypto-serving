@@ -114,8 +114,17 @@ DSPARK_PREFILL_RING_HEAP = (
     4 * 1024 * 1024 * 1024,
     8 * 1024 * 1024 * 1024,
 )
-# dspark_drafter.py pins (4 GiB,)*4 for its own scope depths.
-DSPARK_DRAFTER_RING_HEAP = (4 << 30,) * 4
+# dspark_drafter.py pins (4 GiB,)*4 for its own scope depths.  EP8 doubles
+# each rank's routed experts, and the 16 GiB pooled arena no longer fits next
+# to the weights, so smaller worlds can shrink it (the profile is a generous
+# bring-up default, not a kernel-validated minimum).
+DSPARK_DRAFTER_RING_HEAP = tuple(
+    int(value)
+    for value in os.environ.get(
+        "PYPTO_DSPARK_DRAFTER_RING_HEAP",
+        "4294967296,4294967296,4294967296,4294967296",
+    ).split(",")
+)
 
 # ---- speculative drafter (milestone 2) ----
 # Kernel-fixed speculation constants (dspark_drafter.py / dspark_markov.py):
@@ -333,12 +342,14 @@ def build_dspark_cache_group_specs(
     *,
     max_seq_len: int = DSPARK_MAX_SEQ_LEN,
     max_prefill_tokens: int = DSPARK_PREFILL_MAX_TOKENS,
+    partitions: int = DSPARK_CACHE_PARTITIONS,
 ) -> tuple[KVCacheGroupSpec, ...]:
     """Describe the seven DSpark cache families as scheduler-visible groups.
 
-    ``num_partitions`` is the TP-group count (4), not the rank count: the four
-    ranks of one group hold identical replicated pools, so a block allocated in
-    partition g exists -- with the same id -- on every rank of group g.
+    ``partitions`` is the TP-group count (one per scheduler cache partition),
+    not the rank count: the four ranks of one group hold identical replicated
+    pools, so a block allocated in partition g exists -- with the same id -- on
+    every rank of group g.
     """
     for name, value in (("max_seq_len", max_seq_len), ("max_prefill_tokens", max_prefill_tokens)):
         if not isinstance(value, int) or isinstance(value, bool):
@@ -388,7 +399,7 @@ def build_dspark_cache_group_specs(
                 compress_ratio=compress_ratio,
             ),
             max_blocks_per_seq=int(max_blocks_per_seq),
-            num_partitions=DSPARK_CACHE_PARTITIONS,
+            num_partitions=partitions,
             sliding_window=sliding_window,
         )
 
@@ -503,6 +514,28 @@ class DSparkCacheLayout:
     prefill_local_tokens: int = DSPARK_PREFILL_LOCAL_TOKENS
     prefill_batch: int = DSPARK_PREFILL_MAX_BATCH
     prefill_requests: int = DSPARK_PREFILL_MAX_REQUESTS
+
+    @classmethod
+    def for_ranks(cls, ranks: int) -> "DSparkCacheLayout":
+        """Build the layout for one TP4 world of ``ranks`` ranks (8 or 16).
+
+        Only the rank-derived axes move: the scheduler cache partitions
+        (one per TP group) and the global packed-prefill request capacity that
+        is one ``DSPARK_DECODE_BATCH`` per partition. Every per-group extent
+        (decode batch, dispatch tokens, metadata table depths) is
+        world-size-invariant.
+        """
+        ranks = int(ranks)
+        if ranks not in (2 * DSPARK_TP_SIZE, 4 * DSPARK_TP_SIZE):
+            raise ValueError(
+                f"DSpark serving supports 8 or 16 ranks (TP4, EP=ranks), got {ranks}"
+            )
+        partitions = ranks // DSPARK_TP_SIZE
+        return cls(
+            ranks=ranks,
+            partitions=partitions,
+            prefill_batch=partitions * DSPARK_DECODE_BATCH,
+        )
 
     def validate_runtime(
         self, config: ModelConfig, runtime: RuntimeConfig, device_ids: Sequence[int]
@@ -1202,6 +1235,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 runtime.max_prefill_tokens_per_request or DSPARK_PREFILL_MAX_TOKENS,
                 runtime.max_num_batched_tokens,
             ),
+            partitions=self._compiled.layout.partitions,
         )
         names = tuple(spec.name for spec in specs)
         if names != DSPARK_CACHE_GROUP_NAMES:
@@ -1210,9 +1244,10 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 + ", ".join(DSPARK_CACHE_GROUP_NAMES)
                 + f"; got {names}"
             )
-        if any(spec.num_partitions != DSPARK_CACHE_PARTITIONS for spec in specs):
+        if any(spec.num_partitions != self._compiled.layout.partitions for spec in specs):
             raise ValueError(
-                f"DSpark KV cache groups must use {DSPARK_CACHE_PARTITIONS} partitions"
+                f"DSpark KV cache groups must use "
+                f"{self._compiled.layout.partitions} partitions"
             )
         return tuple(specs)
 

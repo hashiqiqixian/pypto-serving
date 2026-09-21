@@ -123,7 +123,7 @@ jobs:
           run_cmd="$run_cmd python -m pytest tests/test_qwen3_serving.py -q -s"
           task-submit --device auto --timeout 1200 --max-time 1800 --run "$run_cmd"
 
-      - name: Run DeepSeek V4 MTP HTTP matrix
+      - name: Run DeepSeek V4 MTP HTTP guard (K=1 fused)
         env:
           PYPTO_RUNTIME_LOG: error
         run: |
@@ -134,12 +134,15 @@ jobs:
           run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout"
           run_cmd="$run_cmd PYPTO_DSV4_MODEL_DIR=$PYPTO_DSV4_MODEL_DIR"
           run_cmd="$run_cmd PYPTO_RUNTIME_LOG=$PYPTO_RUNTIME_LOG"
-          run_cmd="$run_cmd python -m pytest tests/test_deepseek_v4_accuracy.py -q -s"
+          # Only the fused K=1 case runs: every case boots its own 8-card
+          # server. Selecting by node id also makes a renamed case id fail
+          # collection instead of silently widening the run.
+          run_cmd="$run_cmd python -m pytest 'tests/test_deepseek_v4_accuracy.py::test_deepseek_v4_http_completion_contract[k1-fused]' -q -s"
           task-submit --device auto --device-num 8 --ignore-whitelist \
             --timeout 2400 --max-time 3600 \
             --run "$run_cmd"
 
-      - name: Run DSpark HTTP guard (target K=0 and speculation K=7)
+      - name: Run DSpark HTTP guard (K=7, one server)
         env:
           PYPTO_RUNTIME_LOG: error
         run: |
@@ -150,7 +153,12 @@ jobs:
           run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout"
           run_cmd="$run_cmd PYPTO_DSV4_DSPARK_MODEL_DIR=$PYPTO_DSV4_DSPARK_MODEL_DIR"
           run_cmd="$run_cmd PYPTO_RUNTIME_LOG=$PYPTO_RUNTIME_LOG"
-          run_cmd="$run_cmd python -m pytest tests/test_deepseek_dspark_accuracy.py -q -s"
+          # One 16-card server for the whole guard: the cold greedy palace
+          # request checks generation correctness, then a different prompt run
+          # twice exercises prefix cache on the same boot. Selecting by node
+          # id also makes a renamed case id fail collection instead of
+          # silently widening the run.
+          run_cmd="$run_cmd python -m pytest 'tests/test_deepseek_dspark_accuracy.py::test_dspark_http_k7_one_server' -q -s"
           task-submit --device auto --device-num 16 --ignore-whitelist \
             --timeout 4800 --max-time 7200 \
             --run "$run_cmd"
