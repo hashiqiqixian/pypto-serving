@@ -24,6 +24,7 @@ import pytest
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import TokenOutput
+from pypto_serving.serving.reasoning import OutputParserSpec
 from pypto_serving.serving.server.server import (
     ChatCompletionRequest,
     ChatMessage,
@@ -41,6 +42,7 @@ class _FakeEngine:
 
     def __init__(self, outputs: list[TokenOutput]) -> None:
         self._outputs = outputs
+        self.calls = []
 
     class _FakeTokenizer:
         def encode(self, text: str) -> list[int]:
@@ -52,6 +54,7 @@ class _FakeEngine:
     tokenizer = _FakeTokenizer()
 
     async def add_request(self, request_id, prompt, config, **kwargs):
+        self.calls.append((request_id, prompt, kwargs))
         for out in self._outputs:
             yield out
 
@@ -164,6 +167,83 @@ def test_stream_completion_terminal_usage_chunk():
     delta_chunks = [c for c in parsed if c["choices"]]
     for c in delta_chunks:
         assert c.get("usage") is None, f"Intermediate chunk has usage: {c}"
+
+
+def test_chat_serializes_reasoning_and_freezes_parser_spec() -> None:
+    engine = _FakeEngine(
+        [
+            TokenOutput(
+                text="最终答案",
+                reasoning="先分析",
+                token_ids=(90, 1, 91, 2),
+                finished=True,
+                finish_reason="FINISHED_LENGTH",
+                prompt_tokens=4,
+                completion_tokens=4,
+            )
+        ]
+    )
+
+    class _DeepSeekTokenizer(_FakeEngine._FakeTokenizer):
+        output_parser_id = "deepseek_v4"
+
+    engine.tokenizer = _DeepSeekTokenizer()
+    server = ServingServer(engine, "test-model", GenerateConfig(max_new_tokens=4))
+    response = asyncio.run(
+        server._chat_completions(
+            ChatCompletionRequest(
+                messages=[ChatMessage(role="user", content="问题")],
+                chat_template_kwargs={"enable_thinking": True},
+            )
+        )
+    )
+
+    body = json.loads(response.body)
+    message = body["choices"][0]["message"]
+    assert message["reasoning"] == "先分析"
+    assert message["content"] == "最终答案"
+    spec = engine.calls[0][2]["output_parser_spec"]
+    assert spec.parser_id == "deepseek_v4"
+    assert spec.initial_state == "reasoning"
+
+
+def test_chat_stream_emits_independent_reasoning_and_content_deltas() -> None:
+    engine = _FakeEngine(
+        [
+            TokenOutput(reasoning_delta="先"),
+            TokenOutput(reasoning_delta="分析"),
+            TokenOutput(
+                reasoning="先分析",
+                text="答案",
+                text_delta="答案",
+                finished=True,
+                finish_reason="FINISHED_EOS",
+                prompt_tokens=2,
+                completion_tokens=3,
+            ),
+        ]
+    )
+    server = ServingServer(engine, "test-model", GenerateConfig())
+
+    async def collect():
+        return [
+            chunk
+            async for chunk in server._stream_chat_completion(
+                "chat-0",
+                "prompt",
+                GenerateConfig(stream=True),
+                "test-model",
+                output_parser_spec=OutputParserSpec(
+                    "deepseek_v4",
+                    "reasoning",
+                ),
+            )
+        ]
+
+    parsed = _parse_sse(b"".join(chunk.encode() for chunk in asyncio.run(collect())))
+    deltas = [chunk["choices"][0]["delta"] for chunk in parsed if chunk["choices"]]
+    assert [delta["reasoning"] for delta in deltas] == ["先", "分析", None]
+    assert [delta["content"] for delta in deltas] == ["", "", "答案"]
 
 
 def test_explicit_request_fields_clear_server_generate_defaults():

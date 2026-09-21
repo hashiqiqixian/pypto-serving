@@ -38,6 +38,29 @@ def test_fast_tokenizer_load_preserves_checkpoint_chat_template(tmp_path):
     assert tokenizer.kwargs["chat_template"] == "{{ messages[0].content }}"
 
 
+def test_fast_tokenizer_load_registers_backend_special_tokens(tmp_path):
+    class FakeTokenizer:
+        def __init__(self, tokenizer_file, **kwargs):
+            self.tokenizer_file = tokenizer_file
+            self.kwargs = kwargs
+
+    (tmp_path / "tokenizer.json").write_text(json.dumps({
+        "added_tokens": [
+            {"id": 0, "content": "<bos>", "special": True},
+            {"id": 2, "content": "<internal>", "special": True},
+            {"id": 3, "content": "ordinary", "special": False},
+        ],
+    }))
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({
+        "bos_token": {"content": "<bos>"},
+    }))
+
+    tokenizer = _load_fast_tokenizer_from_file(tmp_path, FakeTokenizer)
+
+    assert tokenizer.kwargs["bos_token"] == "<bos>"
+    assert tokenizer.kwargs["additional_special_tokens"] == ["<internal>"]
+
+
 def test_deepseek_v4_defaults_to_chat_mode():
     adapter = DeepSeekV4TokenizerAdapter(tokenizer=object())
 
@@ -58,6 +81,18 @@ def test_deepseek_v4_enables_thinking_with_vllm_compatible_kwarg():
     ], enable_thinking=True)
 
     assert prompt.endswith("<｜Assistant｜><think>")
+
+
+def test_deepseek_v4_reasoning_none_overrides_enable_thinking():
+    adapter = DeepSeekV4TokenizerAdapter(tokenizer=object())
+
+    prompt = adapter.apply_chat_template(
+        [{"role": "user", "content": "What is 1+1?"}],
+        enable_thinking=True,
+        reasoning_effort="none",
+    )
+
+    assert prompt.endswith("<｜Assistant｜></think>")
 
 
 def test_deepseek_v4_multiturn_thinking_only_marks_latest_user_turn():

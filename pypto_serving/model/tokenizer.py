@@ -27,9 +27,28 @@ class TokenizerAdapter:
         """Encode text into token IDs without adding prompt specials."""
         raise NotImplementedError
 
-    def decode(self, token_ids: list[int]) -> str:
+    def decode(
+        self,
+        token_ids: list[int],
+        *,
+        skip_special_tokens: bool = True,
+    ) -> str:
         """Decode token IDs into text."""
         raise NotImplementedError
+
+    def get_vocab(self) -> dict[str, int]:
+        """Return the vocabulary used to resolve model control tokens."""
+        raise NotImplementedError
+
+    @property
+    def all_special_ids(self) -> tuple[int, ...]:
+        """Return token IDs that must not leak into public text."""
+        return ()
+
+    @property
+    def output_parser_id(self) -> str | None:
+        """Return the Serving output parser registered for this tokenizer."""
+        return None
 
     def apply_chat_template(self, messages: list[dict[str, str]], **kwargs) -> str:
         """Encode chat messages into the model's generation prompt."""
@@ -110,9 +129,27 @@ class TransformersTokenizerAdapter(TokenizerAdapter):
         """Encode text using the wrapped Hugging Face tokenizer."""
         return list(self.tokenizer.encode(text, add_special_tokens=False))
 
-    def decode(self, token_ids: list[int]) -> str:
-        """Decode token IDs, stripping special tokens (EOS / pad / im_end ...) from output."""
-        return self.tokenizer.decode(token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    def decode(
+        self,
+        token_ids: list[int],
+        *,
+        skip_special_tokens: bool = True,
+    ) -> str:
+        """Decode token IDs with request-selectable special-token handling."""
+        return self.tokenizer.decode(
+            token_ids,
+            skip_special_tokens=skip_special_tokens,
+            clean_up_tokenization_spaces=False,
+        )
+
+    def get_vocab(self) -> dict[str, int]:
+        """Return a stable copy of the wrapped tokenizer vocabulary."""
+        return dict(self.tokenizer.get_vocab())
+
+    @property
+    def all_special_ids(self) -> tuple[int, ...]:
+        """Return all special-token IDs exposed by the wrapped tokenizer."""
+        return tuple(int(token_id) for token_id in self.tokenizer.all_special_ids)
 
     def apply_chat_template(self, messages: list[dict[str, str]], **kwargs) -> str:
         """Apply the Hugging Face chat template loaded with the tokenizer."""
@@ -143,13 +180,19 @@ class DeepSeekV4TokenizerAdapter(TransformersTokenizerAdapter):
 
         thinking = bool(kwargs.get("thinking", False) or kwargs.get("enable_thinking", False))
         reasoning_effort = kwargs.get("reasoning_effort")
-        if reasoning_effort == "none" and thinking:
+        if reasoning_effort == "none":
+            thinking = False
             reasoning_effort = None
         return encode_messages(
             messages,
             thinking=thinking,
             reasoning_effort=reasoning_effort if isinstance(reasoning_effort, str) else None,
         )
+
+    @property
+    def output_parser_id(self) -> str | None:
+        """DeepSeek V4 emits reasoning control tokens understood by Serving."""
+        return "deepseek_v4"
 
 
 def load_tokenizer(model_dir: str | Path, *, trust_remote_code: bool = False) -> TokenizerAdapter:
@@ -180,13 +223,28 @@ def _load_fast_tokenizer_from_file(model_path: Path, tokenizer_cls: type) -> obj
     tokenizer_file = model_path / "tokenizer.json"
     if not tokenizer_file.exists():
         raise FileNotFoundError(f"Missing tokenizer.json in {model_path}")
+    tokenizer_payload = json.loads(tokenizer_file.read_text())
     config_path = model_path / "tokenizer_config.json"
     tokenizer_config = json.loads(config_path.read_text()) if config_path.exists() else {}
-    special_tokens = {
+    special_tokens: dict[str, object] = {
         name: _token_content(tokenizer_config.get(name))
         for name in ("bos_token", "eos_token", "pad_token", "unk_token")
         if _token_content(tokenizer_config.get(name)) is not None
     }
+    registered = set(special_tokens.values())
+    additional_special_tokens: list[str] = []
+    for token in tokenizer_payload.get("added_tokens", ()):
+        if not isinstance(token, dict) or token.get("special") is not True:
+            continue
+        content = token.get("content")
+        if (
+            isinstance(content, str)
+            and content not in registered
+        ):
+            additional_special_tokens.append(content)
+            registered.add(content)
+    if additional_special_tokens:
+        special_tokens["additional_special_tokens"] = additional_special_tokens
     chat_template = tokenizer_config.get("chat_template")
     if isinstance(chat_template, (str, dict)):
         special_tokens["chat_template"] = chat_template

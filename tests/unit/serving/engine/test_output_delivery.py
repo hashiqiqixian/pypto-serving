@@ -13,6 +13,7 @@ from pypto_serving.serving.engine.async_engine import (
     ReplicaEngineCore,
     _RequestContext,
 )
+from pypto_serving.serving.reasoning import OutputParserSpec, create_output_parser
 from pypto_serving.serving.sched.scheduler import (
     Request,
     RequestOutput,
@@ -107,6 +108,292 @@ def test_finalize_detok_flushes_trailing_incomplete_char_at_eos():
     # On finish, the authoritative full decode is flushed (no truncation).
     final = core._finalize_detokenization(ctx)
     assert final == core.tokenizer.decode([1, 2, 6]) == "Hi!�"
+
+
+def test_process_step_output_splits_reasoning_from_k7_token_burst():
+    class _ReasoningTokenizer:
+        vocab = {"<think>": 90, "</think>": 91}
+        pieces = {1: "先", 2: "思考", 3: "答案"}
+        all_special_ids = (90, 91)
+
+        def get_vocab(self):
+            return dict(self.vocab)
+
+        def decode(self, ids, *, skip_special_tokens=True):
+            parts = []
+            for token_id in ids:
+                if token_id in self.vocab.values():
+                    if not skip_special_tokens:
+                        parts.append({90: "<think>", 91: "</think>"}[token_id])
+                    continue
+                parts.append(self.pieces.get(token_id, ""))
+            return "".join(parts)
+
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.tokenizer = _ReasoningTokenizer()
+    core._pending_free_ids = []
+    core.scheduler = _ScriptedScheduler(
+        [
+            RequestOutput(
+                request_id="r",
+                new_token_id=3,
+                finished=True,
+                finish_reason="FINISHED_LENGTH",
+            )
+        ]
+    )
+    request = Request(request_id="r", prompt_token_ids=[9], max_new_tokens=4)
+    request.output_token_ids.extend([1, 2, 91, 3])
+    ctx = _RequestContext(
+        request=request,
+        stream=True,
+        output_parser=create_output_parser(
+            OutputParserSpec("deepseek_v4", "reasoning"),
+            core.tokenizer,
+        ),
+    )
+    core._request_contexts = {"r": ctx}
+
+    core._process_step_output(SchedulerOutput(scheduled_requests=[]), {})
+
+    output = ctx.queue.get_nowait()
+    assert output.reasoning == "先思考"
+    assert output.text == "答案"
+    assert output.reasoning_delta == "先思考"
+    assert output.text_delta == "答案"
+    assert output.token_ids == (1, 2, 91, 3)
+
+
+def test_process_step_output_keeps_incremental_reasoning_state() -> None:
+    class _ReasoningTokenizer:
+        vocab = {"<think>": 90, "</think>": 91}
+        pieces = {1: "先", 2: "思考", 3: "答案"}
+        all_special_ids = (90, 91)
+
+        def get_vocab(self):
+            return dict(self.vocab)
+
+        def decode(self, ids, *, skip_special_tokens=True):
+            parts = []
+            for token_id in ids:
+                if token_id in self.vocab.values():
+                    if not skip_special_tokens:
+                        parts.append({90: "<think>", 91: "</think>"}[token_id])
+                    continue
+                parts.append(self.pieces.get(token_id, ""))
+            return "".join(parts)
+
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.tokenizer = _ReasoningTokenizer()
+    core._pending_free_ids = []
+    core.scheduler = _ScriptedScheduler(
+        [
+            RequestOutput(request_id="r", new_token_id=2),
+            RequestOutput(
+                request_id="r",
+                new_token_id=3,
+                finished=True,
+                finish_reason="FINISHED_LENGTH",
+            ),
+        ]
+    )
+    request = Request(request_id="r", prompt_token_ids=[9], max_new_tokens=4)
+    request.output_token_ids.extend([1, 2])
+    ctx = _RequestContext(
+        request=request,
+        stream=True,
+        output_parser=create_output_parser(
+            OutputParserSpec("deepseek_v4", "reasoning"),
+            core.tokenizer,
+        ),
+    )
+    core._request_contexts = {"r": ctx}
+
+    core._process_step_output(SchedulerOutput(scheduled_requests=[]), {})
+    first = ctx.queue.get_nowait()
+    assert first.reasoning_delta == "先思考"
+    assert first.text_delta == ""
+    assert first.reasoning == first.text == ""
+
+    request.output_token_ids.extend([91, 3])
+    core._process_step_output(SchedulerOutput(scheduled_requests=[]), {})
+    final = ctx.queue.get_nowait()
+    assert final.reasoning_delta == ""
+    assert final.text_delta == "答案"
+    assert final.reasoning == "先思考"
+    assert final.text == "答案"
+
+
+def test_process_step_output_contains_parser_failure_to_one_request() -> None:
+    class _Tokenizer:
+        def decode(self, ids, *, skip_special_tokens=True):
+            return "".join(str(token_id) for token_id in ids)
+
+    class _FailingParser:
+        def feed(self, delta_text, delta_token_ids):
+            return SimpleNamespace(reasoning="", content=delta_text)
+
+        def finish(self):
+            raise ValueError("malformed terminal tail")
+
+    class _TwoRequestScheduler:
+        def __init__(self):
+            self.aborted = []
+
+        def update_from_output(self, scheduler_output, new_tokens):
+            return [
+                RequestOutput(
+                    request_id="bad",
+                    new_token_id=1,
+                    finished=True,
+                    finish_reason="FINISHED_LENGTH",
+                ),
+                RequestOutput(
+                    request_id="good",
+                    new_token_id=2,
+                    finished=True,
+                    finish_reason="FINISHED_LENGTH",
+                ),
+            ]
+
+        def abort_request(self, request_id):
+            self.aborted.append(request_id)
+
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.tokenizer = _Tokenizer()
+    core._pending_free_ids = []
+    core.scheduler = _TwoRequestScheduler()
+
+    bad_request = Request(request_id="bad", prompt_token_ids=[9], max_new_tokens=1)
+    bad_request.output_token_ids.append(1)
+    bad_ctx = _RequestContext(
+        request=bad_request,
+        stream=True,
+        output_parser=_FailingParser(),
+    )
+    good_request = Request(request_id="good", prompt_token_ids=[9], max_new_tokens=1)
+    good_request.output_token_ids.append(2)
+    good_ctx = _RequestContext(request=good_request, stream=True)
+    core._request_contexts = {"bad": bad_ctx, "good": good_ctx}
+
+    core._process_step_output(SchedulerOutput(scheduled_requests=[]), {})
+
+    failure = bad_ctx.queue.get_nowait()
+    assert isinstance(failure, ValueError)
+    assert str(failure) == "malformed terminal tail"
+    assert "bad" not in core._request_contexts
+    assert core.scheduler.aborted == ["bad"]
+    assert core._pending_free_ids.count("bad") == 1
+
+    good_output = good_ctx.queue.get_nowait()
+    assert good_output.finished
+    assert good_output.text == "2"
+    assert core._pending_free_ids.count("good") == 1
+
+
+def test_parser_detokenization_work_is_linear_in_generated_tokens() -> None:
+    class _CountingTokenizer:
+        vocab = {"<think>": 90, "</think>": 91}
+        all_special_ids = (90, 91)
+
+        def __init__(self):
+            self.decoded_token_count = 0
+
+        def get_vocab(self):
+            return dict(self.vocab)
+
+        def decode(self, ids, *, skip_special_tokens=True):
+            self.decoded_token_count += len(ids)
+            parts = []
+            for token_id in ids:
+                if token_id in self.vocab.values():
+                    if not skip_special_tokens:
+                        parts.append({90: "<think>", 91: "</think>"}[token_id])
+                    continue
+                parts.append("x")
+            return "".join(parts)
+
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.tokenizer = _CountingTokenizer()
+    request = Request(request_id="r", prompt_token_ids=[9], max_new_tokens=128)
+    ctx = _RequestContext(
+        request=request,
+        stream=True,
+        output_parser=create_output_parser(
+            OutputParserSpec("deepseek_v4", "reasoning"),
+            core.tokenizer,
+        ),
+    )
+
+    token_count = 128
+    for _ in range(token_count):
+        request.output_token_ids.append(1)
+        text_delta = core._detokenize_parser_incrementally(ctx)
+        new_ids = request.output_token_ids[ctx.parser_token_offset :]
+        ctx.parser_token_offset = len(request.output_token_ids)
+        ctx.output_parser.feed(text_delta, new_ids)
+
+    tail = core._finalize_parser_detokenization(ctx)
+    if tail:
+        ctx.output_parser.feed(tail, ())
+    ctx.output_parser.finish()
+
+    # The bounded three-token detokenizer context visits at most a constant
+    # number of IDs per step, plus one final full decode. A cumulative-prefix
+    # parser would visit roughly N*(N+1)/2 IDs and fail this bound.
+    assert core.tokenizer.decoded_token_count <= 9 * token_count
+
+
+def test_stop_string_detection_precedes_reasoning_presentation_split():
+    class _ReasoningTokenizer:
+        vocab = {"<think>": 90, "</think>": 91}
+        pieces = {1: "先", 2: "思考"}
+        all_special_ids = (90, 91)
+
+        def get_vocab(self):
+            return dict(self.vocab)
+
+        def decode(self, ids, *, skip_special_tokens=True):
+            parts = []
+            for token_id in ids:
+                if token_id in self.vocab.values():
+                    if not skip_special_tokens:
+                        parts.append({90: "<think>", 91: "</think>"}[token_id])
+                    continue
+                parts.append(self.pieces.get(token_id, ""))
+            return "".join(parts)
+
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.tokenizer = _ReasoningTokenizer()
+    core._pending_free_ids = []
+    scheduler = _ScriptedScheduler(
+        [RequestOutput(request_id="r", new_token_id=2)]
+    )
+    core.scheduler = scheduler
+    request = Request(
+        request_id="r",
+        prompt_token_ids=[9],
+        max_new_tokens=4,
+        stop_strings=("思考",),
+    )
+    request.output_token_ids.extend([1, 2])
+    ctx = _RequestContext(
+        request=request,
+        output_parser=create_output_parser(
+            OutputParserSpec("deepseek_v4", "reasoning"),
+            core.tokenizer,
+        ),
+    )
+    core._request_contexts = {"r": ctx}
+
+    core._process_step_output(SchedulerOutput(scheduled_requests=[]), {})
+
+    assert scheduler.finished == [("r", RequestStatus.FINISHED_STOP)]
+    output = ctx.queue.get_nowait()
+    assert output.finished
+    assert output.finish_reason == "FINISHED_STOP"
+    assert output.reasoning == "先思考"
+    assert output.text == ""
 
 
 class _ScriptedScheduler:

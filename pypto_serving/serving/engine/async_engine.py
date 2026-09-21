@@ -22,6 +22,7 @@ from typing import Callable
 from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, GenerateResult, RuntimeConfig
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.serving.reasoning import OutputParserSpec, create_output_parser
 from pypto_serving.serving.utils.env import (
     worker_init_timeout_seconds,
     worker_step_timeout_seconds,
@@ -144,12 +145,22 @@ class _RequestContext:
     detok_text: str = ""
     detok_prefix_offset: int = 0
     detok_read_offset: int = 0
+    output_parser: object | None = None
+    parser_detok_parts: list[str] = field(default_factory=list)
+    parser_detok_prefix_offset: int = 0
+    parser_detok_read_offset: int = 0
+    parser_token_offset: int = 0
+    parser_reasoning_parts: list[str] = field(default_factory=list)
+    parser_content_parts: list[str] = field(default_factory=list)
 
 
 @dataclass
 class TokenOutput:
     token_id: int | None = None
     text: str = ""
+    reasoning: str = ""
+    text_delta: str = ""
+    reasoning_delta: str = ""
     finished: bool = False
     finish_reason: str = ""
     # Authoritative token counts from the engine, so the HTTP layer can report
@@ -378,6 +389,7 @@ class ReplicaEngineCore:
         *,
         on_queued: Callable[[], None] | None = None,
         prompt_token_ids: Sequence[int] | None = None,
+        output_parser_spec: OutputParserSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Add a request and yield token outputs as they are generated."""
         with profile_span(
@@ -398,7 +410,11 @@ class ReplicaEngineCore:
                 seed=config.seed,
             )
 
-            ctx = _RequestContext(request=request, stream=getattr(config, "stream", True))
+            ctx = _RequestContext(
+                request=request,
+                stream=getattr(config, "stream", True),
+                output_parser=create_output_parser(output_parser_spec, self.tokenizer),
+            )
             self._request_contexts[request_id] = ctx
             self.scheduler.add_request(request)
             logger.info(
@@ -814,7 +830,13 @@ class ReplicaEngineCore:
             if ctx is None:
                 continue
 
+            previous_text = ctx.detok_text
             text = self._detokenize_incrementally(ctx)
+            text_delta = (
+                text[len(previous_text) :]
+                if text.startswith(previous_text)
+                else ""
+            )
 
             if not req_output.finished and ctx.request.stop_strings:
                 for stop in ctx.request.stop_strings:
@@ -835,6 +857,72 @@ class ReplicaEngineCore:
                 text = self._finalize_detokenization(ctx)
                 self._schedule_worker_free(req_output.request_id)
 
+            # Stop detection above operates on the original generated text.
+            # Semantic parsing only changes the public presentation channels.
+            reasoning = ""
+            reasoning_delta = ""
+            if ctx.output_parser is not None:
+                try:
+                    if ctx.stream:
+                        parser_text_delta = self._detokenize_parser_incrementally(ctx)
+                        token_ids = ctx.request.output_token_ids
+                        delta_token_ids = token_ids[ctx.parser_token_offset :]
+                        ctx.parser_token_offset = len(token_ids)
+                        parsed = ctx.output_parser.feed(
+                            parser_text_delta,
+                            delta_token_ids,
+                        )
+                        reasoning_delta = parsed.reasoning
+                        text_delta = parsed.content
+
+                        if req_output.finished:
+                            final_parser_text = self._finalize_parser_detokenization(ctx)
+                            if final_parser_text:
+                                tail = ctx.output_parser.feed(final_parser_text, ())
+                                reasoning_delta += tail.reasoning
+                                text_delta += tail.content
+                            tail = ctx.output_parser.finish()
+                            reasoning_delta += tail.reasoning
+                            text_delta += tail.content
+
+                        if reasoning_delta:
+                            ctx.parser_reasoning_parts.append(reasoning_delta)
+                        if text_delta:
+                            ctx.parser_content_parts.append(text_delta)
+                        if req_output.finished:
+                            reasoning = "".join(ctx.parser_reasoning_parts)
+                            text = "".join(ctx.parser_content_parts)
+                        else:
+                            reasoning = ""
+                            text = ""
+                    elif req_output.finished:
+                        raw_text = self.tokenizer.decode(
+                            ctx.request.output_token_ids,
+                            skip_special_tokens=False,
+                        )
+                        parsed = ctx.output_parser.parse_complete(
+                            raw_text,
+                            ctx.request.output_token_ids,
+                        )
+                        text = parsed.content
+                        reasoning = parsed.reasoning
+                        text_delta = text
+                        reasoning_delta = reasoning
+                except ValueError as exc:
+                    # Parser failures are request-local presentation errors.
+                    # Remove ownership before waking the consumer so its
+                    # add_request() finally block cannot schedule a duplicate
+                    # worker free while this loop explicitly releases state.
+                    self._request_contexts.pop(req_output.request_id, None)
+                    ctx.queue.put_nowait(exc)
+                    self.scheduler.abort_request(req_output.request_id)
+                    self._schedule_worker_free(req_output.request_id)
+                    logger.exception(
+                        "request %s output parser failed",
+                        req_output.request_id,
+                    )
+                    continue
+
             # Non-streaming requests only need the final output: suppress
             # intermediate ones to save a queue push and HTTP-coroutine wake-up
             # per token. Detok + stop detection above still ran this step, so the
@@ -845,6 +933,9 @@ class ReplicaEngineCore:
             token_output = TokenOutput(
                 token_id=req_output.new_token_id,
                 text=text,
+                reasoning=reasoning,
+                text_delta=text_delta,
+                reasoning_delta=reasoning_delta,
                 finished=req_output.finished,
                 finish_reason=req_output.finish_reason,
                 prompt_tokens=ctx.request.num_prompt_tokens,
@@ -864,33 +955,72 @@ class ReplicaEngineCore:
         the full output_token_ids every step (O(N^2) over a generation).
         Returns the cumulative decoded text so far.
         """
-        output_ids = ctx.request.output_token_ids
-        if not output_ids:
-            return ctx.detok_text
-
-        # Decode a short window: [prefix_offset:] gives context so the delta is
-        # rendered identically to a full decode; the delta is the tail beyond
-        # what [prefix_offset:read_offset] already covered.
-        prefix_ids = output_ids[ctx.detok_prefix_offset: ctx.detok_read_offset]
-        new_ids = output_ids[ctx.detok_prefix_offset:]
-
-        prefix_text = self.tokenizer.decode(prefix_ids) if prefix_ids else ""
-        new_text = self.tokenizer.decode(new_ids)
-
-        if len(new_text) <= len(prefix_text) or new_text.endswith("�"):
-            # No new complete text yet (e.g. mid multi-token character); wait for
-            # more tokens without advancing offsets.
-            return ctx.detok_text
-
-        delta = new_text[len(prefix_text):]
-        ctx.detok_text += delta
-        # Keep a small sliding context window (last few tokens) rather than
-        # collapsing the prefix onto the read offset. A 1-2 token prefix loses
-        # boundary context and can corrupt spacing / multi-token characters for
-        # SentencePiece / byte-level BPE tokenizers.
-        ctx.detok_read_offset = len(output_ids)
-        ctx.detok_prefix_offset = max(0, ctx.detok_read_offset - 3)
+        (
+            ctx.detok_text,
+            ctx.detok_prefix_offset,
+            ctx.detok_read_offset,
+            _,
+        ) = self._advance_detokenization(
+            ctx.request.output_token_ids,
+            text=ctx.detok_text,
+            prefix_offset=ctx.detok_prefix_offset,
+            read_offset=ctx.detok_read_offset,
+            skip_special_tokens=True,
+        )
         return ctx.detok_text
+
+    def _detokenize_parser_incrementally(self, ctx: _RequestContext) -> str:
+        """Return newly released raw text for one stateful output parser."""
+        (
+            _,
+            ctx.parser_detok_prefix_offset,
+            ctx.parser_detok_read_offset,
+            delta,
+        ) = self._advance_detokenization(
+            ctx.request.output_token_ids,
+            text="",
+            prefix_offset=ctx.parser_detok_prefix_offset,
+            read_offset=ctx.parser_detok_read_offset,
+            skip_special_tokens=False,
+        )
+        if delta:
+            ctx.parser_detok_parts.append(delta)
+        return delta
+
+    def _advance_detokenization(
+        self,
+        output_ids: Sequence[int],
+        *,
+        text: str,
+        prefix_offset: int,
+        read_offset: int,
+        skip_special_tokens: bool,
+    ) -> tuple[str, int, int, str]:
+        """Advance one bounded-context detokenizer and return its text delta."""
+        if not output_ids:
+            return text, prefix_offset, read_offset, ""
+
+        prefix_ids = output_ids[prefix_offset:read_offset]
+        new_ids = output_ids[prefix_offset:]
+
+        def decode(token_ids: Sequence[int]) -> str:
+            if skip_special_tokens:
+                return self.tokenizer.decode(token_ids)
+            return self.tokenizer.decode(
+                token_ids,
+                skip_special_tokens=False,
+            )
+
+        prefix_text = decode(prefix_ids) if prefix_ids else ""
+        new_text = decode(new_ids)
+        if len(new_text) <= len(prefix_text) or new_text.endswith("�"):
+            return text, prefix_offset, read_offset, ""
+
+        delta = new_text[len(prefix_text) :]
+        text += delta
+        read_offset = len(output_ids)
+        prefix_offset = max(0, read_offset - 3)
+        return text, prefix_offset, read_offset, delta
 
     def _finalize_detokenization(self, ctx: _RequestContext) -> str:
         """Return the authoritative final text for a finished request.
@@ -908,6 +1038,30 @@ class ReplicaEngineCore:
         ctx.detok_read_offset = len(output_ids)
         ctx.detok_prefix_offset = max(0, ctx.detok_read_offset - 3)
         return final_text
+
+    def _finalize_parser_detokenization(self, ctx: _RequestContext) -> str:
+        """Flush raw parser text without changing an already streamed prefix."""
+        output_ids = ctx.request.output_token_ids
+        if not output_ids:
+            return ""
+        final_text = self.tokenizer.decode(
+            output_ids,
+            skip_special_tokens=False,
+        )
+        streamed_text = "".join(ctx.parser_detok_parts)
+        if not final_text.startswith(streamed_text):
+            raise ValueError(
+                "final parser detokenization changed an already emitted prefix"
+            )
+        delta = final_text[len(streamed_text) :]
+        if delta:
+            ctx.parser_detok_parts.append(delta)
+        ctx.parser_detok_read_offset = len(output_ids)
+        ctx.parser_detok_prefix_offset = max(
+            0,
+            ctx.parser_detok_read_offset - 3,
+        )
+        return delta
 
     def _shutdown_worker(self, *, timeout: float) -> None:
         input_q = self._input_queue
@@ -1102,6 +1256,8 @@ class AsyncLLMEngine:
         request_id: str,
         prompt: str,
         config,
+        *,
+        output_parser_spec: OutputParserSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         replica_idx = self._select_replica()
         prompt_token_ids = self._tokenize_prompt(prompt)
@@ -1122,13 +1278,24 @@ class AsyncLLMEngine:
 
         try:
             core = self._cores[replica_idx]
-            async for output in core.add_request(
-                request_id,
-                prompt,
-                config,
-                on_queued=clear_route_extra_load,
-                prompt_token_ids=prompt_token_ids,
-            ):
+            if output_parser_spec is None:
+                outputs = core.add_request(
+                    request_id,
+                    prompt,
+                    config,
+                    on_queued=clear_route_extra_load,
+                    prompt_token_ids=prompt_token_ids,
+                )
+            else:
+                outputs = core.add_request(
+                    request_id,
+                    prompt,
+                    config,
+                    on_queued=clear_route_extra_load,
+                    prompt_token_ids=prompt_token_ids,
+                    output_parser_spec=output_parser_spec,
+                )
+            async for output in outputs:
                 yield output
         finally:
             self._request_to_replica.pop(request_id, None)
