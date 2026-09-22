@@ -56,7 +56,11 @@ _MISSING_REQUEST = object()
 
 @dataclass(frozen=True)
 class _PreparedDecodeWork:
-    """Backend snapshot prepared without resolving prior-step output tokens."""
+    """Owned decode slot, optionally staged ahead of device execution.
+
+    Mixed commands reserve the slot on receipt but leave ``prepared`` unset
+    until their prefill has finished on the device lane.
+    """
 
     prepared: object | None
     buffer_slot: int
@@ -320,9 +324,11 @@ class WorkerProcess:
                 if (
                     isinstance(cmd, StepCommand)
                     and cmd.decode_requests
-                    and not cmd.prefill_requests
                     and self.executor.supports_device_decode_embedding
                 ):
+                    # Every writer must own its slot, including the decode
+                    # half of a mixed command that stages later on the device
+                    # lane while this thread prepares the following command.
                     owned_slot = cmd.step_id % _DECODE_PIPELINE_SLOTS
                     slot_ownership[owned_slot].acquire()
                 try:
@@ -331,6 +337,8 @@ class WorkerProcess:
                         if isinstance(cmd, StepCommand)
                         else None
                     )
+                    if prepared is None and owned_slot is not None:
+                        prepared = _PreparedDecodeWork(prepared=None, buffer_slot=owned_slot)
                 except Exception as exc:
                     logger.error("Worker decode preparation failed: %s", exc, exc_info=True)
                     prepared = _PreparedDecodeWork(
@@ -951,10 +959,20 @@ class WorkerProcess:
             else:
                 if prepared_decode.error is not None:
                     raise RuntimeError(prepared_decode.error)
+                prepared = prepared_decode.prepared
+                if prepared is None:
+                    # Prefill has now completed. Stage the mixed command's
+                    # decode into its reserved slot instead of run_decode's
+                    # default slot, which may belong to a prepared future step.
+                    prepared = self.executor.prepare_decode(
+                        runtime_model,
+                        batch,
+                        buffer_slot=prepared_decode.buffer_slot,
+                    )
                 decode_result = self.executor.run_prepared_decode(
                     runtime_model,
                     batch,
-                    prepared_decode.prepared,
+                    prepared,
                 )
             return self._consume_decode_result(scheduled, decode_result, new_tokens)
 

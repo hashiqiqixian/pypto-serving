@@ -529,3 +529,81 @@ def test_worker_entry_always_closes_worker(monkeypatch, caplog, busy_loop_fails,
     assert calls.close == 1
     if log_level == "invalid":
         assert "Invalid PYPTO_SIMPLER_LOG_LEVEL" in caplog.text
+
+
+def test_mixed_decode_does_not_overwrite_prepared_next_step():
+    prefill_running = threading.Event()
+    next_prepared = threading.Event()
+    shared_rows = [{}, {}]
+
+    class Executor:
+        supports_async_decode_prepare = True
+        supports_async_decode_reclaim = False
+        supports_device_decode_embedding = True
+        supports_device_sampling = True
+        device_topk_sampling_k = 0
+        max_prefill_batch_size = None
+
+        @staticmethod
+        def prepare_decode(_model, batch, *, buffer_slot):
+            # Prepared descriptors alias staging storage, as in the NPU runner.
+            rows = shared_rows[buffer_slot]
+            rows.clear()
+            rows.update({request_id: [11] for request_id in batch.request_ids})
+            if "victim" in rows:
+                next_prepared.set()
+            return rows
+
+        @staticmethod
+        def run_prepared_decode(_model, batch, rows):
+            return DecodeResult(
+                hidden_states=None, logits=None,
+                accepted_token_ids=[rows[request_id] for request_id in batch.request_ids],
+            )
+
+        def run_decode(self, model, batch):
+            # The old mixed-command fallback stages into slot zero.
+            return self.run_prepared_decode(model, batch, self.prepare_decode(model, batch, buffer_slot=0))
+
+    def prefill(_scheduled, _model, _tokens):
+        prefill_running.set()
+        assert next_prepared.wait(timeout=5)
+
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.config = SimpleNamespace(resolve_async_scheduling=lambda: True)
+    worker.input_queue, worker.output_queue = Queue(), Queue()
+    worker.profile_output_queue = None
+    worker.executor = Executor()
+    worker.sampler = _FixedSampler(token_id=0)
+    worker.model_record = SimpleNamespace(runtime_model=_model(max_batch_size=2, eos_token_id=0))
+    worker._req_cache = {
+        request_id: NewRequestData(request_id, [1], 0.0, 1.0, None)
+        for request_id in ("anchor", "victim")
+    }
+    worker._last_tokens = {}
+    worker._batch_prefill = prefill
+    mixed = StepCommand(
+        new_requests=[], prefill_requests=[PrefillRequest("prefill", [1], 0, [])],
+        decode_requests=[DecodeRequest("anchor", 10, 2, [])],
+        finished_request_ids=[], step_id=47,
+    )
+    following = StepCommand(
+        new_requests=[], prefill_requests=[],
+        decode_requests=[DecodeRequest("anchor", 11, 3, []), DecodeRequest("victim", 10, 2, [])],
+        finished_request_ids=[], step_id=48,
+    )
+    thread = threading.Thread(target=worker.busy_loop, daemon=True)
+    thread.start()
+    try:
+        worker.input_queue.put(encode_command(mixed))
+        assert prefill_running.wait(timeout=5)
+        worker.input_queue.put(encode_command(following))
+        for expected in ({"anchor": [11]}, {"anchor": [11], "victim": [11]}):
+            result = decode_result(worker.output_queue.get(timeout=5))
+            assert result.error is None
+            assert result.new_tokens == expected
+    finally:
+        next_prepared.set()
+        worker.input_queue.put(encode_command(ShutdownCommand()))
+        thread.join(timeout=5)
+    assert not thread.is_alive()
