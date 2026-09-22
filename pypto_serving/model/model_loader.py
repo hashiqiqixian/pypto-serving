@@ -24,7 +24,7 @@ from pypto_serving.config.types import (
     RuntimeModel,
 )
 
-from .model_family import is_deepseek_v4_config, read_model_config
+from .model_family import is_deepseek_v4_config, is_deepseek_v41_config, read_model_config
 from .tokenizer import TokenizerAdapter, load_tokenizer
 
 
@@ -457,6 +457,14 @@ class ModelLoader:
         **loader_options: object,
     ) -> LoadedModel:
         """Load a model directory using an explicit or inferred format."""
+        if is_deepseek_v41_config(read_model_config(model_dir)):
+            from .deepseek_v41.config import load_text_config
+
+            load_text_config(model_dir)
+            raise NotImplementedError(
+                "V4.1 configuration and tokenizer are supported; weight loading and execution "
+                "are not integrated yet. Use load_text_config() and load_tokenizer() for inspection."
+            )
         request = ModelLoadRequest(
             model_id=model_id,
             model_dir=model_dir,

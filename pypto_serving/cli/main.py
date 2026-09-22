@@ -277,6 +277,13 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = read_model_config(model_dir)
     model_family = detect_model_family(model_config_data)
+    if model_family == "deepseek_v41":
+        from pypto_serving.model.deepseek_v41.config import load_text_config
+
+        load_text_config(model_dir)
+        raise NotImplementedError(
+            "V4.1 configuration and tokenizer are supported; serving execution is not integrated yet."
+        )
     model_variant = _resolve_model_variant(args)
     _validate_prefill_chunk_size(
         model_family,
