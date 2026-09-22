@@ -521,11 +521,13 @@ class WorkerProcess:
             ):
                 decode_result = self.executor.reclaim_prepared_decode(work.pending)
                 new_tokens: dict[str, list[int]] = {}
-                self._consume_decode_result(work.scheduled, decode_result, new_tokens)
+                num_draft_tokens = self._consume_decode_result(work.scheduled, decode_result, new_tokens)
                 for req_id, tokens in new_tokens.items():
                     if tokens:
                         self._record_last_tokens(req_id, tokens)
-            return StepResult(new_tokens=new_tokens, step_id=work.cmd.step_id)
+            return StepResult(
+                new_tokens=new_tokens, step_id=work.cmd.step_id, num_draft_tokens=num_draft_tokens
+            )
         except Exception as exc:
             logger.error("Worker decode reclaim failed: %s", exc, exc_info=True)
             return StepResult(new_tokens={}, error=str(exc), step_id=work.cmd.step_id)
@@ -639,6 +641,7 @@ class WorkerProcess:
         """Execute one step using the lightweight IPC protocol."""
         runtime_model = self.model_record.runtime_model
         new_tokens: dict[str, list[int]] = {}
+        num_draft_tokens: dict[str, int] = {}
 
         with profile_span(
             "WorkerProcess.execute_step",
@@ -664,7 +667,7 @@ class WorkerProcess:
                     ):
                         self._batch_prefill(chunk, runtime_model, new_tokens)
             if cmd.decode_requests:
-                self._batch_decode(
+                num_draft_tokens = self._batch_decode(
                     cmd.decode_requests,
                     runtime_model,
                     new_tokens,
@@ -677,7 +680,7 @@ class WorkerProcess:
             if tokens:
                 self._record_last_tokens(req_id, tokens)
 
-        return StepResult(new_tokens=new_tokens, step_id=cmd.step_id)
+        return StepResult(new_tokens=new_tokens, step_id=cmd.step_id, num_draft_tokens=num_draft_tokens)
 
     def _record_last_tokens(self, request_id: str, tokens: list[int]) -> None:
         """Remember the latest sampled token for async placeholder resolution."""
@@ -927,7 +930,7 @@ class WorkerProcess:
         runtime_model,
         new_tokens: dict[str, list[int]],
         prepared_decode: _PreparedDecodeWork | None = None,
-    ) -> None:
+    ) -> dict[str, int]:
         with profile_span(
             "WorkerProcess.batch_decode",
             cat="worker",
@@ -953,19 +956,24 @@ class WorkerProcess:
                     batch,
                     prepared_decode.prepared,
                 )
-            self._consume_decode_result(scheduled, decode_result, new_tokens)
+            return self._consume_decode_result(scheduled, decode_result, new_tokens)
 
     def _consume_decode_result(
         self,
         scheduled: tuple[DecodeRequest, ...] | list[DecodeRequest],
         decode_result: DecodeResult,
         new_tokens: dict[str, list[int]],
-    ) -> None:
+    ) -> dict[str, int]:
         """Convert a runner result to tokens on either serial or reclaim lane."""
         if decode_result.accepted_token_ids is not None:
             for i, dr in enumerate(scheduled):
                 new_tokens[dr.request_id] = list(decode_result.accepted_token_ids[i])
-            return
+            if decode_result.num_draft_tokens is None:
+                return {}
+            return {
+                dr.request_id: count
+                for dr, count in zip(scheduled, decode_result.num_draft_tokens, strict=True)
+            }
         allow_device_greedy_sampling = self._allow_device_sampled_ids(list(scheduled))
         allow_device_topk_sampling = self._allow_device_topk_sampling(list(scheduled))
         for i, dr in enumerate(scheduled):
@@ -993,6 +1001,7 @@ class WorkerProcess:
                 allow_device_topk_sampling=allow_device_topk_sampling,
             )
             new_tokens[dr.request_id] = [token_id]
+        return {}
 
     def close(self) -> None:
         """Release executor-owned runtime and device resources."""

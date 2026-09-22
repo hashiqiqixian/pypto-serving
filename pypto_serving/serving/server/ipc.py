@@ -146,6 +146,7 @@ class StepResult(msgspec.Struct):
     error: str | None = None
     # Echoes the originating StepCommand.step_id (pipeline ordering guard).
     step_id: int = 0
+    num_draft_tokens: dict[str, int] = msgspec.field(default_factory=dict)
 
 
 class ProfileResult(msgspec.Struct):

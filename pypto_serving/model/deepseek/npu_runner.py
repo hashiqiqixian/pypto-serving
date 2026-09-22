@@ -3004,6 +3004,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             hidden_states=None,
             logits=None,
             accepted_token_ids=accepted,
+            num_draft_tokens=[1] * len(accepted),
         )
 
     def _run_chunked_mtp_decode(
@@ -3065,6 +3066,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             hidden_states=None,
             logits=verification.first_logits,
             accepted_token_ids=accepted,
+            num_draft_tokens=[int(drafts.shape[1])] * len(accepted),
         )
 
     def _mtp_draft_count(self, model: RuntimeModel, batch: DecodeBatch) -> int:

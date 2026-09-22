@@ -355,6 +355,9 @@ class DecodeResult:
     sampling_candidates: SamplingCandidates | None = None
     next_hidden_states: torch.Tensor | None = None
     accepted_token_ids: list[list[int]] | None = None
+    # Actual verified drafts per request, before scheduler output truncation.
+    # None disables speculation metrics; zero denotes a target-only fallback.
+    num_draft_tokens: list[int] | None = None
 
 
 @dataclass

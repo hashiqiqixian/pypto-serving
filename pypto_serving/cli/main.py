@@ -26,6 +26,7 @@ from pypto_serving.config.types import (
     RuntimeConfig,
 )
 from pypto_serving.model.model_family import detect_model_family, read_model_config
+from pypto_serving.observability.access_log import create_uvicorn_log_config
 from pypto_serving.serving.utils.env import configure_runtime_logging
 from pypto_serving.tools.profile import (
     ProfileConfig,
@@ -825,12 +826,13 @@ def run_serve(
         print(f"  Chunked prefill with speculative decoding: {speculation_support}")
     print(f"  Prefix cache: {'enabled' if config.enable_prefix_cache else 'disabled'}")
     print(f"  Chunk prefill: {'enabled' if config.enable_chunk_prefill else 'disabled'}")
-    endpoints = "/v1/completions, /v1/chat/completions, /v1/models, /health"
+    endpoints = "/v1/completions, /v1/chat/completions, /v1/models, /health, /metrics"
     if get_profiler().enabled:
         endpoints += ", /start_profile, /stop_profile"
     print(f"  Endpoints: {endpoints}")
 
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    log_config = create_uvicorn_log_config(["/metrics", "/metrics/json"])
+    uvicorn.run(app, host=host, port=port, log_level="info", log_config=log_config)
 
 
 def run_generate(

@@ -121,6 +121,28 @@ Requests that omit sampling fields use the server-wide `GenerateConfig`
 defaults for every model: `temperature=0.0` (greedy decoding) and `top_p=1.0`.
 Override them per request or with `--generate-config` when starting the server.
 
+## Local Monitoring
+
+The serving process exposes cumulative engine metrics at `/metrics` in
+Prometheus text format, including `vllm:` families for existing vLLM dashboards,
+and at `/metrics/json` as structured JSON. Metrics cover
+request latency, token traffic and throughput inputs, scheduler queues, KV cache
+usage, prefix-cache hits, request outcomes, and MTP/DSpark draft acceptance,
+acceptance length, and speculation fallbacks.
+
+For a self-contained local dashboard with SQLite history, start the companion
+tool from the repository root:
+
+```bash
+python -m tools.monitor \
+  --target http://127.0.0.1:8899 \
+  --port 9090
+```
+
+Open <http://127.0.0.1:9090>. See
+[`tools/monitor/README.md`](tools/monitor/README.md) for retention, database, and
+timezone options.
+
 ## Notes
 
 - All model/device/runtime options are passed via CLI arguments. Run `pypto-serving --help` for the exact arguments available in the installed package. See `docs/cli-reference/pypto-serving.md` for the documented reference.

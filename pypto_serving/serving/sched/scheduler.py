@@ -136,6 +136,7 @@ class Request:
     # Earliest valid KV position after a model skips the beginning of a
     # prefill chunk. Keep this across decode so partial pages stay unpublished.
     group_cache_valid_from: dict[str, int] = field(default_factory=dict)
+    prefix_cache_metrics_recorded: bool = False
     # Async scheduling: tokens scheduled optimistically but not yet sampled.
     # Stands in for output tokens still in flight so the next schedule() advances
     # correctly; decremented as real tokens are applied in update_from_output.
@@ -190,6 +191,9 @@ class SchedulerOutput:
     rejected_requests: dict[str, str] = field(default_factory=dict)
     num_prefill_tokens: int = 0
     num_decode_tokens: int = 0
+    prefix_cache_queries: int = 0
+    prefix_cache_hits: int = 0
+    prefix_cache_query_tokens: int = 0
 
     @property
     def is_empty(self) -> bool:
@@ -504,6 +508,18 @@ class Scheduler:
                 self._release_waiting_prefix_blocks(request)
                 remaining_waiting.append(request)
                 break
+
+            if self.config.enable_prefix_cache and not request.prefix_cache_metrics_recorded:
+                cacheable_tokens = (
+                    request.num_prompt_tokens // self.kv_cache_manager.block_size
+                ) * self.kv_cache_manager.block_size
+                output.prefix_cache_queries += cacheable_tokens
+                output.prefix_cache_query_tokens += request.num_prompt_tokens
+                output.prefix_cache_hits += min(
+                    cacheable_tokens,
+                    request.num_computed_tokens,
+                )
+                request.prefix_cache_metrics_recorded = True
 
             request.status = RequestStatus.RUNNING
             self.running.append(request)

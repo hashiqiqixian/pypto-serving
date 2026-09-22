@@ -1,0 +1,8 @@
+numpy>=2.0
+safetensors
+transformers
+fastapi
+pydantic>=2.0
+uvicorn
+msgspec
+prometheus-client>=0.20
