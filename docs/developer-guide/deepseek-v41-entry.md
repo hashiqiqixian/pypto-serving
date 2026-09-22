@@ -36,8 +36,9 @@ and decoding but is not a full-checkpoint tokenizer validation.
 
 1. Model identification, text config and tokenizer (implemented).
 2. Selective checkpoint loading, weight formats and shard contracts (implemented on CPU).
-3. Embedding and initial mHC residual/pre-mix state.
-4. Input preparation at the selected lib composite boundary.
+3. Executor/Runner preparation and composite contract verification (metadata planning implemented;
+   device registration blocked on composite integration).
+4. Embedding and initial residual/pre-mix state at the selected composite boundary.
 5. SWA, C2A and C1A prefill composite entries and cache state.
 6. Decode composite entries and prefill-to-decode transitions.
 7. Cross-layer state and TP/EP composition, then the full backbone.
@@ -109,7 +110,53 @@ Validation uses synthetic checkpoint tensors stored in actual safetensors files,
 independent packing-address checks, and shared-store regression tests. These
 checks are not real-checkpoint numerical inference or NPU acceptance.
 
-## Validation
+## Executor/Runner preparation
+
+Stage numbers follow serving issue #240. `V41ExecutionPlan` implements the
+CPU preparation portion of stage 3; it is not a registered executor, device
+runner or substitute inference backend.
+
+```python
+from pypto_serving.model.deepseek_v41.execution_plan import RankPlacement, V41ExecutionPlan
+
+plan = V41ExecutionPlan(model_dir, RankPlacement(rank=7))
+layer = plan.layer(24)  # C1A Reindex: KV producer 20, index producer 24
+names = plan.weight_names(24)  # local experts; no duplicate scale loads
+bundle = plan.load_weight(24, "layers.24.hc_attn_scale")
+```
+
+Logical ranks form contiguous TP groups. With TP4/DP2/EP8, rank 7 is
+TP rank 3, DP rank 1 and EP rank 7. These are logical coordinates, not
+physical NPU IDs. The checkpoint loader still enforces dimension divisibility.
+The plan preserves checkpoint names and the loader's per-operation budget;
+it does not invent parameter bindings for an unsupported composite signature.
+
+Layer planning follows lib's `config.layer_config` ownership rules. SWA
+windows are layer-local. Compressed layers select the latest preceding
+producer of the same compression ratio. Full layers publish KV/index state;
+Reindex layers use the KV producer's index-key cache and publish a new Top-K
+selection; Reuse layers consume that selection without loading producer
+weights. C1A candidates must address the same KV producer as their consumers.
+These layer references are not scheduler page IDs or request-global state.
+
+The execution integration will follow upstream V4's `PyptoExecutor` and
+`ModelRunner` lifecycle: the executor validates lib contracts and compiles
+composites; the runner owns uploaded weights, buffers and dispatch completion;
+the scheduler owns request/page reservations. Do not inherit the generic
+dense K/V allocator for V4.1's window/compressed/index/pending-state pools.
+Request and DP identity must scope every pool. Active token counts, padding,
+physical page layouts and buffer reuse must come from the selected composite
+contract, not from the V4 constants or a tensor capacity alone.
+
+At inspected lib revision `4c3eab2`, complete-layer coverage and the routed
+weight contract are not ready for this registration. The current prefill
+layer takes FP8 routed weights, whereas this loader preserves packed FP4;
+the decode block factory raises `NotImplementedError`. Independent MoE FP4
+support does not establish full-layer compatibility. No device runner is
+registered, generic fallback enabled, or FP4 model expanded to work around
+these constraints. Stage 3 remains partially complete pending these contracts.
+
+## Test command
 
 ```bash
 python -m pytest tests/unit/model/deepseek_v41 tests/unit/model/test_tokenizer.py tests/unit/cli/test_parallel_options.py -q
