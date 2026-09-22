@@ -58,30 +58,24 @@ _DSPARK_IMPORT_MODULES = (
     "config",
     "decode_compressor_ratio128",
     "decode_compressor_ratio4",
-    "decode_cp_token_allgather",
+    "decode_cp_allgather",
     "decode_csa",
     "decode_fwd",
-    "decode_fwd_device_state",
     "decode_fwd_dspark",
     "decode_hca",
     "decode_indexer",
     "decode_indexer_compressor",
     "decode_layer",
-    "decode_metadata",
     "decode_o_proj",
+    "decode_prepare",
     "decode_sparse_attn_csa",
     "decode_sparse_attn_hca",
     "decode_sparse_attn_swa",
     "decode_swa",
     "dspark_attention",
     "dspark_context_kv",
-    "dspark_decode_bridge",
-    "dspark_draft_step_device_state",
-    "dspark_device_state",
     "dspark_drafter",
     "dspark_markov",
-    "dspark_prefill",
-    "dspark_proj",
     "expert_routed",
     "expert_shared",
     "gate",
@@ -391,13 +385,19 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                 )
             if speculative:
                 # The fused decode program owns every recurrent decode stage,
-                # but prefill still needs one standalone draft step to seed the
-                # first K=7 tokens and publish the initial device state.
+                # but prefill still needs one standalone draft step to seed
+                # the first K=7 tokens. pypto-lib#1314 folded the integrated
+                # draft-step+markov+state program away, so the pair now
+                # dispatches split: the bare drafter, then the standalone
+                # markov sampler; the persistent device state is published by
+                # the runner's host copy after the first draft read.
                 drafter = self._compile_l3_callable(
-                    "dspark_draft_step_device_state_bootstrap",
-                    modules[
-                        "dspark_draft_step_device_state"
-                    ].l3_dspark_draft_step_device_state,
+                    "dspark_drafter_bootstrap",
+                    modules["dspark_drafter"].l3_dspark_drafter,
+                )
+                markov = self._compile_l3_callable(
+                    "dspark_markov_sample",
+                    modules["dspark_markov"].l3_distributed_markov_sample,
                 )
             rope = self._build_rope_tables(
                 modules["utils"],
@@ -422,7 +422,10 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             state_accept=state_accept,
             state_commit=state_commit,
             decode_device_state_fused=speculative,
-            draft_device_state_fused=speculative,
+            # The integrated draft-step program the fused drafter dispatch
+            # relied on is gone (pypto-lib#1314); the runner's split path
+            # dispatches the bare drafter and the markov sampler separately.
+            draft_device_state_fused=False,
             decode_full_fused=speculative,
             num_speculative_tokens=self._num_speculative_tokens,
             rope=rope,
@@ -480,15 +483,6 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             if speculative:
                 modules["dspark_drafter"] = importlib.import_module("dspark_drafter")
                 modules["dspark_markov"] = importlib.import_module("dspark_markov")
-                modules["dspark_draft_step_device_state"] = importlib.import_module(
-                    "dspark_draft_step_device_state"
-                )
-                modules["dspark_device_state"] = importlib.import_module(
-                    "dspark_device_state"
-                )
-                modules["decode_fwd_device_state"] = importlib.import_module(
-                    "decode_fwd_device_state"
-                )
                 modules["decode_fwd_dspark"] = importlib.import_module(
                     "decode_fwd_dspark"
                 )
