@@ -75,11 +75,18 @@ def invoke(name="lookup", **parameters):
     return "".join(parts) + "</｜DSML｜invoke>\n"
 
 
-def parser(*, thinking=False, include_reasoning=True, choice="auto"):
+class SplitRootTokenizer(ToolTokenizer):
+    # The real checkpoint exposes this inner sentinel, not whole root tags.
+    specials = ("<think>", "</think>", "｜DSML｜", "<eos>")
+    vocab = {text: index + 1 for index, text in enumerate(specials)}
+    all_special_ids = tuple(vocab.values())
+
+
+def parser(*, thinking=False, include_reasoning=True, choice="auto", tokenizer=None):
     return create_output_parser(OutputParserSpec(
         "deepseek_v4", "reasoning" if thinking else "content", include_reasoning,
         tool_choice=choice, tool_names=("lookup", "other"),
-    ), ToolTokenizer())
+    ), tokenizer or ToolTokenizer())
 
 
 def replay(text, chunk_size, **kwargs):
@@ -279,3 +286,53 @@ def test_random_partitions_preserve_body_and_delimiter_prefixes():
         calls = calls_from_deltas(outputs)
         assert json.loads(calls[0][1]) == values
         assert calls[1] == ("other", '{"text":"second"}')
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 7, 29, 100000])
+@pytest.mark.parametrize("thinking", [False, True])
+def test_checkpoint_with_split_root_tags(chunk_size, thinking):
+    tokenizer = SplitRootTokenizer()
+    instance = parser(tokenizer=tokenizer, thinking=thinking)
+    # Root-looking text inside a string stays data, even when it spans feeds.
+    values = {"text": '杭州 "quoted" \\ path\n' + TOOL_START + TOOL_END, "nested": [1, True, None]}
+    prefix = "reason</think>before" if thinking else "before"
+    text = prefix + TOOL_START + invoke(**values) + invoke("other") + TOOL_END + "after<eos>"
+    ids = tokenizer.encode(text)
+    outputs = [instance.feed(tokenizer.decode(ids[i:i + chunk_size], skip_special_tokens=False),
+                             ids[i:i + chunk_size]) for i in range(0, len(ids), chunk_size)]
+    outputs.append(instance.finish())
+    complete = parser(tokenizer=tokenizer, thinking=thinking).parse_complete(text, ids)
+    assert "".join(out.reasoning for out in outputs) == complete.reasoning == ("reason" if thinking else "")
+    assert "".join(out.content for out in outputs) == complete.content == "beforeafter"
+    calls = calls_from_deltas(outputs)
+    assert json.loads(calls[0][1]) == values
+    assert calls[1] == ("other", "{}")
+    assert calls == [(call.name, call.arguments) for call in complete.tool_calls]
+    assert all(call.complete for call in outputs[-1].tool_calls)
+
+
+@pytest.mark.parametrize("suffix", ["<", "</", "<｜DSML｜tool_", "<xml>"])
+def test_split_root_partial_literal_is_flushed_at_end(suffix):
+    tokenizer = SplitRootTokenizer()
+    result = parser(tokenizer=tokenizer).parse_complete("answer" + suffix, tokenizer.encode("answer" + suffix))
+    assert result.content == "answer" + suffix
+    assert not result.tool_calls
+
+
+def test_split_root_buffer_is_bounded_and_reset_between_requests():
+    tokenizer = SplitRootTokenizer()
+    instance = parser(tokenizer=tokenizer)
+    for text in ("<", "x" * 100000, "<｜DSML｜tool_"):
+        instance.feed(text, tokenizer.encode(text))
+        assert len(instance._root_tail) < len(TOOL_END)
+    text = TOOL_START + invoke() + TOOL_END
+    result = instance.parse_complete(text, tokenizer.encode(text))
+    assert len(result.tool_calls) == 1
+
+
+def test_split_root_implicit_reasoning_end_and_none_mode():
+    tokenizer = SplitRootTokenizer()
+    text = "reason" + TOOL_START + invoke() + TOOL_END + "answer"
+    result = parser(tokenizer=tokenizer, thinking=True, choice="none").parse_complete(text, tokenizer.encode(text))
+    assert result.reasoning == "reason" and result.content == "answer"
+    assert not result.tool_calls

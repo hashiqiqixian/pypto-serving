@@ -14,7 +14,7 @@ import json
 import re
 import uuid
 from dataclasses import dataclass, field, replace
-from typing import Sequence
+from typing import Iterable, Sequence
 
 from .parser import (
     DeepSeekV4ReasoningParser,
@@ -26,6 +26,7 @@ from .parser import (
     _END_TERMINAL,
     _Segment,
     _START_TERMINAL,
+    _TerminalSegment,
     _TextSegment,
 )
 
@@ -57,14 +58,23 @@ class DeepSeekV4ToolParser(DeepSeekV4ReasoningParser):
         self._reset()
 
     def _extra_terminals(self, vocab: dict[str, int]) -> dict[int, str]:
-        # Preserve any special DSML header pieces for the inner grammar. Root
-        # boundaries, unlike textual lookalikes, must come from actual token IDs.
+        # Checkpoints may expose whole root tags or only the inner DSML sentinel
+        # as special tokens. As in vLLM, use token boundaries where available and
+        # bounded text matching for roots that are not individual vocab entries.
         terminals = {
             token_id: "dsml_text" for text, token_id in vocab.items()
-            if text.startswith((f"<{_DSML}", f"</{_DSML}"))
+            if text == _DSML or text.startswith((f"<{_DSML}", f"</{_DSML}"))
         }
-        terminals[self._require_terminal(vocab, TOOL_START)] = "tool_start"
-        terminals[self._require_terminal(vocab, TOOL_END)] = "tool_end"
+        self._text_roots = {}
+        for text, kind in ((TOOL_START, "tool_start"), (TOOL_END, "tool_end")):
+            if text in vocab:
+                terminals[vocab[text]] = kind
+            else:
+                self._text_roots[text] = kind
+        self._root_pattern = (
+            re.compile("|".join(re.escape(text) for text in self._text_roots))
+            if self._text_roots else None
+        )
         return terminals
 
     def _reset(self) -> None:
@@ -76,8 +86,42 @@ class DeepSeekV4ToolParser(DeepSeekV4ReasoningParser):
         self._value_parts: list[str] = []
         self._string_value = False
         self._calls: list[_Call] = []
+        self._root_tail = ""
 
     def _consume(self, segments: Sequence[_Segment]) -> ParsedDelta:
+        return self._consume_segments(self._split_text_roots(segments))
+
+    def _split_text_roots(self, segments: Iterable[_Segment]) -> Iterable[_Segment]:
+        for segment in segments:
+            if self._root_pattern is None:
+                yield segment
+                continue
+            if isinstance(segment, _TextSegment) or segment.kind == "dsml_text":
+                text = self._root_tail + segment.text
+                self._root_tail = ""
+                offset = 0
+                for match in self._root_pattern.finditer(text):
+                    if match.start() > offset:
+                        yield _TextSegment(text[offset:match.start()])
+                    yield _TerminalSegment(self._text_roots[match.group()], match.group())
+                    offset = match.end()
+                keep = 0
+                for root in self._text_roots:
+                    for size in range(min(len(root) - 1, len(text) - offset), keep, -1):
+                        if text.endswith(root[:size]):
+                            keep = size
+                            break
+                if len(text) - keep > offset:
+                    yield _TextSegment(text[offset:len(text) - keep])
+                self._root_tail = text[-keep:] if keep else ""
+            else:
+                # Never join a textual tag across a token-ID control boundary.
+                if self._root_tail:
+                    yield _TextSegment(self._root_tail)
+                    self._root_tail = ""
+                yield segment
+
+    def _consume_segments(self, segments: Iterable[_Segment]) -> ParsedDelta:
         reasoning: list[str] = []
         content: list[str] = []
         deltas: list[ToolCallDelta] = []
@@ -256,6 +300,15 @@ class DeepSeekV4ToolParser(DeepSeekV4ReasoningParser):
 
     def finish(self, *, truncated: bool = False) -> ParsedDelta:
         tail = super().finish(truncated=truncated)
+        if self._root_tail:
+            pending = self._root_tail
+            self._root_tail = ""
+            rest = self._consume_segments((_TextSegment(pending),))
+            tail = ParsedDelta(
+                reasoning=tail.reasoning + rest.reasoning,
+                content=tail.content + rest.content,
+                tool_call_deltas=self._coalesce([*tail.tool_call_deltas, *rest.tool_call_deltas]),
+            )
         if self._inside_tools and not truncated:
             raise ValueError("generation ended inside an incomplete DSML tool call")
         calls = tuple(

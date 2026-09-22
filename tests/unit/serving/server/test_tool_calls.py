@@ -22,7 +22,7 @@ from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConf
 from pypto_serving.serving.reasoning.deepseek_v4_tools import TOOL_END, TOOL_START
 from pypto_serving.serving.sched.scheduler import RequestOutput, RequestStatus, SchedulerOutput
 from pypto_serving.serving.server.server import ChatCompletionRequest, ServingServer
-from tests.unit.serving.reasoning.test_deepseek_v4_tools import ToolTokenizer, invoke
+from tests.unit.serving.reasoning.test_deepseek_v4_tools import SplitRootTokenizer, ToolTokenizer, invoke
 
 
 TOOLS = [{"type": "function", "function": {
@@ -124,6 +124,13 @@ class _ChatTokenizer(ToolTokenizer):
         return prompt
 
 
+class _SplitChatTokenizer(_ChatTokenizer):
+    specials = SplitRootTokenizer.specials
+    vocab = SplitRootTokenizer.vocab
+    all_special_ids = SplitRootTokenizer.all_special_ids
+    eos_token_id = vocab["<eos>"]
+
+
 class _ReplayScheduler:
     """Replace model execution only; use real engine parsing and delivery."""
 
@@ -195,9 +202,9 @@ class _ReplayCore(ReplicaEngineCore):
         self._pending_free_ids.clear()
 
 
-def _replay_server(*scripts, chunk_size=7):
+def _replay_server(*scripts, chunk_size=7, tokenizer=None):
     engine = AsyncLLMEngine(
-        EngineConfig(model_id="test"), _ChatTokenizer(),
+        EngineConfig(model_id="test"), tokenizer or _ChatTokenizer(),
         core_factory=lambda **kwargs: _ReplayCore(**kwargs, scripts=scripts, chunk_size=chunk_size),
     )
     return ServingServer(engine, "test", GenerateConfig(max_new_tokens=2048))
@@ -264,13 +271,14 @@ def _assert_released(server, count):
 
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("chunk_size", [1, 7, 100000])
-def test_http_tools_roundtrip_runs_real_output_delivery(stream, chunk_size):
+@pytest.mark.parametrize("tokenizer_class", [_ChatTokenizer, _SplitChatTokenizer])
+def test_http_tools_roundtrip_runs_real_output_delivery(stream, chunk_size, tokenizer_class):
     call_text = "Need data</think>" + TOOL_START + invoke(city="杭州") + TOOL_END + "<eos>"
     second_call = "Need more data" + TOOL_START + invoke(city="北京") + TOOL_END + "<eos>"
     answer = "Now known</think>Two results.<eos>"
     server = _replay_server(
         (call_text, "FINISHED_EOS"), (second_call, "FINISHED_EOS"), (answer, "FINISHED_EOS"),
-        chunk_size=chunk_size,
+        chunk_size=chunk_size, tokenizer=tokenizer_class(),
     )
     messages = [{"role": "user", "content": "Compare two cities"}]
     with TestClient(server.app) as client:
@@ -392,14 +400,15 @@ def test_closing_http_stream_releases_active_tool_request_once():
 
 
 @pytest.mark.parametrize("stream", [False, True])
-def test_real_delivery_holds_utf8_and_distinguishes_literal_markers(stream):
-    tokenizer = _ChatTokenizer()
+@pytest.mark.parametrize("tokenizer_class", [_ChatTokenizer, _SplitChatTokenizer])
+def test_real_delivery_holds_utf8_and_distinguishes_literal_markers(stream, tokenizer_class):
+    tokenizer = tokenizer_class()
     literal = "</think>secret"
     ids = [1000 + ord(char) for char in literal]
     ids += [tokenizer.vocab["</think>"], 700, 701]
     ids += tokenizer.encode(TOOL_START + invoke(city="杭州") + TOOL_END + "<eos>")
     # First K7-like burst ends in an unfinished multi-token character.
-    server = _replay_server((ids, "FINISHED_EOS"), chunk_size=len(literal) + 2)
+    server = _replay_server((ids, "FINISHED_EOS"), chunk_size=len(literal) + 2, tokenizer=tokenizer)
     with TestClient(server.app) as client:
         message, reason, _ = _collect_chat(client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "Question"}], "tools": TOOLS,
