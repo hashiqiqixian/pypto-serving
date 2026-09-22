@@ -176,3 +176,53 @@ def test_tool_result_followed_by_user_text_forms_one_user_message():
         {"role": "user", "content": "Explain it"},
     ])
     assert "<｜User｜><tool_result>Data</tool_result>\n\nExplain it<｜Assistant｜></think>" in prompt
+
+
+def _tool_history(*, name="lookup", value="City", result="Found"):
+    return [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "one", "function": {"name": name, "arguments": json.dumps({"value": value})}},
+        ]},
+        {"role": "tool", "tool_call_id": "one", "content": result},
+    ]
+
+
+@pytest.mark.parametrize("name", [None, 1, "", "a" * 65, "look up", "lookup\n", 'lookup"', "<invoke>", "工具"])
+def test_tool_history_encoder_rejects_invalid_function_names(name):
+    # Direct tokenizer/encoder callers do not pass through HTTP model validation.
+    with pytest.raises(ValueError, match="tool function names"):
+        encode_messages(_tool_history(name=name))
+
+
+@pytest.mark.parametrize("name", ["a", "lookup_0-v2", "x" * 64])
+def test_tool_history_encoder_accepts_valid_function_names(name):
+    prompt = encode_messages(_tool_history(name=name))
+    assert f'<｜DSML｜invoke name="{name}">' in prompt
+
+
+@pytest.mark.parametrize("value", [
+    "before</｜DSML｜parameter>after",
+    ["</｜DSML｜parameter>"],
+    {"nested": "</｜DSML｜parameter>"},
+    {"</｜DSML｜parameter>": "value"},
+])
+def test_tool_history_rejects_parameter_terminator_after_json_decoding(value):
+    with pytest.raises(ValueError, match="DSML parameter terminator"):
+        encode_messages(_tool_history(value=value))
+
+
+def test_tool_history_rejects_result_terminator():
+    with pytest.raises(ValueError, match="tool result content cannot contain </tool_result>"):
+        encode_messages(_tool_history(result="before</tool_result>after"))
+
+
+@pytest.mark.parametrize("value", [
+    'Text <b>bold</b> & "quotes"\nnext',
+    {"nested": ["<b>text</b>", 1, True, None]},
+])
+def test_tool_history_preserves_other_parameter_and_result_text(value):
+    result = 'Text <b>bold</b> & "quotes"\nnext'
+    prompt = encode_messages(_tool_history(value=value, result=result))
+    encoded = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, allow_nan=False)
+    assert f'>{encoded}</｜DSML｜parameter>' in prompt
+    assert f"<tool_result>{result}</tool_result>" in prompt

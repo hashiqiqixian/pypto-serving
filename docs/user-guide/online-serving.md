@@ -60,8 +60,11 @@ The server converts chat messages to a prompt with the tokenizer's `apply_chat_t
 
 Tool calling is selected by the model tokenizer; no extra launcher flag or vLLM dependency is required. Serving encodes tool definitions and parses model output. **The client executes tools**, then sends the results in a new chat request.
 
+Send this request to a **DeepSeek V4** server, not the Qwen server in the examples above. Set `DEEPSEEK_BASE_URL` to that server's host and port (8000 is the default serving port).
+
 ```bash
-curl --noproxy "*" http://127.0.0.1:8899/v1/chat/completions \
+DEEPSEEK_BASE_URL=http://127.0.0.1:8000  # Replace with your DeepSeek V4 endpoint.
+curl --noproxy "*" "$DEEPSEEK_BASE_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [{"role": "user", "content": "What is the weather in London?"}],
@@ -107,6 +110,7 @@ Supported controls and limits:
 - Multiple calls are supported. `parallel_tool_calls: false` exposes only the first call; it does not constrain sampling or execute tools serially.
 - `required`, named tool choices, and `strict: true` return HTTP 400 because constrained tool decoding is not implemented. Non-function tool types are rejected during request validation.
 - Tools on a model without a registered tool parser are rejected. DSML formatting stays in the DeepSeek implementation, not the HTTP server or scheduler.
+- Tool-history argument values cannot contain the reserved `</｜DSML｜parameter>` delimiter, including inside nested JSON values. Tool-result content cannot contain `</tool_result>`. These inputs return HTTP 400 before generation rather than breaking the history encoding.
 - The parser preserves DSML parameter types without schema-based coercion or guessed JSON repairs. A length-truncated call can have incomplete arguments: do not execute it as a successful call.
 - This feature applies to `/v1/chat/completions`; `/v1/completions` remains an unparsed text API.
 

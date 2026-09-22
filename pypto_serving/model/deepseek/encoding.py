@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
 
 
@@ -146,6 +147,9 @@ def _encode_tool_calls(tool_calls: Sequence[Mapping[str, object]]) -> str:
     invokes = []
     for call in tool_calls:
         function = call["function"]
+        name = function.get("name")
+        if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name) is None:
+            raise ValueError("tool function names must be 1-64 ASCII letters, digits, underscores, or hyphens")
         arguments = json.loads(function["arguments"])
         if not isinstance(arguments, dict):
             raise ValueError("tool call arguments must encode an object")
@@ -155,12 +159,14 @@ def _encode_tool_calls(tool_calls: Sequence[Mapping[str, object]]) -> str:
                 raise ValueError("tool parameter names cannot contain DSML attribute delimiters")
             is_string = isinstance(value, str)
             encoded = value if is_string else json.dumps(value, ensure_ascii=False, allow_nan=False)
+            if f"</{DSML}parameter>" in encoded:
+                raise ValueError("tool parameter values cannot contain the DSML parameter terminator")
             parameters.append(
                 f'<{DSML}parameter name="{key}" string="{str(is_string).lower()}">'
                 f'{encoded}</{DSML}parameter>'
             )
         invokes.append(
-            f'<{DSML}invoke name="{function["name"]}">\n'
+            f'<{DSML}invoke name="{name}">\n'
             + "\n".join(parameters) + f"\n</{DSML}invoke>"
         )
     return f"\n\n<{DSML}tool_calls>\n" + "\n".join(invokes) + f"\n</{DSML}tool_calls>"
@@ -190,6 +196,8 @@ def _merge_tool_results(messages: Sequence[Mapping[str, object]]) -> list[dict]:
                 raise ValueError("duplicate tool result for tool_call_id")
             if not isinstance(message.get("content"), str):
                 raise ValueError("DeepSeek V4 tool result content must be a string")
+            if "</tool_result>" in message["content"]:
+                raise ValueError("tool result content cannot contain </tool_result>")
             results[call_id] = message["content"]
             continue
         flush_results()
