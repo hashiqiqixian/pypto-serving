@@ -13,7 +13,7 @@ from pypto_serving.serving.engine.async_engine import (
     ReplicaEngineCore,
     _RequestContext,
 )
-from pypto_serving.serving.reasoning import OutputParserSpec, create_output_parser
+from pypto_serving.serving.reasoning import OutputParserSpec, ParsedDelta, create_output_parser
 from pypto_serving.serving.sched.scheduler import (
     Request,
     RequestOutput,
@@ -231,9 +231,9 @@ def test_process_step_output_contains_parser_failure_to_one_request() -> None:
 
     class _FailingParser:
         def feed(self, delta_text, delta_token_ids):
-            return SimpleNamespace(reasoning="", content=delta_text)
+            return ParsedDelta(content=delta_text)
 
-        def finish(self):
+        def finish(self, *, truncated=False):
             raise ValueError("malformed terminal tail")
 
     class _TwoRequestScheduler:

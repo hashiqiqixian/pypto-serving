@@ -23,7 +23,9 @@ from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, GenerateResult, RuntimeConfig
 from pypto_serving.observability import InMemoryStatLogger, IterationStats, SchedulerStats
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
-from pypto_serving.serving.reasoning import OutputParserSpec, create_output_parser
+from pypto_serving.serving.reasoning import (
+    OutputParserSpec, ParsedToolCall, ToolCallDelta, create_output_parser,
+)
 from pypto_serving.serving.utils.env import (
     worker_init_timeout_seconds,
     worker_step_timeout_seconds,
@@ -172,6 +174,8 @@ class TokenOutput:
     # outputs empty avoids copying the complete token history once per step,
     # while offline callers can still build a structured GenerateResult.
     token_ids: tuple[int, ...] = ()
+    tool_call_deltas: tuple[ToolCallDelta, ...] = ()
+    tool_calls: tuple[ParsedToolCall, ...] = ()
 
 
 class ReplicaEngineCore:
@@ -864,7 +868,7 @@ class ReplicaEngineCore:
                 if request_id in seen:
                     continue
                 seen.add(request_id)
-                ctx = self._request_contexts.get(request_id)
+                ctx = self._request_contexts.pop(request_id, None)
                 if ctx is not None:
                     ctx.queue.put_nowait(
                         TokenOutput(finished=True, finish_reason="error")
@@ -964,8 +968,11 @@ class ReplicaEngineCore:
             # Semantic parsing only changes the public presentation channels.
             reasoning = ""
             reasoning_delta = ""
+            tool_call_deltas: tuple[ToolCallDelta, ...] = ()
+            tool_calls: tuple[ParsedToolCall, ...] = ()
             if ctx.output_parser is not None:
                 try:
+                    truncated = req_output.finish_reason in ("FINISHED_LENGTH", "FINISHED_ABORTED")
                     if ctx.stream:
                         parser_text_delta = self._detokenize_parser_incrementally(ctx)
                         token_ids = ctx.request.output_token_ids
@@ -977,6 +984,7 @@ class ReplicaEngineCore:
                         )
                         reasoning_delta = parsed.reasoning
                         text_delta = parsed.content
+                        tool_call_deltas = parsed.tool_call_deltas
 
                         if req_output.finished:
                             final_parser_text = self._finalize_parser_detokenization(ctx)
@@ -984,9 +992,12 @@ class ReplicaEngineCore:
                                 tail = ctx.output_parser.feed(final_parser_text, ())
                                 reasoning_delta += tail.reasoning
                                 text_delta += tail.content
-                            tail = ctx.output_parser.finish()
+                                tool_call_deltas += tail.tool_call_deltas
+                            tail = ctx.output_parser.finish(truncated=truncated)
                             reasoning_delta += tail.reasoning
                             text_delta += tail.content
+                            tool_call_deltas += tail.tool_call_deltas
+                            tool_calls = tail.tool_calls
 
                         if reasoning_delta:
                             ctx.parser_reasoning_parts.append(reasoning_delta)
@@ -1006,11 +1017,13 @@ class ReplicaEngineCore:
                         parsed = ctx.output_parser.parse_complete(
                             raw_text,
                             ctx.request.output_token_ids,
+                            truncated=truncated,
                         )
                         text = parsed.content
                         reasoning = parsed.reasoning
                         text_delta = text
                         reasoning_delta = reasoning
+                        tool_calls = parsed.tool_calls
                 except ValueError as exc:
                     # Parser failures are request-local presentation errors.
                     # Remove ownership before waking the consumer so its
@@ -1047,6 +1060,8 @@ class ReplicaEngineCore:
                 reasoning=reasoning,
                 text_delta=text_delta,
                 reasoning_delta=reasoning_delta,
+                tool_call_deltas=tool_call_deltas,
+                tool_calls=tool_calls,
                 finished=req_output.finished,
                 finish_reason=req_output.finish_reason,
                 prompt_tokens=ctx.request.num_prompt_tokens,
@@ -1057,6 +1072,10 @@ class ReplicaEngineCore:
                     else ()
                 ),
             )
+            if req_output.finished:
+                # Final output owns the already-scheduled worker release. Drop
+                # the context before waking a consumer that may close at once.
+                self._request_contexts.pop(req_output.request_id, None)
             ctx.queue.put_nowait(token_output)
 
     def _detokenize_incrementally(self, ctx: _RequestContext) -> str:
@@ -1425,17 +1444,18 @@ class AsyncLLMEngine:
                     prompt_token_ids=prompt_token_ids,
                     output_parser_spec=output_parser_spec,
                 )
-            async for output in outputs:
-                if not self._core_records_metrics[replica_idx]:
-                    self.metrics.record_output(
-                        replica_idx, request_id, completion_tokens=output.completion_tokens,
-                    )
-                if output.finished:
-                    terminal_output_seen = True
+            async with contextlib.aclosing(outputs):
+                async for output in outputs:
                     if not self._core_records_metrics[replica_idx]:
-                        self.metrics.finish_request(replica_idx, request_id, output.finish_reason)
-                yield output
-        except asyncio.CancelledError:
+                        self.metrics.record_output(
+                            replica_idx, request_id, completion_tokens=output.completion_tokens,
+                        )
+                    if output.finished:
+                        terminal_output_seen = True
+                        if not self._core_records_metrics[replica_idx]:
+                            self.metrics.finish_request(replica_idx, request_id, output.finish_reason)
+                    yield output
+        except (asyncio.CancelledError, GeneratorExit):
             if not terminal_output_seen:
                 self.metrics.finish_request(
                     replica_idx,

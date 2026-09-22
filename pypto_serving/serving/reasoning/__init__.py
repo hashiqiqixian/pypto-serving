@@ -13,7 +13,10 @@ from .parser import (
     OutputParserSpec,
     ParsedDelta,
     ParsedOutput,
+    ParsedToolCall,
+    ToolCallDelta,
     create_output_parser,
+    supports_tool_calls,
 )
 
 __all__ = (
@@ -21,5 +24,8 @@ __all__ = (
     "OutputParserSpec",
     "ParsedDelta",
     "ParsedOutput",
+    "ParsedToolCall",
+    "ToolCallDelta",
     "create_output_parser",
+    "supports_tool_calls",
 )

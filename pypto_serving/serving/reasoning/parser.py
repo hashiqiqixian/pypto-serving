@@ -29,12 +29,43 @@ class OutputParserSpec:
     parser_id: str
     initial_state: Literal["content", "reasoning"]
     include_reasoning: bool = True
+    tool_choice: Literal["none", "auto"] = "none"
+    tool_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.parser_id != "deepseek_v4":
             raise ValueError(f"unsupported output parser {self.parser_id!r}")
         if self.initial_state not in ("content", "reasoning"):
             raise ValueError("output parser initial_state must be content or reasoning")
+        if self.tool_choice not in ("none", "auto"):
+            raise ValueError("output parser tool_choice must be none or auto")
+        if self.tool_choice == "auto" and not self.tool_names:
+            raise ValueError("auto tool choice requires tool names")
+
+
+def supports_tool_calls(parser_id: str | None) -> bool:
+    """Report model parser capabilities before starting a request."""
+    return parser_id == "deepseek_v4"
+
+
+@dataclass(frozen=True)
+class ParsedToolCall:
+    """Model-independent function call; incomplete calls are never repaired."""
+
+    id: str
+    name: str
+    arguments: str
+    complete: bool = True
+
+
+@dataclass(frozen=True)
+class ToolCallDelta:
+    """Append-only updates to one call, identified by its request-local index."""
+
+    index: int
+    id: str | None = None
+    name: str | None = None
+    arguments: str = ""
 
 
 @dataclass(frozen=True)
@@ -43,6 +74,9 @@ class ParsedDelta:
 
     reasoning: str = ""
     content: str = ""
+    tool_call_deltas: tuple[ToolCallDelta, ...] = ()
+    # Populated at finalization only, like the final TokenOutput snapshot.
+    tool_calls: tuple[ParsedToolCall, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -51,6 +85,7 @@ class ParsedOutput:
 
     reasoning: str = ""
     content: str = ""
+    tool_calls: tuple[ParsedToolCall, ...] = ()
 
 
 class OutputParser(Protocol):
@@ -60,12 +95,14 @@ class OutputParser(Protocol):
         delta_token_ids: Sequence[int],
     ) -> ParsedDelta: ...
 
-    def finish(self) -> ParsedDelta: ...
+    def finish(self, *, truncated: bool = False) -> ParsedDelta: ...
 
     def parse_complete(
         self,
         text: str,
         token_ids: Sequence[int],
+        *,
+        truncated: bool = False,
     ) -> ParsedOutput: ...
 
 
@@ -261,11 +298,15 @@ class DeepSeekV4ReasoningParser:
             think_start_id: _START_TERMINAL,
             think_end_id: _END_TERMINAL,
         }
+        terminals.update(self._extra_terminals(vocab))
         for raw_token_id in getattr(tokenizer, "all_special_ids", ()):
             token_id = int(raw_token_id)
             terminals.setdefault(token_id, _DROP_TERMINAL)
         self._scanner = _TokenTerminalScanner(tokenizer, terminals)
         self._state = self._initial_state
+
+    def _extra_terminals(self, vocab: dict[str, int]) -> dict[int, str]:
+        return {}
 
     @staticmethod
     def _require_terminal(vocab: dict[str, int], terminal: str) -> int:
@@ -283,20 +324,23 @@ class DeepSeekV4ReasoningParser:
     ) -> ParsedDelta:
         return self._consume(self._scanner.scan(delta_text, delta_token_ids))
 
-    def finish(self) -> ParsedDelta:
+    def finish(self, *, truncated: bool = False) -> ParsedDelta:
         return self._consume(self._scanner.finish())
 
     def parse_complete(
         self,
         text: str,
         token_ids: Sequence[int],
+        *,
+        truncated: bool = False,
     ) -> ParsedOutput:
         self._reset()
         first = self.feed(text, token_ids)
-        final = self.finish()
+        final = self.finish(truncated=truncated)
         return ParsedOutput(
             reasoning=first.reasoning + final.reasoning,
             content=first.content + final.content,
+            tool_calls=final.tool_calls,
         )
 
     def _reset(self) -> None:
@@ -337,5 +381,9 @@ def create_output_parser(spec: OutputParserSpec | None, tokenizer) -> OutputPars
     if spec is None:
         return None
     if spec.parser_id == "deepseek_v4":
+        if spec.tool_names:
+            from .deepseek_v4_tools import DeepSeekV4ToolParser
+
+            return DeepSeekV4ToolParser(tokenizer, spec)
         return DeepSeekV4ReasoningParser(tokenizer, spec)
     raise ValueError(f"unsupported output parser {spec.parser_id!r}")
