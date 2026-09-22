@@ -462,8 +462,8 @@ class ModelLoader:
 
             load_text_config(model_dir)
             raise NotImplementedError(
-                "V4.1 configuration and tokenizer are supported; weight loading and execution "
-                "are not integrated yet. Use load_text_config() and load_tokenizer() for inspection."
+                "V4.1 serving execution is not integrated yet. Use load_text_config() and "
+                "load_tokenizer() for inspection, or V41WeightLoader for selective CPU weight loading."
             )
         request = ModelLoadRequest(
             model_id=model_id,

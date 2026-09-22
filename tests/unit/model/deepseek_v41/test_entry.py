@@ -88,7 +88,7 @@ def test_invalid_special_id(raw, value):
 
 @pytest.mark.parametrize("model_format", [None, "hf", "deepseek_v4"])
 def test_loading_never_falls_through_to_qwen(model_dir, model_format):
-    with pytest.raises(NotImplementedError, match="weight loading and execution"):
+    with pytest.raises(NotImplementedError, match="serving execution"):
         ModelLoader().load("v41", str(model_dir), model_format=model_format)
 
 
