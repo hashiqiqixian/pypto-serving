@@ -50,7 +50,7 @@ class TokenizerAdapter:
         """Return the Serving output parser registered for this tokenizer."""
         return None
 
-    def apply_chat_template(self, messages: list[dict[str, str]], **kwargs) -> str:
+    def apply_chat_template(self, messages: list[dict[str, object]], **kwargs) -> str:
         """Encode chat messages into the model's generation prompt."""
         raise NotImplementedError
 
@@ -151,7 +151,7 @@ class TransformersTokenizerAdapter(TokenizerAdapter):
         """Return all special-token IDs exposed by the wrapped tokenizer."""
         return tuple(int(token_id) for token_id in self.tokenizer.all_special_ids)
 
-    def apply_chat_template(self, messages: list[dict[str, str]], **kwargs) -> str:
+    def apply_chat_template(self, messages: list[dict[str, object]], **kwargs) -> str:
         """Apply the Hugging Face chat template loaded with the tokenizer."""
         return self.tokenizer.apply_chat_template(messages, **kwargs)
 
@@ -175,7 +175,7 @@ class TransformersTokenizerAdapter(TokenizerAdapter):
 class DeepSeekV4TokenizerAdapter(TransformersTokenizerAdapter):
     """Tokenizer adapter for DeepSeek V4's Python-defined chat encoding."""
 
-    def apply_chat_template(self, messages: list[dict[str, str]], **kwargs) -> str:
+    def apply_chat_template(self, messages: list[dict[str, object]], **kwargs) -> str:
         from pypto_serving.model.deepseek.encoding import encode_messages
 
         thinking = bool(kwargs.get("thinking", False) or kwargs.get("enable_thinking", False))
@@ -187,6 +187,8 @@ class DeepSeekV4TokenizerAdapter(TransformersTokenizerAdapter):
             messages,
             thinking=thinking,
             reasoning_effort=reasoning_effort if isinstance(reasoning_effort, str) else None,
+            tools=kwargs.get("tools"),
+            drop_thinking=kwargs.get("drop_thinking", True),
         )
 
     @property

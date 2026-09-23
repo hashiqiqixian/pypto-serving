@@ -52,9 +52,69 @@ curl --noproxy "*" http://127.0.0.1:8899/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"What is 1+1?"}],"max_tokens":32}'
 ```
 
-Chat completions accept `model`, `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stop`, `stream`, and `chat_template_kwargs`.
+Chat completions accept `model`, `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stop`, `stream`, `reasoning_effort`, `include_reasoning`, and `chat_template_kwargs`. DeepSeek V4 also supports the function-tool fields described below.
 
 The server converts chat messages to a prompt with the tokenizer's `apply_chat_template` method. `chat_template_kwargs` is forwarded to the tokenizer, which allows model-specific controls such as Qwen thinking-mode settings when the tokenizer supports them.
+
+## DeepSeek V4 Function Tools
+
+Tool calling is selected by the model tokenizer; no extra launcher flag or vLLM dependency is required. Serving encodes tool definitions and parses model output. **The client executes tools**, then sends the results in a new chat request.
+
+Send this request to a **DeepSeek V4** server, not the Qwen server in the examples above. Set `DEEPSEEK_BASE_URL` to that server's host and port (8000 is the default serving port).
+
+```bash
+DEEPSEEK_BASE_URL=http://127.0.0.1:8000  # Replace with your DeepSeek V4 endpoint.
+curl --noproxy "*" "$DEEPSEEK_BASE_URL/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "What is the weather in London?"}],
+    "tools": [{"type": "function", "function": {
+      "name": "get_weather",
+      "description": "Get current weather for a city",
+      "parameters": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"]
+      }
+    }}],
+    "tool_choice": "auto",
+    "max_tokens": 512
+  }'
+```
+
+`auto` is the default when non-empty `tools` are supplied. The model can answer normally or return `message.tool_calls`, with each call containing `id`, `type: "function"`, and `function: {name, arguments}`. `arguments` is a **JSON string**, not a JSON object. `content` can be null; `reasoning`, when enabled, remains separate from both content and tools.
+
+The parser returns a model-generated function name even if that name is absent from this request's `tools`, matching vLLM's default DeepSeek V4 behavior. Serving does not provide built-in functions such as `read_file`; the client decides which calls it can execute. Check the returned name against the client's available tools before executing it.
+
+For a successful call, the client should validate the function name and arguments against its schema before execution. Append the returned assistant message and a tool result that references the same call ID:
+
+```json
+[
+  {"role": "user", "content": "What is the weather in London?"},
+  {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [{
+      "id": "call_example",
+      "type": "function",
+      "function": {"name": "get_weather", "arguments": "{\"city\":\"London\"}"}
+    }]
+  },
+  {"role": "tool", "tool_call_id": "call_example", "content": "Sunny, 18 degrees Celsius"}
+]
+```
+
+Send that history to the same chat endpoint, including `tools` again if another tool call is allowed. Preserve the returned assistant `reasoning` when present and use consistent thinking settings across the round trip. Results of multiple calls are encoded in the original call order, even if the client returns them out of order.
+
+Supported controls and limits:
+
+- `tool_choice: "none"` suppresses tool-call output. Recognized tool blocks are consumed when tools are supplied; ordinary no-tools chat keeps its existing parser behavior.
+- Multiple calls are supported. `parallel_tool_calls: false` exposes only the first call; it does not constrain sampling or execute tools serially.
+- `required`, named tool choices, and `strict: true` return HTTP 400 because constrained tool decoding is not implemented. Non-function tool types are rejected during request validation.
+- Tools on a model without a registered tool parser are rejected. DSML formatting stays in the DeepSeek implementation, not the HTTP server or scheduler.
+- Tool-history argument values cannot contain the reserved `</｜DSML｜parameter>` delimiter, including inside nested JSON values. Tool-result content cannot contain `</tool_result>`. These inputs return HTTP 400 before generation rather than breaking the history encoding.
+- The parser preserves DSML parameter types without schema-based coercion or guessed JSON repairs. A length-truncated call can have incomplete arguments: do not execute it as a successful call.
+- This feature applies to `/v1/chat/completions`; `/v1/completions` remains an unparsed text API.
 
 ## Streaming
 
@@ -74,16 +134,23 @@ data: [DONE]
 
 Accumulate `choices[0].text` for completions and `choices[0].delta.content` for chat completions. The final usage event has an empty `choices` list and authoritative token counts.
 
+For tool-enabled chat, collect `delta.tool_calls` separately, keyed by `index`. The first delta for a call supplies its `id`, `type`, and `function.name`; concatenate subsequent `function.arguments` fragments for that index. Arguments can be incomplete JSON until the call finishes. String parameters stream before their closing delimiter; non-string parameters are emitted once their JSON value is complete. Accumulate `delta.reasoning` separately when present.
+
+Invalid tool configuration is rejected before the stream starts. A model-output parsing error after SSE headers sends `data: {"error": {"message": "...", "type": "invalid_model_output", "code": 400}}`, followed by `[DONE]`, instead of a successful tool-call finish. The HTTP status is already 200 in that case; clients must inspect stream error events.
+
 ## Responses
 
 Non-streaming responses include one choice and usage counts when the request finishes. Finish reasons are normalized to:
 
 | Value | Meaning |
 | --- | --- |
-| `eos` | The model produced EOS. |
+| `stop` | The model produced EOS or a stop string matched. |
 | `length` | The request reached `max_tokens` or model length. |
-| `stop` | A stop string matched or an unknown finish state was normalized. |
 | `aborted` | The request was aborted. |
+| `error` | The engine reported a failure. |
+| `tool_calls` | Tool-enabled chat ended normally with complete calls. |
+
+`length`, `aborted`, and `error` are not overwritten by `tool_calls`. A normal end inside an incomplete tool block is a request-local parsing error, not a successful call.
 
 Scheduler and engine rejections are returned as HTTP 400 with:
 

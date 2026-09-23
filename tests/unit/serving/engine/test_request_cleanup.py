@@ -33,10 +33,11 @@ def test_worker_step_error_queues_finished_ids_for_executor_release():
     core._pending_free_ids = []
     core._batch_queue = deque()
     core._discard_result_step_ids = set()
-    core._request_contexts = {
+    contexts = {
         "req-a": SimpleNamespace(queue=asyncio.Queue()),
         "req-b": SimpleNamespace(queue=asyncio.Queue()),
     }
+    core._request_contexts = dict(contexts)
     scheduler_output = SimpleNamespace(
         scheduled_requests=[
             SimpleNamespace(request=SimpleNamespace(request_id="req-a")),
@@ -51,8 +52,9 @@ def test_worker_step_error_queues_finished_ids_for_executor_release():
     assert aborted == ["req-a", "req-b"]
     assert discarded == scheduler_output.scheduled_requests
     assert core._pending_free_ids == ["req-a", "req-b"]
+    assert not core._request_contexts
     for request_id in ("req-a", "req-b"):
-        token = core._request_contexts[request_id].queue.get_nowait()
+        token = contexts[request_id].queue.get_nowait()
         assert isinstance(token, TokenOutput)
         assert token.finished is True
         assert token.finish_reason == "error"

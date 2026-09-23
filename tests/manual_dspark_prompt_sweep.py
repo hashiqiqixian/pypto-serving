@@ -41,7 +41,7 @@ def _validate(response: dict, log: str, target: int, codes: list[str]) -> None:
     if usage.get("prompt_tokens") != target or not isinstance(count, int) or not 1 < count <= 128:
         raise RuntimeError(f"invalid token accounting or no decode: {usage}")
     choices = response.get("choices", [])
-    if (len(choices) != 1 or choices[0].get("finish_reason") != "eos"
+    if (len(choices) != 1 or choices[0].get("finish_reason") != "stop"
             or choices[0]["message"]["content"].strip().splitlines() != codes):
         raise RuntimeError(f"expected three ordered code lines and natural EOS: {choices}")
     if not re.search(r"DSpark speculation progress[^\n]*\bverifies=[1-9]\d*\b", log):

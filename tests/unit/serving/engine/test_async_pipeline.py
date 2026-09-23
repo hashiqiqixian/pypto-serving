@@ -331,7 +331,8 @@ def test_async_pipeline_drains_stale_result_after_error(monkeypatch):
     req = _running_decode_request(prompt=(1, 2), first_output=50)
     core.scheduler.running.append(req)
     core.scheduler.requests[req.request_id] = req
-    core._request_contexts = {"r": SimpleNamespace(queue=asyncio.Queue(), request=req, stream=True)}
+    ctx = SimpleNamespace(queue=asyncio.Queue(), request=req, stream=True)
+    core._request_contexts = {"r": ctx}
 
     # Two steps dispatched: both commands reached the FIFO worker, so both
     # results are already in transit.
@@ -356,7 +357,8 @@ def test_async_pipeline_drains_stale_result_after_error(monkeypatch):
     assert asyncio.run(core._await_and_apply_oldest()) is False
     assert not core._batch_queue
     assert second_step_id in core._discard_result_step_ids
-    tok = core._request_contexts["r"].queue.get_nowait()
+    tok = ctx.queue.get_nowait()
+    assert not core._request_contexts
     assert tok.finished is True and tok.finish_reason == "error"
 
     # Next live fetch must SKIP the stale second-step result and return step 99,

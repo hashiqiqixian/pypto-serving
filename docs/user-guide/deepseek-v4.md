@@ -89,7 +89,7 @@ curl --noproxy "*" http://127.0.0.1:8225/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"What is 1+1?"}],"max_tokens":32}'
 ```
 
-Pass `"reasoning_effort":"high"` or `"chat_template_kwargs":{"enable_thinking":true}` to use the model's thinking prompt. An explicit `enable_thinking` value takes priority when both are given. The current API supports string content with system, user, developer, assistant, and `latest_reminder` roles; tool calls and multimodal content are not yet exposed by the PyPTO request schema. Generation defaults to greedy sampling (`temperature=0`).
+Pass `"reasoning_effort":"high"` or `"chat_template_kwargs":{"enable_thinking":true}` to use the model's thinking prompt. An explicit `enable_thinking` value takes priority when both are given. The API supports text messages with system, user, developer, assistant, and `latest_reminder` roles, plus assistant function calls and tool-result messages. See [Function Tools](online-serving.md#deepseek-v4-function-tools) for request fields, streaming deltas, and client-side execution. Multimodal content is not exposed by the request schema. Generation defaults to greedy sampling (`temperature=0`).
 
 The main prefill kernel accepts a dynamic request extent up to 8192 tokens and walks it internally in 128-token tiles. The effective dispatch extent is the minimum of 8192, `--max-num-batched-tokens`, `--long-prefill-token-threshold`, and `--max-model-len`. An 8191-token prompt can therefore use one 8192-row main-prefill dispatch when those configured limits permit it, instead of 64 serving dispatches.
 

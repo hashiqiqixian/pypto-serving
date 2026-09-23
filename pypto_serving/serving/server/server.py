@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
@@ -18,8 +19,8 @@ import uuid
 from typing import Literal
 
 from pypto_serving.config.types import GenerateConfig
-from pypto_serving.serving.engine.async_engine import AsyncLLMEngine
-from pypto_serving.serving.reasoning import OutputParserSpec
+from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, TokenOutput
+from pypto_serving.serving.reasoning import OutputParserSpec, ToolCallDelta, supports_tool_calls
 from pypto_serving.tools.profile import (
     get_profiler,
     merge_profile,
@@ -36,7 +37,7 @@ ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "
 try:
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse, Response, StreamingResponse
-    from pydantic import BaseModel
+    from pydantic import BaseModel, Field, model_serializer
 except ImportError as e:
     raise ImportError(
         "Serving requires fastapi and pydantic. Install with: pip install fastapi uvicorn sse-starlette pydantic"
@@ -59,10 +60,65 @@ class CompletionRequest(BaseModel):
     stream: bool = False
 
 
+class FunctionDefinition(BaseModel):
+    name: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    description: str | None = None
+    parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}})
+    strict: bool | None = None
+
+
+class ChatTool(BaseModel):
+    type: Literal["function"] = "function"
+    function: FunctionDefinition
+
+
+class FunctionCall(BaseModel):
+    name: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    arguments: str
+
+
+class ToolCall(BaseModel):
+    id: str = Field(min_length=1)
+    type: Literal["function"] = "function"
+    function: FunctionCall
+
+
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: str | None = None
     reasoning: str | None = None
+    tool_calls: list[ToolCall] | None = None
+    tool_call_id: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        for key in ("tool_calls", "tool_call_id"):
+            if not data.get(key):
+                data.pop(key, None)
+        return data
+
+
+class DeltaFunctionCall(BaseModel):
+    name: str | None = None
+    arguments: str | None = None
+
+
+class DeltaToolCall(BaseModel):
+    index: int
+    id: str | None = None
+    type: Literal["function"] | None = None
+    function: DeltaFunctionCall
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = {key: value for key, value in handler(self).items() if value is not None}
+        data["function"] = {key: value for key, value in data["function"].items() if value is not None}
+        return data
+
+
+class ChatDelta(ChatMessage):
+    tool_calls: list[DeltaToolCall] | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -78,6 +134,9 @@ class ChatCompletionRequest(BaseModel):
     reasoning_effort: ReasoningEffort | None = None
     chat_template_kwargs: dict | None = None
     include_reasoning: bool = True
+    tools: list[ChatTool] | None = None
+    tool_choice: str | dict | None = None
+    parallel_tool_calls: bool = True
 
 
 class CompletionChoice(BaseModel):
@@ -104,7 +163,7 @@ class CompletionResponse(BaseModel):
 class ChatCompletionChoice(BaseModel):
     index: int = 0
     message: ChatMessage | None = None
-    delta: ChatMessage | None = None
+    delta: ChatDelta | None = None
     finish_reason: str | None = None
 
 
@@ -282,10 +341,12 @@ class ServingServer:
 
     async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        output_parser_spec = self._output_parser_spec(request)
         prompt = self._apply_chat_template(
             request.messages,
             request.chat_template_kwargs,
             reasoning_effort=request.reasoning_effort,
+            tools=request.tools,
         )
         # The OpenAI chat schema has no ignore_eos field, so the server-wide
         # config decides it (the completions endpoint keeps its historic
@@ -294,7 +355,6 @@ class ServingServer:
             self._resolve_generate_config(request),
             ignore_eos=self.generate_config.ignore_eos,
         )
-        output_parser_spec = self._output_parser_spec(request)
 
         with profile_span(
             "http.chat_completions",
@@ -309,12 +369,14 @@ class ServingServer:
                         config,
                         request.model or self.model_id,
                         output_parser_spec=output_parser_spec,
+                        parallel_tool_calls=request.parallel_tool_calls,
                     ),
                     media_type="text/event-stream",
                 )
 
             full_text = ""
             full_reasoning = ""
+            tool_calls = ()
             finish_reason = ""
             usage = None
             async for output in self.engine.add_request(
@@ -328,7 +390,8 @@ class ServingServer:
                 if output.reasoning:
                     full_reasoning = output.reasoning
                 if output.finished:
-                    finish_reason = self._map_finish_reason(output.finish_reason)
+                    finish_reason = self._chat_finish_reason(output)
+                    tool_calls = output.tool_calls if request.parallel_tool_calls else output.tool_calls[:1]
                     usage = ResponseUsage(
                         prompt_tokens=output.prompt_tokens,
                         completion_tokens=output.completion_tokens,
@@ -343,8 +406,12 @@ class ServingServer:
                 choices=[ChatCompletionChoice(
                     message=ChatMessage(
                         role="assistant",
-                        content=full_text,
+                        content=full_text or (None if tool_calls else ""),
                         reasoning=full_reasoning or None,
+                        tool_calls=[
+                            ToolCall(id=call.id, function=FunctionCall(name=call.name, arguments=call.arguments))
+                            for call in tool_calls
+                        ] or None,
                     ),
                     finish_reason=finish_reason,
                 )],
@@ -402,70 +469,112 @@ class ServingServer:
         model: str,
         *,
         output_parser_spec: OutputParserSpec | None = None,
+        parallel_tool_calls: bool = True,
+    ):
+        # Once SSE headers have been sent, request-local parser failures must be
+        # reported in the stream. Cancellation still propagates to engine cleanup.
+        chunks = self._stream_chat_chunks(
+            request_id, prompt, config, model, output_parser_spec=output_parser_spec,
+            parallel_tool_calls=parallel_tool_calls,
+        )
+        try:
+            async with contextlib.aclosing(chunks):
+                async for chunk in chunks:
+                    yield chunk
+        except ValueError as exc:
+            error = {"error": {"message": str(exc), "type": "invalid_model_output", "code": 400}}
+            yield f"data: {json.dumps(error)}\n\n"
+            yield "data: [DONE]\n\n"
+
+    async def _stream_chat_chunks(
+        self,
+        request_id: str,
+        prompt: str,
+        config: GenerateConfig,
+        model: str,
+        *,
+        output_parser_spec: OutputParserSpec | None,
+        parallel_tool_calls: bool,
     ):
         with profile_span("http.stream_chat_completion", cat="request", args={"request_id": request_id}):
             prev_text = ""
             prev_reasoning = ""
-            async for output in self.engine.add_request(
+            outputs = self.engine.add_request(
                 request_id,
                 prompt,
                 config,
                 output_parser_spec=output_parser_spec,
-            ):
-                if output_parser_spec is not None:
-                    delta = output.text_delta
-                    reasoning_delta = output.reasoning_delta
-                else:
-                    delta = output.text[len(prev_text):] if output.text else ""
-                    prev_text = output.text or prev_text
-                    reasoning_delta = (
-                        output.reasoning[len(prev_reasoning):]
-                        if output.reasoning
-                        else ""
-                    )
-                    prev_reasoning = output.reasoning or prev_reasoning
-                finish_reason = self._map_finish_reason(output.finish_reason) if output.finished else None
+            )
+            async with contextlib.aclosing(outputs):
+                async for output in outputs:
+                    if output_parser_spec is not None:
+                        delta = output.text_delta
+                        reasoning_delta = output.reasoning_delta
+                    else:
+                        delta = output.text[len(prev_text):] if output.text else ""
+                        prev_text = output.text or prev_text
+                        reasoning_delta = output.reasoning[len(prev_reasoning):] if output.reasoning else ""
+                        prev_reasoning = output.reasoning or prev_reasoning
+                    finish_reason = self._chat_finish_reason(output) if output.finished else None
+                    tool_deltas = [
+                        self._tool_delta(item) for item in output.tool_call_deltas
+                        if parallel_tool_calls or item.index == 0
+                    ]
 
-                chunk = ChatCompletionResponse(
-                    id=request_id,
-                    object="chat.completion.chunk",
-                    created=int(time.time()),
-                    model=model,
-                    choices=[ChatCompletionChoice(
-                        delta=ChatMessage(
-                            role="assistant",
-                            content=delta,
-                            reasoning=reasoning_delta or None,
-                        ),
-                        finish_reason=finish_reason,
-                    )],
-                )
-                yield f"data: {json.dumps(chunk.model_dump())}\n\n"
-
-                if output.finished:
-                    # Terminal usage chunk (OpenAI stream_options.include_usage
-                    # shape): empty choices, authoritative counts from the engine.
-                    usage_chunk = ChatCompletionResponse(
+                    chunk = ChatCompletionResponse(
                         id=request_id,
                         object="chat.completion.chunk",
                         created=int(time.time()),
                         model=model,
-                        choices=[],
-                        usage=ResponseUsage(
-                            prompt_tokens=output.prompt_tokens,
-                            completion_tokens=output.completion_tokens,
-                            total_tokens=output.prompt_tokens + output.completion_tokens,
-                        ),
+                        choices=[ChatCompletionChoice(
+                            delta=ChatDelta(
+                                role="assistant",
+                                content=delta or (None if tool_deltas else ""),
+                                reasoning=reasoning_delta or None,
+                                tool_calls=tool_deltas or None,
+                            ),
+                            finish_reason=finish_reason,
+                        )],
                     )
-                    yield f"data: {json.dumps(usage_chunk.model_dump())}\n\n"
+                    yield f"data: {json.dumps(chunk.model_dump())}\n\n"
 
-                    profile_instant(
-                        "http.stream_chat.finished",
-                        cat="request",
-                        args={"request_id": request_id, "finish_reason": finish_reason},
-                    )
-                    yield "data: [DONE]\n\n"
-                    break
+                    if output.finished:
+                        usage_chunk = ChatCompletionResponse(
+                            id=request_id,
+                            object="chat.completion.chunk",
+                            created=int(time.time()),
+                            model=model,
+                            choices=[],
+                            usage=ResponseUsage(
+                                prompt_tokens=output.prompt_tokens,
+                                completion_tokens=output.completion_tokens,
+                                total_tokens=output.prompt_tokens + output.completion_tokens,
+                            ),
+                        )
+                        yield f"data: {json.dumps(usage_chunk.model_dump())}\n\n"
+                        profile_instant(
+                            "http.stream_chat.finished",
+                            cat="request",
+                            args={"request_id": request_id, "finish_reason": finish_reason},
+                        )
+                        yield "data: [DONE]\n\n"
+                        break
+
+    @staticmethod
+    def _tool_delta(delta: ToolCallDelta) -> DeltaToolCall:
+        return DeltaToolCall(
+            index=delta.index, id=delta.id, type="function" if delta.id else None,
+            function=DeltaFunctionCall(name=delta.name, arguments=delta.arguments or None),
+        )
+
+    @classmethod
+    def _chat_finish_reason(cls, output: TokenOutput) -> str:
+        if (
+            output.finish_reason in ("FINISHED_EOS", "FINISHED_STOP")
+            and output.tool_calls and all(call.complete for call in output.tool_calls)
+        ):
+            return "tool_calls"
+        return cls._map_finish_reason(output.finish_reason)
 
     def _apply_chat_template(
         self,
@@ -473,6 +582,7 @@ class ServingServer:
         chat_template_kwargs: dict | None = None,
         *,
         reasoning_effort: str | None = None,
+        tools: list[ChatTool] | None = None,
     ) -> str:
         """Apply the model's official chat template, forwarding chat_template_kwargs.
 
@@ -480,10 +590,20 @@ class ServingServer:
         passed straight through to ``apply_chat_template``, mirroring vLLM so clients
         control thinking mode per request.
         """
-        hf_messages = [{"role": m.role, "content": m.content} for m in messages]
+        hf_messages = [m.model_dump(exclude_none=True) for m in messages]
+        for original, message in zip(messages, hf_messages):
+            message["content"] = original.content
         kwargs: dict = {"tokenize": False, "add_generation_prompt": True}
-        if chat_template_kwargs:
-            kwargs.update(chat_template_kwargs)
+        kwargs.update(self._chat_kwargs(chat_template_kwargs, reasoning_effort))
+        if tools:
+            kwargs["tools"] = [tool.model_dump(exclude_none=True) for tool in tools]
+        kwargs["tokenize"] = False
+        kwargs["add_generation_prompt"] = True
+        return self.engine.tokenizer.apply_chat_template(hf_messages, **kwargs)
+
+    @staticmethod
+    def _chat_kwargs(chat_template_kwargs: dict | None, reasoning_effort: str | None) -> dict:
+        kwargs = dict(chat_template_kwargs or {})
         if reasoning_effort is not None:
             if reasoning_effort == "none":
                 kwargs["enable_thinking"] = False
@@ -491,26 +611,54 @@ class ServingServer:
             else:
                 kwargs.setdefault("enable_thinking", True)
             kwargs["reasoning_effort"] = reasoning_effort
-        kwargs["tokenize"] = False
-        kwargs["add_generation_prompt"] = True
-        return self.engine.tokenizer.apply_chat_template(hf_messages, **kwargs)
+        return kwargs
+
+    @staticmethod
+    def _validate_chat_request(request: ChatCompletionRequest) -> str:
+        if "tools" in (request.chat_template_kwargs or {}):
+            raise ValueError("tools must be supplied as a top-level request field")
+        choice = request.tool_choice
+        if choice is None:
+            choice = "auto" if request.tools else "none"
+        if choice not in ("none", "auto"):
+            raise ValueError("only tool_choice 'auto' and 'none' are supported; constrained tool choice is unavailable")
+        if choice == "auto" and not request.tools:
+            raise ValueError("tool_choice 'auto' requires non-empty tools")
+        names = []
+        for tool in request.tools or ():
+            if tool.function.strict:
+                raise ValueError("strict tool schemas require constrained decoding, which is not supported")
+            names.append(tool.function.name)
+        if len(set(names)) != len(names):
+            raise ValueError("tool function names must be unique")
+        for message in request.messages:
+            calls = message.tool_calls or ()
+            if calls and message.role != "assistant":
+                raise ValueError("only assistant messages can contain tool_calls")
+            if message.content is None and not (message.role == "assistant" and calls):
+                raise ValueError("message content must be text, or null for an assistant tool call")
+            if message.role == "tool" and not message.tool_call_id:
+                raise ValueError("tool messages require tool_call_id")
+            if len({call.id for call in calls}) != len(calls):
+                raise ValueError("assistant tool call IDs must be unique")
+            for call in calls:
+                if not isinstance(json.loads(call.function.arguments), dict):
+                    raise ValueError("tool call arguments must encode an object")
+        return choice
 
     def _output_parser_spec(
         self,
         request: ChatCompletionRequest,
     ) -> OutputParserSpec | None:
         """Freeze model-output semantics before generation starts."""
+        tool_choice = self._validate_chat_request(request)
         parser_id = getattr(self.engine.tokenizer, "output_parser_id", None)
+        has_tool_history = any(m.tool_calls or m.role == "tool" for m in request.messages)
+        if (request.tools or has_tool_history) and not supports_tool_calls(parser_id):
+            raise ValueError("the model has no tool-call parser")
         if not parser_id:
             return None
-        kwargs = dict(request.chat_template_kwargs or {})
-        if request.reasoning_effort is not None:
-            kwargs["reasoning_effort"] = request.reasoning_effort
-            if request.reasoning_effort == "none":
-                kwargs["enable_thinking"] = False
-                kwargs["thinking"] = False
-            else:
-                kwargs.setdefault("enable_thinking", True)
+        kwargs = self._chat_kwargs(request.chat_template_kwargs, request.reasoning_effort)
         thinking = bool(
             kwargs.get("thinking", False) or kwargs.get("enable_thinking", False)
         ) and kwargs.get("reasoning_effort") != "none"
@@ -518,15 +666,18 @@ class ServingServer:
             parser_id=str(parser_id),
             initial_state="reasoning" if thinking else "content",
             include_reasoning=request.include_reasoning,
+            tool_choice=tool_choice,
+            tool_names=tuple(tool.function.name for tool in request.tools or ()),
         )
 
     @staticmethod
     def _map_finish_reason(reason: str) -> str:
         mapping = {
-            "FINISHED_EOS": "eos",
+            "FINISHED_EOS": "stop",
             "FINISHED_LENGTH": "length",
             "FINISHED_STOP": "stop",
             "FINISHED_ABORTED": "aborted",
+            "error": "error",
         }
         return mapping.get(reason, "stop")
 

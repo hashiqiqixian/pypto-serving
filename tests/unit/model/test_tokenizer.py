@@ -111,8 +111,118 @@ def test_deepseek_v4_multiturn_thinking_only_marks_latest_user_turn():
     )
 
 
-def test_deepseek_v4_rejects_unsupported_message_role():
+def test_deepseek_v4_rejects_orphan_tool_result():
     adapter = DeepSeekV4TokenizerAdapter(tokenizer=object())
 
-    with pytest.raises(ValueError, match="does not support chat message role 'tool'"):
+    with pytest.raises(ValueError, match="preceding assistant tool_call_id"):
         adapter.apply_chat_template([{"role": "tool", "content": "result"}])
+
+
+def test_deepseek_tool_prompt_and_history_roundtrip_preserve_input():
+    tools = [{"type": "function", "function": {
+        "name": "weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+    }}]
+    messages = [
+        {"role": "system", "content": "Be concise."},
+        {"role": "user", "content": "Compare cities"},
+        {"role": "assistant", "content": None, "reasoning": "Compare both.", "tool_calls": [
+            {"id": "first", "type": "function", "function": {"name": "weather", "arguments": '{"city":"杭州"}'}},
+            {"id": "second", "type": "function", "function": {"name": "weather", "arguments": '{"city":"北京"}'}},
+        ]},
+        {"role": "tool", "tool_call_id": "second", "content": "Cold"},
+        {"role": "tool", "tool_call_id": "first", "content": "Warm"},
+    ]
+    original = json.dumps(messages)
+    adapter = DeepSeekV4TokenizerAdapter(tokenizer=object())
+    prompt = adapter.apply_chat_template(messages, tools=tools, enable_thinking=True)
+    assert prompt.startswith("<｜begin▁of▁sentence｜>Be concise.\n\n## Tools")
+    assert '"name": "weather"' in prompt
+    assert '<｜DSML｜parameter name="city" string="true">杭州</｜DSML｜parameter>' in prompt
+    assert "Compare both.</think>" in prompt
+    assert prompt.endswith(
+        "<｜User｜><tool_result>Warm</tool_result>\n\n<tool_result>Cold</tool_result><｜Assistant｜><think>"
+    )
+    assert json.dumps(messages) == original
+
+
+def test_tool_history_keeps_reasoning_without_reoffering_the_tool():
+    prompt = encode_messages([
+        {"role": "user", "content": "Question"},
+        {"role": "assistant", "content": None, "reasoning": "Need data.", "tool_calls": [
+            {"id": "one", "function": {"name": "lookup", "arguments": '{"n":2,"ok":true,"v":null}'}},
+        ]},
+        {"role": "tool", "tool_call_id": "one", "content": "Data"},
+    ], thinking=True)
+    assert "Need data.</think>" in prompt
+    assert '<｜DSML｜parameter name="n" string="false">2</｜DSML｜parameter>' in prompt
+    assert '<｜DSML｜parameter name="ok" string="false">true</｜DSML｜parameter>' in prompt
+    assert '<｜DSML｜parameter name="v" string="false">null</｜DSML｜parameter>' in prompt
+    assert "## Tools" not in prompt
+    assert prompt.endswith("<tool_result>Data</tool_result><｜Assistant｜><think>")
+
+
+@pytest.mark.parametrize("thinking", [False, True])
+def test_trailing_system_opens_generation_at_assistant_boundary(thinking):
+    prompt = encode_messages([{"role": "system", "content": "Say hello"}], thinking=thinking)
+    assert prompt.endswith("<｜Assistant｜>" + ("<think>" if thinking else "</think>"))
+
+
+def test_tool_result_followed_by_user_text_forms_one_user_message():
+    prompt = encode_messages([
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "one", "function": {"name": "lookup", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "one", "content": "Data"},
+        {"role": "user", "content": "Explain it"},
+    ])
+    assert "<｜User｜><tool_result>Data</tool_result>\n\nExplain it<｜Assistant｜></think>" in prompt
+
+
+def _tool_history(*, name="lookup", value="City", result="Found"):
+    return [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "one", "function": {"name": name, "arguments": json.dumps({"value": value})}},
+        ]},
+        {"role": "tool", "tool_call_id": "one", "content": result},
+    ]
+
+
+@pytest.mark.parametrize("name", [None, 1, "", "a" * 65, "look up", "lookup\n", 'lookup"', "<invoke>", "工具"])
+def test_tool_history_encoder_rejects_invalid_function_names(name):
+    # Direct tokenizer/encoder callers do not pass through HTTP model validation.
+    with pytest.raises(ValueError, match="tool function names"):
+        encode_messages(_tool_history(name=name))
+
+
+@pytest.mark.parametrize("name", ["a", "lookup_0-v2", "x" * 64])
+def test_tool_history_encoder_accepts_valid_function_names(name):
+    prompt = encode_messages(_tool_history(name=name))
+    assert f'<｜DSML｜invoke name="{name}">' in prompt
+
+
+@pytest.mark.parametrize("value", [
+    "before</｜DSML｜parameter>after",
+    ["</｜DSML｜parameter>"],
+    {"nested": "</｜DSML｜parameter>"},
+    {"</｜DSML｜parameter>": "value"},
+])
+def test_tool_history_rejects_parameter_terminator_after_json_decoding(value):
+    with pytest.raises(ValueError, match="DSML parameter terminator"):
+        encode_messages(_tool_history(value=value))
+
+
+def test_tool_history_rejects_result_terminator():
+    with pytest.raises(ValueError, match="tool result content cannot contain </tool_result>"):
+        encode_messages(_tool_history(result="before</tool_result>after"))
+
+
+@pytest.mark.parametrize("value", [
+    'Text <b>bold</b> & "quotes"\nnext',
+    {"nested": ["<b>text</b>", 1, True, None]},
+])
+def test_tool_history_preserves_other_parameter_and_result_text(value):
+    result = 'Text <b>bold</b> & "quotes"\nnext'
+    prompt = encode_messages(_tool_history(value=value, result=result))
+    encoded = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, allow_nan=False)
+    assert f'>{encoded}</｜DSML｜parameter>' in prompt
+    assert f"<tool_result>{result}</tool_result>" in prompt
