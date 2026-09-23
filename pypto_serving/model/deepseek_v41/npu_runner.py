@@ -7,9 +7,10 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """V4-style runner lifecycle for explicit V4.1 composite bindings."""
-from .composite import CompositeBindings, MissingCompositeInterface, LayerState
+from .composite import CompositeBindings, LayerState
 from .input_preparation import lookup_token_embeddings
 import torch
+from pypto_serving.config.types import PrefillResult, DecodeResult
 from .execution_plan import V41ExecutionPlan
 from .metadata import prefill_requests, decode_requests
 from .request_state import RequestLedger
@@ -148,7 +149,21 @@ class V41ModelRunner:
         return self._finish_step(state, step)
 
     def _finish_step(self, state, step):
-        raise MissingCompositeInterface("final HC/Norm/LM-head result binding is not connected yet")
+        logits = self.bindings.output(state, step, self.resources)
+        self.bindings.wait(self.resources)
+        shape = (len(step.requests), self.plan.weights.config.vocab_size)
+        if (not isinstance(logits, torch.Tensor) or logits.device.type != "cpu"
+                or tuple(logits.shape) != shape or logits.dtype not in (
+                    torch.float32, torch.bfloat16, torch.float16)):
+            raise ValueError("output composite must return CPU logits [requests, vocabulary] in request order")
+        if not bool(torch.isfinite(logits).all()):
+            raise ValueError("output composite returned non-finite logits")
+        # Shared workers may sample after the next dispatch reuses device output
+        # scratch. Keep returned host logits independent of adapter-owned buffers.
+        owned_logits = logits.detach().clone()
+        if step.phase == "prefill":
+            return PrefillResult(last_hidden=None, logits=owned_logits)
+        return DecodeResult(hidden_states=None, logits=owned_logits)
 
     def run_decode(self, model, batch):
         with self._lock:
