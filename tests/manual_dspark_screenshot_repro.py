@@ -7,12 +7,13 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Reproduce the screenshot's revisions and 16-card DSpark 64/256 shape.
+"""Measure pinned-revision warmed 16-card DSpark Palace 64/256 generation.
 
-Run this helper separately from the pristine production --serving-root. The
-repository Palace prompt is used; the screenshot's original prompt and full
-launch configuration were unavailable, so this is not an exact workload claim.
-One non-streaming warmup precedes one streaming measurement, without profiling.
+Run separately from the pristine production --serving-root, with four explicit
+expected source SHAs. One non-streaming warmup precedes one streaming request.
+Engine metric differences isolate formal-request acceptance from warmup; runner
+logs are diagnostic only. CLI profiling is disabled; record build instrumentation
+separately. Keep model, toolchain, and request settings fixed for A/B comparisons.
 """
 
 from __future__ import annotations
@@ -32,12 +33,7 @@ import urllib.request
 from pathlib import Path
 
 
-REVISIONS = {
-    "serving": "2a03e11afb8357b256c666e8b1b82487d2a0d5e7",
-    "lib": "7b2c3f94020b963c1afdf3033917676adb074378",
-    "pypto": "e8191e3cc9fb3c93b2e66e8329d4ce85b522cfae",
-    "runtime": "22385d2b0c08b8f697fe8feede488c87cf83ef84",
-}
+SOURCE_NAMES = ("serving", "lib", "pypto", "runtime")
 ENV_KEYS = (
     "PATH", "PYTHONPATH", "PYPTO_LIB_ROOT", "PTOAS_ROOT", "PTO_ISA_ROOT",
     "PYPTO_DSPARK_EP_SIZE", "PYPTO_DSPARK_RING_HEAP", "PYPTO_DSPARK_DRAFTER_RING_HEAP",
@@ -46,7 +42,7 @@ ENV_KEYS = (
     "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "TASK_DEVICE",
     "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "TOKENIZERS_PARALLELISM", "PYPTO_RUNTIME_LOG",
     "SIMPLER_DFX", "SIMPLER_ORCH_PROFILING", "SIMPLER_SCHED_PROFILING", "SIMPLER_TENSORMAP_PROFILING",
-    "ASCEND_HOME_PATH", "ASCEND_RT_VISIBLE_DEVICES",
+    "ASCEND_HOME_PATH", "ASCEND_RT_VISIBLE_DEVICES", "CPATH", "LD_LIBRARY_PATH",
 )
 FINISHED = re.compile(
     r"DSpark speculation finished: request=(\S+) verifies=(\d+) "
@@ -80,6 +76,99 @@ def _validate_response(response: dict) -> None:
     if (not response.get("id") or len(choices) != 1
             or choices[0].get("finish_reason") != "length" or not choices[0].get("text")):
         raise RuntimeError(f"invalid completion contract: {response}")
+
+
+def _metrics_snapshot(port: int, deadline: float) -> dict:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("deadline reached before engine metrics capture")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(f"http://127.0.0.1:{port}/metrics/json", timeout=min(30, remaining)) as reply:
+        return json.loads(reply.read())
+
+
+def _engine_acceptance(before: dict, after: dict, model_name: str) -> dict:
+    """Isolate one completed formal request; never subtract cumulative rates."""
+    identity = ("schema_version", "server_id", "started_at", "model_name")
+    if (not isinstance(before, dict) or not isinstance(after, dict)
+            or any(key not in before or key not in after or before[key] != after[key] for key in identity)
+            or type(before["schema_version"]) is not int or before["schema_version"] != 1
+            or not isinstance(before["server_id"], str) or not before["server_id"]
+            or type(before["started_at"]) not in (int, float) or not before["started_at"] > 0
+            or before["model_name"] != model_name):
+        raise ValueError("metrics snapshots must belong to the same schema, server and model")
+    keys = (
+        "speculative_drafts", "draft_tokens", "accepted_tokens", "speculative_fallbacks",
+        "requests_finished", "requests_error", "requests_aborted", "prompt_tokens", "generation_tokens",
+    )
+
+    def indexed(snapshot):
+        replicas = snapshot.get("replicas")
+        if not isinstance(replicas, list) or not replicas:
+            raise ValueError("metrics must include a nonempty replica list")
+        result = {}
+        for replica in replicas:
+            if not isinstance(replica, dict):
+                raise ValueError("metrics replica must be an object")
+            index = replica.get("engine")
+            if type(index) is not int or index < 0 or index in result:
+                raise ValueError("invalid or duplicate engine index")
+            if any(replica.get("gauges", {}).get(key) != 0 for key in ("running", "waiting")):
+                raise ValueError("metrics window boundary contains a live or waiting request")
+            counters = replica.get("counters", {})
+            positions = replica.get("accepted_tokens_per_pos", [])
+            values = [counters.get(key) for key in keys]
+            if (not isinstance(positions, list) or len(positions) != 7
+                    or any(type(value) is not int or value < 0 for value in [*values, *positions])):
+                raise ValueError("metrics require nonnegative integer counters and seven draft positions")
+            if sum(positions) != counters["accepted_tokens"]:
+                raise ValueError("cumulative per-position counts disagree with accepted drafts")
+            result[index] = replica
+        return result
+
+    old, new = indexed(before), indexed(after)
+    if old.keys() != new.keys():
+        raise ValueError("metrics replica set changed during the formal request")
+    totals = dict.fromkeys(keys, 0)
+    positions = [0] * 7
+    for index, previous in old.items():
+        current = new[index]
+        for key in keys:
+            delta = current["counters"][key] - previous["counters"][key]
+            if delta < 0:
+                raise ValueError(f"engine {index} counter {key} decreased")
+            totals[key] += delta
+        for pos, (old_count, new_count) in enumerate(zip(
+            previous["accepted_tokens_per_pos"], current["accepted_tokens_per_pos"], strict=True,
+        )):
+            if new_count < old_count:
+                raise ValueError(f"engine {index} accepted position {pos} decreased")
+            positions[pos] += new_count - old_count
+    expected = {
+        "requests_finished": 1, "requests_error": 0, "requests_aborted": 0,
+        "prompt_tokens": 64, "generation_tokens": 256, "speculative_fallbacks": 0,
+    }
+    if any(sum(replica["counters"][key] for replica in old.values()) != value
+           for key, value in expected.items()):
+        raise ValueError("before snapshot must contain only the one successful 64/256 warmup")
+    if any(totals[key] != value for key, value in expected.items()):
+        raise ValueError(f"formal window must contain one successful 64/256 request without fallback: {totals}")
+    rounds, drafted, accepted = (totals[key] for key in (
+        "speculative_drafts", "draft_tokens", "accepted_tokens",
+    ))
+    if (rounds <= 0 or drafted != 7 * rounds or not 0 <= accepted <= drafted
+            or sum(positions) != accepted or positions[0] > rounds
+            or any(left < right for left, right in zip(positions, positions[1:]))):
+        raise ValueError(f"inconsistent K=7 verification counters: {totals}, positions={positions}")
+    return {
+        **totals, "draft_acceptance_rate": accepted / drafted,
+        "mean_acceptance_length": 1 + accepted / rounds, "accepted_tokens_per_pos": positions,
+        "counting": (
+            "Formal-after minus warmup-after engine counters, one isolated request. Actual verified "
+            "drafts before EOS/length truncation, including the final round; accepted excludes bonus; "
+            "mean acceptance length includes one bonus per verifying round. Not cumulative runner logs."
+        ),
+    }
 
 
 def _read_stream(port: int, payload: dict, deadline: float, output: Path) -> dict:
@@ -224,6 +313,8 @@ def main() -> None:
     parser.add_argument("--serving-root", type=Path, required=True)
     parser.add_argument("--pypto-root", type=Path, required=True)
     parser.add_argument("--runtime-root", type=Path, required=True)
+    for name in SOURCE_NAMES:
+        parser.add_argument(f"--expected-{name}-sha", required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--startup-timeout", type=int, default=1800)
@@ -238,12 +329,15 @@ def main() -> None:
     if os.environ.get("PYPTO_DSPARK_EP_SIZE", "16") != "16":
         parser.error("PYPTO_DSPARK_EP_SIZE must be 16")
     if not os.environ.get("PYPTO_LIB_ROOT"):
-        parser.error("PYPTO_LIB_ROOT must select the screenshot lib checkout")
+        parser.error("PYPTO_LIB_ROOT must select the lib checkout being measured")
     roots = {
         "serving": args.serving_root.resolve(), "lib": Path(os.environ["PYPTO_LIB_ROOT"]).resolve(),
         "pypto": args.pypto_root.resolve(), "runtime": args.runtime_root.resolve(),
     }
-    versions = {name: _revision(root, REVISIONS[name]) for name, root in roots.items()}
+    expected = {name: getattr(args, f"expected_{name}_sha") for name in SOURCE_NAMES}
+    if any(re.fullmatch(r"[0-9a-f]{40}", sha) is None for sha in expected.values()):
+        parser.error("expected source SHAs must be full 40-character lowercase commit hashes")
+    versions = {name: _revision(root, expected[name]) for name, root in roots.items()}
     args.model = args.model.resolve()
     if not args.model.is_dir():
         parser.error(f"model directory does not exist: {args.model}")
@@ -280,9 +374,9 @@ def main() -> None:
         "warmup_requests": 1, "formal_requests": 1, "endpoint": "/v1/completions",
         "prompt_sha256": hashlib.sha256(payload["prompt"].encode("utf-8")).hexdigest(),
         "limitations": (
-            "Reproduces screenshot revisions/topology/lengths; original screenshot artifact, prompt, "
-            "launch options and metric formula unavailable. Uses repository Palace64 prompt and "
-            "default server settings. No HC-mean fix or production source edits."
+            "One repository Palace64 prompt and one warmed formal request, not a broad workload "
+            "or latency distribution. CLI profiling is disabled; environment metadata does not "
+            "independently prove build instrumentation or installed binary provenance."
         ),
         "timeouts": {name: getattr(args, name) for name in (
             "startup_timeout", "request_timeout", "overall_timeout", "reclaim_timeout",
@@ -313,18 +407,24 @@ def main() -> None:
             _save(args.output_dir / "run.json", metadata)
             warmup = shared._request_json(
                 process, port, min(deadline, time.monotonic() + args.request_timeout),
-                endpoint="/v1/completions", request_kind="screenshot warmup", payload=payload,
+                endpoint="/v1/completions", request_kind="benchmark warmup", payload=payload,
             )
             _save(args.output_dir / "warmup-response.json", warmup)
             _validate_response(warmup)
             _save(args.output_dir / "warmup-counters.json", _finished_counters(
                 log_path, warmup["id"], min(deadline, time.monotonic() + 30),
             ))
+            before = _metrics_snapshot(port, deadline)
+            _save(args.output_dir / "metrics-before-formal.json", before)
             performance = _measure_stream(
                 process, port, formal, min(deadline, time.monotonic() + args.request_timeout), args.output_dir,
             )
             _save(args.output_dir / "performance.json", performance)
-            performance["speculation"] = _finished_counters(
+            after = _metrics_snapshot(port, deadline)
+            _save(args.output_dir / "metrics-after-formal.json", after)
+            performance["engine_acceptance"] = _engine_acceptance(before, after, dspark.MODEL_ID)
+            _save(args.output_dir / "performance.json", performance)
+            performance["legacy_runner_diagnostic"] = _finished_counters(
                 log_path, performance["request_id"], min(deadline, time.monotonic() + 30),
             )
             formal_response = json.loads((args.output_dir / "formal-response.json").read_text(encoding="utf-8"))
