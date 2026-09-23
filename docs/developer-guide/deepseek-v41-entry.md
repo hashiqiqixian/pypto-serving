@@ -1,10 +1,11 @@
 # DeepSeek V4.1 text entry
 
-V4.1 integration currently provides model identification, metadata validation,
-local text tokenization and selective CPU weight loading. Configuration and
-tokenization do not read checkpoint tensors. None of these APIs allocate NPU
-resources or enable generation. Both the model loader and serving CLI reject
-V4.1 execution until its executor is integrated, instead of treating it as Qwen.
+V4.1 integration provides metadata loading, local text tokenization, selective
+CPU weight loading and a serving framework for explicit lib composite bindings.
+The model loader registers metadata without opening checkpoint payloads. The
+CLI routes V4.1 to its own executor, but rejects execution before allocating
+devices until `load_composite_bindings()` supplies a verified adapter. The
+default adapter is an explicit placeholder; this is not an executable M0 model.
 
 ```python
 from pypto_serving.model.deepseek_v41.config import load_text_config
@@ -36,14 +37,13 @@ and decoding but is not a full-checkpoint tokenizer validation.
 
 1. Model identification, text config and tokenizer (implemented).
 2. Selective checkpoint loading, weight formats and shard contracts (implemented on CPU).
-3. Executor/Runner preparation and composite contract verification (metadata planning implemented;
-   device registration blocked on composite integration).
-4. Embedding and initial residual/pre-mix state at the selected composite boundary.
-5. SWA, C2A and C1A prefill composite entries and cache state.
-6. Decode composite entries and prefill-to-decode transitions.
-7. Cross-layer state and TP/EP composition, then the full backbone.
-8. Final HC/norm, LM head and greedy decode loop.
-9. Scheduler/HTTP lifecycle, recovery, memory observations and M0 acceptance.
+3. Executor/Runner lifecycle and explicit composite contract (framework implemented).
+4. Bounded CPU embedding rows from TP shards (implemented); device residual/pre-mix initialization is an adapter callback.
+5. Chunked prefill and request/cache ownership (framework implemented); numerical composites remain adapter callbacks.
+6. Decode continuity and prefill-to-decode transitions (framework implemented).
+7. Rank-owned weights and all backbone layers (dispatch implemented); device TP/EP execution remains in the adapter.
+8. Final HC/norm/head boundary and shared greedy sampling (framework implemented); numerical head remains an adapter callback.
+9. Model loader, CLI, scheduler metadata and request release (framework implemented); HTTP/device M0 acceptance remains pending.
 
 Engram, vision and speculative decoding are deferred. Optional metadata for
 these modules may be present in config.json; this stage does not initialize or
@@ -53,7 +53,7 @@ Engram-disabled scope, not claim equality with the complete official model.
 Development starts from upstream main. Existing experimental V4.1 code can be
 reused selectively with tests; its backend and runtime are not prerequisites.
 Kernel stages should track current pypto-lib interfaces and record the revision
-used for validation. This metadata/tokenizer stage does not change the lib pin.
+used for validation. This integration does not change the lib pin.
 
 ## Selective weight loading
 
@@ -112,9 +112,9 @@ checks are not real-checkpoint numerical inference or NPU acceptance.
 
 ## Executor/Runner preparation
 
-Stage numbers follow serving issue #240. `V41ExecutionPlan` implements the
-CPU preparation portion of stage 3; it is not a registered executor, device
-runner or substitute inference backend.
+Stage numbers follow serving issue #240. `V41ExecutionPlan` describes the
+checkpoint and rank ownership without opening devices. The executor uses one
+plan per logical rank and dispatches complete layer entries through its runner.
 
 ```python
 from pypto_serving.model.deepseek_v41.execution_plan import RankPlacement, V41ExecutionPlan
@@ -139,22 +139,89 @@ selection; Reuse layers consume that selection without loading producer
 weights. C1A candidates must address the same KV producer as their consumers.
 These layer references are not scheduler page IDs or request-global state.
 
-The execution integration will follow upstream V4's `PyptoExecutor` and
-`ModelRunner` lifecycle: the executor validates lib contracts and compiles
-composites; the runner owns uploaded weights, buffers and dispatch completion;
-the scheduler owns request/page reservations. Do not inherit the generic
-dense K/V allocator for V4.1's window/compressed/index/pending-state pools.
-Request and DP identity must scope every pool. Active token counts, padding,
-physical page layouts and buffer reuse must come from the selected composite
-contract, not from the V4 constants or a tensor capacity alone.
+`DeepSeekV41PyptoExecutor` and `V41ModelRunner` follow the shared executor
+lifecycle, with one synchronous collective session for TP4/DP2/EP8 on A5.
+The runner does not inherit the generic dense K/V allocator. The scheduler
+owns page reservations; the adapter owns device pools, compilation, uploads
+and completion. Physical device IDs are independent of logical ranks.
 
-At inspected lib revision `4c3eab2`, complete-layer coverage and the routed
-weight contract are not ready for this registration. The current prefill
-layer takes FP8 routed weights, whereas this loader preserves packed FP4;
-the decode block factory raises `NotImplementedError`. Independent MoE FP4
-support does not establish full-layer compatibility. No device runner is
-registered, generic fallback enabled, or FP4 model expanded to work around
-these constraints. Stage 3 remains partially complete pending these contracts.
+## Composite adapter contract
+
+`CompositeBindings` is a serving-owned integration boundary, not a declaration
+that current lib functions already have these signatures. A concrete adapter
+must identify its tested lib revision and implement every operation below.
+All callbacks may enqueue device work; `wait(resources)` must establish
+completion across every participating rank before host code reuses storage.
+
+| Operation | Responsibility |
+| --- | --- |
+| `allocate(plan, device_ids, runtime, build_options)` | Return `(resources, num_pages)` with positive scheduler page capacity. Honor the worker's platform, build directory and compile-cache choice. Allocate the declared cache groups and compressor state, enforce memory budgets, and prepare global embedding/HC/norm/head resources as needed. Clean up partially created resources if allocation raises before returning. |
+| `initialize(embeddings, step, resources)` | Upload packed CPU BF16 `[active_tokens, hidden_size]` and initialize the production residual and delayed pre-mix state. No fixture pre-mix value is assumed. |
+| `prepare_weights(rank_plans, layer, resources)` | Bind each rank's TP projections and EP experts, retaining packed FP4. Own bounded staging or persistent residency and reuse producer weights correctly. |
+| `entries[(phase, mode)](layer, state, step, resources, weights)` | Execute the complete Attention + FFN layer for prefill/decode, preserving the declared residual/pre-mix layout and returning `LayerState`. |
+| `output(state, step, resources)` | Execute final HC/norm/head and return CPU float logits `[requests, vocabulary]` in original request order, including a row for each prefill chunk. Only terminal prompt chunks are sampled by the shared worker. |
+| `reset_request(resources, key, owner)` | Clear every cache/state location owned by this request. `owner` includes its DP partition, stable compressor block ID, committed length and page tables, including pages touched by a failed step. |
+| `wait(resources)` / `close(resources)` | Establish collective completion / release all session resources. A failed wait must never be treated as permission to reuse buffers. |
+
+The runner carries opaque `LayerState` between layers. Both replicated and
+TP-local-token residual layouts are supported when all callbacks agree; it
+does not insert an unconditional residual AllGather. Every collective must
+include the two DP partitions even when one has no active requests. The
+adapter lowers logical positions, active tokens and page IDs into the exact
+lib ABI, including padding and communication-window lifetimes.
+
+`cache_groups` must describe the same concrete layouts and capacities to the
+scheduler and allocator, with two DP partitions. Full-history page tables are
+supported by the framework. Rolling page reuse requires a verified lowering
+contract and is explicitly rejected for now. Cache payloads must not use a
+generic dense K/V substitute. The adapter must bound physical page IDs against
+actual allocated pools when a group leaves `num_blocks` unspecified.
+
+At inspected upstream lib revision `1b8caa4`, packed-FP4 MoE and token-local
+decode Attention progress do not yet provide a compatible complete-layer
+adapter. Decode `stage="block"` remains disabled; the prefill fixture still
+uses the older routed-weight/call contract. Initial residual/pre-mix, complete
+prefill/decode, cache allocation/reset and final HC/norm/head remain explicit
+integration work. These facts do not block testing the serving state machine,
+but they do block real-model generation and M0 numerical acceptance.
+
+## Request state and serving lifecycle
+
+`RequestLedger` allocates a stable logical compressor state block per request
+and DP partition. This is an ownership ID, not a physical layout: the adapter
+must translate it to the selected lib's ring-state block table. Paused or
+omitted requests keep their blocks. Batch reordering does not change ownership.
+The adapter must provision enough state blocks for the configured request
+capacity; no batch row is used as a persistent state address.
+
+Packed prefill metadata carries both the end of the current chunk (`seq_lens`)
+and the original full prompt length (`prompt_lens`). A subsequent chunk must
+start at the committed position. Decode requires completed prefill and consumes
+exactly one supplied token per request. Lengths are committed only after all
+layers and output finish. Failed execution waits, resets affected requests and
+releases their ownership; failed completion/reset poisons the session instead
+of reusing uncertain state. This does not attempt to roll back in-place device
+updates to an earlier token position.
+
+The existing worker owns sampling, EOS handling, HTTP request lifecycle and
+finished-request notifications. Returned logits own their host storage so an
+adapter cannot overwrite them while the worker samples. Prefix caching and
+asynchronous scheduling are disabled: restoring a prefix also needs matching
+compressor state, and concurrent dispatch needs separate mutable state tickets.
+
+The CLI requires A5, eight distinct device IDs, TP4/DP2/EP8 and 128-row pages.
+The shared engine sees one overlapped EP worker; internal TP/DP placement lives
+in the rank plan and the two cache partitions. A3 execution, Engram, MTP and
+vision are outside this framework's current execution contract.
+
+## Validation boundary
+
+Serving tests use small safetensors checkpoints and explicitly named recording
+adapters. They verify ownership, metadata, call order, failures and sampling
+integration without inventing numerical results for missing production kernels.
+Running these CPU tests on an A5 host is not NPU acceptance. Real M0 still needs
+the concrete adapter, original weights, matched-reference 8K + 128-token greedy
+results, repeated-request cleanup and device memory observations.
 
 ## Test command
 

@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """V4-style runner lifecycle for explicit V4.1 composite bindings."""
-from .composite import CompositeBindings, LayerState
+from .composite import BuildOptions, CompositeBindings, LayerState
 from .input_preparation import lookup_token_embeddings
 import torch
 from pypto_serving.config.types import PrefillResult, DecodeResult
@@ -23,7 +23,8 @@ class V41ModelRunner:
     This follows the shared runner lifecycle but deliberately does not inherit
     its generic K/V allocator: V4.1 pools include index and compressor state.
     """
-    def __init__(self, plan: V41ExecutionPlan, bindings: CompositeBindings, *, device_ids, runtime):
+    def __init__(self, plan: V41ExecutionPlan, bindings: CompositeBindings, *, device_ids, runtime,
+                 build_options: BuildOptions = BuildOptions()):
         self.plan, self.bindings = plan, bindings
         self.device_ids = tuple(device_ids)
         if len(self.device_ids) != plan.placement.ep_size or len(set(self.device_ids)) != len(self.device_ids):
@@ -32,6 +33,7 @@ class V41ModelRunner:
             raise ValueError("device IDs must be nonnegative integers")
         bindings.require(plan.layers, plan.placement)
         self.runtime = runtime
+        self.build_options = build_options
         self.resources = None
         self.num_pages = None
         self.closed = False
@@ -48,7 +50,8 @@ class V41ModelRunner:
         if self.resources is not None:
             return self.num_pages
         try:
-            resources, pages = self.bindings.allocate(self.plan, self.device_ids, self.runtime)
+            resources, pages = self.bindings.allocate(
+                self.plan, self.device_ids, self.runtime, self.build_options)
             self.resources = resources
             if resources is None or type(pages) is not int or pages <= 0:
                 raise ValueError("composite allocator must return resources and a positive page capacity")

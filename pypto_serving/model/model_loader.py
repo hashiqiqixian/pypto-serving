@@ -442,7 +442,11 @@ class ModelLoader:
 
     def __init__(self, format_loaders: list[ModelFormatLoader] | None = None) -> None:
         """Create a loader registry with optional custom format loaders."""
-        self._format_loaders = format_loaders or [DeepSeekV4W8A8DirectoryLoader(), HuggingFaceDirectoryLoader()]
+        from .deepseek_v41.model_loader import DeepSeekV41DirectoryLoader
+
+        self._format_loaders = format_loaders or [
+            DeepSeekV41DirectoryLoader(), DeepSeekV4W8A8DirectoryLoader(), HuggingFaceDirectoryLoader(),
+        ]
 
     def register(self, format_loader: ModelFormatLoader) -> None:
         """Register an additional model format loader."""
@@ -458,13 +462,10 @@ class ModelLoader:
     ) -> LoadedModel:
         """Load a model directory using an explicit or inferred format."""
         if is_deepseek_v41_config(read_model_config(model_dir)):
-            from .deepseek_v41.config import load_text_config
+            from .deepseek_v41.model_loader import DeepSeekV41DirectoryLoader
 
-            load_text_config(model_dir)
-            raise NotImplementedError(
-                "V4.1 serving execution is not integrated yet. Use load_text_config() and "
-                "load_tokenizer() for inspection, or V41WeightLoader for selective CPU weight loading."
-            )
+            if model_format is not None and not DeepSeekV41DirectoryLoader().supports_format(model_format):
+                raise ValueError("a V4.1 checkpoint requires model_format='deepseek_v41'")
         request = ModelLoadRequest(
             model_id=model_id,
             model_dir=model_dir,

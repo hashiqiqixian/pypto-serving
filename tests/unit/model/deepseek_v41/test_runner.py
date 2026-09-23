@@ -10,7 +10,7 @@
 from types import SimpleNamespace
 import pytest
 
-from pypto_serving.model.deepseek_v41.composite import CompositeBindings, MissingCompositeInterface
+from pypto_serving.model.deepseek_v41.composite import BuildOptions, CompositeBindings, MissingCompositeInterface
 from pypto_serving.model.deepseek_v41.execution_plan import LayerPlan, RankPlacement
 from pypto_serving.model.deepseek_v41.npu_runner import V41ModelRunner
 
@@ -47,6 +47,18 @@ def test_lifecycle_waits_before_free_and_is_idempotent():
     assert events == ["allocate", "wait", "wait", "close"]
     with pytest.raises(RuntimeError, match="closed"):
         runner.preflight()
+
+
+def test_allocator_receives_build_options():
+    options = BuildOptions(pypto_build_dir="worker-7-build", use_compile_cache=True)
+    received = []
+    runner = V41ModelRunner(
+        plan(), bindings([], allocate=lambda *args: (received.append(args[-1]) or object(), 12)),
+        device_ids=range(8), runtime=None, build_options=options,
+    )
+    runner.preflight()
+    assert received == [options]
+    runner.close()
 
 
 def test_bad_allocator_result_is_closed():

@@ -9,7 +9,7 @@
 """Executor routing for V4.1; devices are opened only after contract validation."""
 from pypto_serving.model.common.executor.executor import ModelExecutor
 
-from .composite import MissingCompositeInterface, load_composite_bindings
+from .composite import BuildOptions, MissingCompositeInterface, load_composite_bindings
 from .execution_plan import RankPlacement, V41ExecutionPlan
 from .npu_runner import V41ModelRunner
 
@@ -38,7 +38,10 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         if record.runtime.kv_cache_groups != bindings.cache_groups:
             raise ValueError("scheduler and composite cache group contracts differ")
         plan = V41ExecutionPlan(record.runtime_model.extra["model_dir"], RankPlacement(0))
-        runner = V41ModelRunner(plan, bindings, device_ids=self.device_ids, runtime=record.runtime)
+        runner = V41ModelRunner(
+            plan, bindings, device_ids=self.device_ids, runtime=record.runtime,
+            build_options=BuildOptions(self.platform, self.pypto_build_dir, self.use_compile_cache),
+        )
         try:
             pages = runner.preflight()
         except Exception:

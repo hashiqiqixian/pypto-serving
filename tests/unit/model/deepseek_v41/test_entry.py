@@ -86,17 +86,20 @@ def test_invalid_special_id(raw, value):
         V41TextConfig.from_dict(raw)
 
 
-@pytest.mark.parametrize("model_format", [None, "hf", "deepseek_v4"])
+@pytest.mark.parametrize("model_format", ["hf", "deepseek_v4"])
 def test_loading_never_falls_through_to_qwen(model_dir, model_format):
-    with pytest.raises(NotImplementedError, match="serving execution"):
+    with pytest.raises(ValueError, match="requires model_format='deepseek_v41'"):
         ModelLoader().load("v41", str(model_dir), model_format=model_format)
 
 
 def test_cli_rejects_execution_before_device_setup(model_dir):
     from pypto_serving.cli.main import build_parser, build_serving_engine_config
 
-    args = build_parser().parse_args(["--model", str(model_dir)])
-    with pytest.raises(NotImplementedError, match="serving execution"):
+    args = build_parser().parse_args([
+        "--model", str(model_dir), "--platform", "a5", "--tp", "4", "--dp", "2", "--ep", "8",
+        "--devices", "0,1,2,3,4,5,6,7",
+    ])
+    with pytest.raises(NotImplementedError, match="verified lib composite bindings"):
         build_serving_engine_config(args)
 
 

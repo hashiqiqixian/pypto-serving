@@ -23,6 +23,14 @@ class MissingCompositeInterface(NotImplementedError):
 
 
 @dataclass(frozen=True)
+class BuildOptions:
+    """Worker-selected compilation settings passed unchanged to the adapter."""
+    platform: str = "a5"
+    pypto_build_dir: str = "build_output"
+    use_compile_cache: bool = False
+
+
+@dataclass(frozen=True)
 class LayerState:
     """Opaque device state carried between composites, never converted on host."""
     residual: object
@@ -39,6 +47,9 @@ class CompositeBindings:
     (state, step, resources) and returns host logits in original request order.
     The adapter owns device uploads and lib ABI binding. Serving never expands
     packed FP4 or calls the sub-operators of a complete layer.
+    allocate consumes (plan, device_ids, runtime, BuildOptions), including the
+    worker's build directory and compile-cache choice, and returns (resources,
+    num_pages). It also prepares global weights needed by initialize/output.
 
     No default implementation fabricates results. A supplied adapter must handle
     all DP partitions collectively, including empty partitions, and retain input
