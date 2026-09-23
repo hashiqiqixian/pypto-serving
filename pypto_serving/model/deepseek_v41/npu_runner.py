@@ -9,6 +9,9 @@
 """V4-style runner lifecycle for explicit V4.1 composite bindings."""
 from .composite import CompositeBindings, MissingCompositeInterface
 from .execution_plan import V41ExecutionPlan
+from .metadata import prefill_requests
+from .request_state import RequestLedger
+from threading import RLock
 
 
 class V41ModelRunner:
@@ -30,6 +33,8 @@ class V41ModelRunner:
         self.num_pages = None
         self.closed = False
         self.failed = False
+        self.ledger = None
+        self._lock = RLock()
 
     def preflight(self):
         if self.failed:
@@ -61,12 +66,49 @@ class V41ModelRunner:
             self.resources = None
         self.closed = True
 
+    def _request_ledger(self):
+        self.preflight()
+        if self.ledger is None:
+            self.ledger = RequestLedger(max_requests=self.runtime.max_batch_size,
+                                        max_seq_len=self.runtime.max_seq_len)
+        return self.ledger
+
+    def _reset_request(self, key, owner):
+        self.bindings.reset_request(self.resources, key, owner)
+        self.bindings.wait(self.resources)
+
     def run_prefill(self, model, batch):
-        raise MissingCompositeInterface("prefill request/state binding is not connected yet")
+        with self._lock:
+            ledger = self._request_ledger()
+            requests = prefill_requests(batch, model.config, self.runtime, self.bindings.cache_groups)
+            step = ledger.begin_prefill(requests)
+            return self._run_transaction(step, batch.input_embeddings)
+
+    def _run_transaction(self, step, embeddings):
+        try:
+            result = self._execute_step(step, embeddings)
+            self.bindings.wait(self.resources)
+            self.ledger.commit(step)
+            return result
+        except Exception:
+            try:
+                self.bindings.wait(self.resources)
+            except Exception:
+                self.failed = True
+                self.ledger.poisoned = True
+                # Keep pending state and buffers owned: completion is unknown.
+                raise
+            self.ledger.abort(step, self._reset_request)
+            raise
+
+    def _execute_step(self, step, embeddings):
+        raise MissingCompositeInterface("backbone/output composite dispatch is not connected yet")
 
     def run_decode(self, model, batch):
         raise MissingCompositeInterface("decode request/state binding is not connected yet")
 
     def release_finished_requests(self, request_ids):
-        if request_ids:
-            raise MissingCompositeInterface("request cache lifecycle is not connected yet")
+        with self._lock:
+            if self.ledger is not None:
+                self.bindings.wait(self.resources)
+                self.ledger.release(request_ids, self._reset_request)
