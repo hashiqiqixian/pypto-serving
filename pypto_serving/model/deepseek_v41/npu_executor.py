@@ -48,6 +48,9 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         self.runners[model_id] = runner
         return pages
 
+    def lookup_embeddings(self, model, token_ids):
+        return self.runners[model.config.model_id].lookup_embeddings(token_ids)
+
     def run_prefill(self, model, batch):
         return self.runners[model.config.model_id].run_prefill(model, batch)
 

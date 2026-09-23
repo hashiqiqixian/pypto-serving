@@ -148,3 +148,10 @@ class V41ExecutionPlan:
         if name not in self.weight_names(layer_id):
             raise ValueError("weight is not owned by the selected layer and rank")
         return self.weights.load(name)
+
+    def for_rank(self, rank):
+        """Create metadata-only owned weight access for one collective participant."""
+        placement = RankPlacement(rank, self.placement.tp_size, self.placement.dp_size, self.placement.ep_size)
+        if placement == self.placement:
+            return self
+        return V41ExecutionPlan(self.weights.model_dir, placement, max_load_bytes=self.weights.max_load_bytes)

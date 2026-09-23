@@ -7,7 +7,9 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """V4-style runner lifecycle for explicit V4.1 composite bindings."""
-from .composite import CompositeBindings, MissingCompositeInterface
+from .composite import CompositeBindings, MissingCompositeInterface, LayerState
+from .input_preparation import lookup_token_embeddings
+import torch
 from .execution_plan import V41ExecutionPlan
 from .metadata import prefill_requests, decode_requests
 from .request_state import RequestLedger
@@ -35,6 +37,7 @@ class V41ModelRunner:
         self.failed = False
         self.ledger = None
         self._lock = RLock()
+        self._plans = None
 
     def preflight(self):
         if self.failed:
@@ -101,8 +104,51 @@ class V41ModelRunner:
             self.ledger.abort(step, self._reset_request)
             raise
 
+    def _rank_plans(self):
+        if self._plans is None:
+            self._plans = tuple(self.plan.for_rank(rank) for rank in range(self.plan.placement.ep_size))
+        return self._plans
+
+    def lookup_embeddings(self, token_ids):
+        # A complete TP vocabulary exists in each DP group; read it once on host.
+        plans = self._rank_plans()[:self.plan.placement.tp_size]
+        return lookup_token_embeddings([plan.weights for plan in plans], token_ids)
+
+    def _check_state(self, state):
+        if not isinstance(state, LayerState) or state.residual is None or state.pre_mix is None:
+            raise ValueError("composite must return both residual and delayed pre_mix")
+        if state.layout != self.bindings.output_layout:
+            raise ValueError("composite output token layout differs from the next layer input")
+        return state
+
+    def _run_layers(self, step, embeddings):
+        config = self.plan.weights.config
+        if embeddings is None:
+            embeddings = self.lookup_embeddings(torch.tensor(step.token_ids, dtype=torch.int64))
+        if (not isinstance(embeddings, torch.Tensor) or embeddings.device.type != "cpu"
+                or embeddings.dtype != torch.bfloat16
+                or tuple(embeddings.shape) != (len(step.token_ids), config.hidden_size)):
+            raise ValueError("input embeddings must be packed CPU BF16 [active_tokens, hidden_size]")
+        plans = self._rank_plans()
+        state = self.bindings.initialize(embeddings, step, self.resources)
+        self.bindings.wait(self.resources)
+        self._check_state(state)
+        for layer in self.plan.layers:
+            # The adapter chooses bounded staging or residency; payloads stay packed.
+            weights = self.bindings.prepare_weights(plans, layer, self.resources)
+            self.bindings.wait(self.resources)
+            state = self.bindings.entries[(step.phase, layer.mode)](
+                layer, state, step, self.resources, weights)
+            self.bindings.wait(self.resources)
+            self._check_state(state)
+        return state
+
     def _execute_step(self, step, embeddings):
-        raise MissingCompositeInterface("backbone/output composite dispatch is not connected yet")
+        state = self._run_layers(step, embeddings)
+        return self._finish_step(state, step)
+
+    def _finish_step(self, state, step):
+        raise MissingCompositeInterface("final HC/Norm/LM-head result binding is not connected yet")
 
     def run_decode(self, model, batch):
         with self._lock:
