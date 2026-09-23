@@ -202,7 +202,7 @@ def test_json_nesting_errors_remain_request_local(monkeypatch):
 
 
 @pytest.mark.parametrize("body", [
-    invoke("unknown"),
+    invoke("invalid name"),
     '<｜DSML｜invoke name="lookup"><｜DSML｜parameter name="x" string="true">a</｜DSML｜parameter><｜DSML｜parameter name="x" string="true">b</｜DSML｜parameter></｜DSML｜invoke>',
     "not a header",
 ])

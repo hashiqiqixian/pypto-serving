@@ -21,6 +21,7 @@ import asyncio
 import json
 
 import pytest
+from fastapi.testclient import TestClient
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import TokenOutput
@@ -167,6 +168,22 @@ def test_stream_completion_terminal_usage_chunk():
     delta_chunks = [c for c in parsed if c["choices"]]
     for c in delta_chunks:
         assert c.get("usage") is None, f"Intermediate chunk has usage: {c}"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("chat", [False, True])
+def test_http_eos_uses_standard_stop_finish_reason(stream, chat):
+    server = _make_server([
+        TokenOutput(text="Done", finished=True, finish_reason="FINISHED_EOS",
+                    prompt_tokens=2, completion_tokens=1),
+    ])
+    path = "/v1/chat/completions" if chat else "/v1/completions"
+    payload = {"messages": [{"role": "user", "content": "Go"}]} if chat else {"prompt": "Go"}
+    with TestClient(server.app) as client:
+        response = client.post(path, json={**payload, "stream": stream})
+    assert response.status_code == 200
+    choices = _parse_sse(response.content) if stream else [response.json()]
+    assert [item["choices"][0]["finish_reason"] for item in choices if item["choices"]][-1] == "stop"
 
 
 def test_chat_serializes_reasoning_and_freezes_parser_spec() -> None:

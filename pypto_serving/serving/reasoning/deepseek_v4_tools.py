@@ -53,7 +53,6 @@ class DeepSeekV4ToolParser(DeepSeekV4ReasoningParser):
 
     def __init__(self, tokenizer, spec: OutputParserSpec) -> None:
         super().__init__(tokenizer, spec)
-        self._allowed_names = frozenset(spec.tool_names)
         self._publish_tools = spec.tool_choice == "auto"
         self._reset()
 
@@ -227,8 +226,6 @@ class DeepSeekV4ToolParser(DeepSeekV4ReasoningParser):
             if match is None:
                 raise ValueError("expected a DSML invoke header")
             name = match.group(1)
-            if self._publish_tools and name not in self._allowed_names:
-                raise ValueError(f"model called unknown tool {name!r}")
             call = _Call(name=name)
             self._calls.append(call)
             if self._publish_tools:

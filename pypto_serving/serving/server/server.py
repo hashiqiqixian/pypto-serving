@@ -673,7 +673,7 @@ class ServingServer:
     @staticmethod
     def _map_finish_reason(reason: str) -> str:
         mapping = {
-            "FINISHED_EOS": "eos",
+            "FINISHED_EOS": "stop",
             "FINISHED_LENGTH": "length",
             "FINISHED_STOP": "stop",
             "FINISHED_ABORTED": "aborted",

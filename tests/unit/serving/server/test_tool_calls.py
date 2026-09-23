@@ -328,7 +328,7 @@ def test_http_tools_roundtrip_runs_real_output_delivery(stream, chunk_size, toke
         assert message["content"] == "Two results."
         assert message["reasoning"] == "Now known"
         assert "tool_calls" not in message
-        assert reason == "eos"
+        assert reason == "stop"
     assert "Need data</think>" in server.engine.tokenizer.prompts[1]
     assert "Need more data</think>" in server.engine.tokenizer.prompts[2]
     assert server.engine.tokenizer.prompts[2].count("<tool_result>") == 2
@@ -351,7 +351,7 @@ def test_http_tool_modes_and_parallel_filter(stream, parallel, choice):
     assert message["reasoning"] is None
     if choice == "none":
         assert "tool_calls" not in message
-        assert reason == "eos"
+        assert reason == "stop"
     else:
         assert len(message["tool_calls"]) == (2 if parallel else 1)
         assert reason == "tool_calls"
@@ -382,8 +382,25 @@ def test_http_truncation_never_claims_tool_success(stream, complete, reason):
 
 
 @pytest.mark.parametrize("stream", [False, True])
+def test_model_tool_name_outside_request_is_returned_for_client_validation(stream):
+    text = TOOL_START + invoke("read_file", path="notes.txt") + TOOL_END + "<eos>"
+    server = _replay_server((text, "FINISHED_EOS"), chunk_size=7)
+    with TestClient(server.app) as client:
+        response = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Read notes"}],
+            "tools": TOOLS,
+            "stream": stream,
+        })
+        message, reason, _ = _collect_chat(response, stream)
+    assert reason == "tool_calls"
+    assert len(message["tool_calls"]) == 1
+    assert message["tool_calls"][0]["function"]["name"] == "read_file"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {"path": "notes.txt"}
+    _assert_released(server, 1)
+
+
+@pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize(("invalid", "error"), [
-    (TOOL_START + invoke("unknown") + TOOL_END, "unknown tool"),
     (TOOL_START + invoke(city="one"), "incomplete DSML"),
     (TOOL_START + invoke(value=123).replace(">123</", ">broken</") + TOOL_END, "Expecting value"),
 ])
@@ -401,7 +418,7 @@ def test_parser_error_is_request_local_and_next_request_succeeds(stream, invalid
             assert error in response.json()["message"]
         message, reason, _ = _collect_chat(client.post("/v1/chat/completions", json=payload), stream)
         assert message["content"] == "Healthy"
-        assert "tool_calls" not in message and reason == "eos"
+        assert "tool_calls" not in message and reason == "stop"
     _assert_released(server, 2)
 
 

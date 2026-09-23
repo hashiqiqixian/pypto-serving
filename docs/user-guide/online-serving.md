@@ -84,6 +84,8 @@ curl --noproxy "*" "$DEEPSEEK_BASE_URL/v1/chat/completions" \
 
 `auto` is the default when non-empty `tools` are supplied. The model can answer normally or return `message.tool_calls`, with each call containing `id`, `type: "function"`, and `function: {name, arguments}`. `arguments` is a **JSON string**, not a JSON object. `content` can be null; `reasoning`, when enabled, remains separate from both content and tools.
 
+The parser returns a model-generated function name even if that name is absent from this request's `tools`, matching vLLM's default DeepSeek V4 behavior. Serving does not provide built-in functions such as `read_file`; the client decides which calls it can execute. Check the returned name against the client's available tools before executing it.
+
 For a successful call, the client should validate the function name and arguments against its schema before execution. Append the returned assistant message and a tool result that references the same call ID:
 
 ```json
@@ -142,9 +144,8 @@ Non-streaming responses include one choice and usage counts when the request fin
 
 | Value | Meaning |
 | --- | --- |
-| `eos` | The model produced EOS. |
+| `stop` | The model produced EOS or a stop string matched. |
 | `length` | The request reached `max_tokens` or model length. |
-| `stop` | A stop string matched or an unknown finish state was normalized. |
 | `aborted` | The request was aborted. |
 | `error` | The engine reported a failure. |
 | `tool_calls` | Tool-enabled chat ended normally with complete calls. |
