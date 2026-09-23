@@ -159,7 +159,7 @@ def test_public_runner_chunked_8k_128_decode_release_and_reuse():
     assert steps[-1].terminal_prefill == (True, True)
     assert not any(terminal for step in steps[:-1] for terminal in step.terminal_prefill)
 
-    sampler, params = Sampler(), SamplingParams(temperature=0.0)
+    sampler, params = Sampler(), SamplingParams(temperature=0.0, top_p=1.0)
     next_token = {key: sampler.sample(result.logits[row], params, key) for row, key in enumerate(order)}
     generated = {key: [] for key in prompts}
     for turn in range(128):

@@ -81,7 +81,7 @@ def test_output_uses_shared_greedy_sampler_and_feeds_decode():
     result = runner._run_transaction(step, torch.ones(2, 4, dtype=torch.bfloat16))
     sampler, generated = Sampler(), []
     for position in range(2, 6):
-        token = sampler.sample(result.logits[0], SamplingParams(temperature=0.0), "a")
+        token = sampler.sample(result.logits[0], SamplingParams(temperature=0.0, top_p=1.0), "a")
         generated.append(token)
         step = ledger.begin_decode([("a", 0, position, token, {})])
         result = runner._run_transaction(step, torch.ones(1, 4, dtype=torch.bfloat16))
