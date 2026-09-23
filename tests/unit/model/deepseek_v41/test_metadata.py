@@ -144,3 +144,18 @@ def test_dispatch_and_per_request_token_limits(inputs):
         prefill_requests(batch, config, replace(runtime, max_num_batched_tokens=4), groups)
     with pytest.raises(ValueError, match="per-request capacity"):
         prefill_requests(batch, config, replace(runtime, max_prefill_tokens_per_request=2), groups)
+
+
+def test_decode_worker_column_tokens_preserve_request_order(inputs):
+    from pypto_serving.config.types import DecodeBatch
+    from pypto_serving.model.deepseek_v41.metadata import decode_requests
+    _, config, runtime, groups = inputs
+    batch = DecodeBatch(request_ids=["B", "A"], token_ids=torch.tensor([[7], [9]]),
+                        hidden_states=None, seq_lens=torch.tensor([3, 6]), cache_partitions=[0, 1],
+                        block_ids_by_group=[{"window": [0, 1], "compressed": [3]},
+                                            {"window": [0, 1, 2], "compressed": [3, 4]}])
+    rows = decode_requests(batch, config, runtime, groups)
+    assert [r[:4] for r in rows] == [("B", 0, 2, 7), ("A", 1, 5, 9)]
+    batch.token_ids = torch.tensor([[7, 8], [9, 10]])
+    with pytest.raises(ValueError, match="one token"):
+        decode_requests(batch, config, runtime, groups)

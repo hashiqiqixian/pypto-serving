@@ -128,3 +128,31 @@ def prefill_requests(batch, config, runtime, groups):
             batch.request_ids, batch.cache_partitions, batch.chunk_starts, chunks, batch.prompt_lens, pages,
         )
     ]
+
+
+def decode_requests(batch, config, runtime, groups):
+    """Decode consumes exactly one supplied token per request; no padding rows."""
+    count = len(batch.request_ids)
+    if not count or count > min(runtime.max_batch_size, runtime.max_num_batched_tokens):
+        raise ValueError("decode request count exceeds the configured batch capacity")
+    if len(set(batch.request_ids)) != count or any(not isinstance(k, str) or not k for k in batch.request_ids):
+        raise ValueError("decode requires distinct nonempty request IDs")
+    tokens, lengths = batch.token_ids, batch.seq_lens
+    for value in (tokens, lengths):
+        if not isinstance(value, torch.Tensor) or value.device.type != "cpu" or value.dtype not in (
+            torch.int32, torch.int64,
+        ):
+            raise ValueError("decode tokens and lengths must be CPU integer tensors")
+    if tuple(tokens.shape) not in ((count,), (count, 1)) or tuple(lengths.shape) != (count,):
+        raise ValueError("decode requires one token and one sequence length per request")
+    ids, ends = tokens.reshape(-1).tolist(), lengths.tolist()
+    if any(not 0 <= token < config.vocab_size for token in ids):
+        raise ValueError("decode token ID is outside the vocabulary")
+    if any(not 1 <= end <= min(runtime.max_seq_len, config.max_position_embeddings) for end in ends):
+        raise ValueError("decode sequence length exceeds model capacity")
+    if len(batch.cache_partitions) != count or len(batch.block_ids_by_group) != count:
+        raise ValueError("decode requires one partition and grouped page table per request")
+    pages = validate_page_tables(batch.block_ids_by_group, batch.cache_partitions, ends, groups)
+    return [(key, partition, end - 1, token, table)
+            for key, partition, end, token, table in zip(
+                batch.request_ids, batch.cache_partitions, ends, ids, pages)]

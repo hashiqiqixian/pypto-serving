@@ -119,6 +119,27 @@ class RequestLedger:
         self.pending = ForwardStep("prefill", tuple(slices), self.epoch)
         return self.pending
 
+    def begin_decode(self, requests):
+        if self.poisoned:
+            raise RuntimeError("session requires recovery after device reset failure")
+        if self.pending is not None:
+            raise RuntimeError("a request batch is already in flight")
+        if not requests or len({r[0] for r in requests}) != len(requests):
+            raise ValueError("batch must contain distinct request IDs")
+        slices = []
+        for key, partition, start, token, pages in requests:
+            owner = self.owners.get(key)
+            if owner is None or owner.length < owner.prompt_length:
+                raise ValueError("decode requires a completed prefill for the same request")
+            if type(start) is not int or owner.length != start or owner.partition != partition:
+                raise ValueError("decode must continue at the committed position and DP partition")
+            if start + 1 > self.max_seq_len:
+                raise ValueError("decode exceeds sequence capacity")
+            slices.append(RequestSlice(key, partition, owner.slot, start, (token,), owner.prompt_length,
+                                       MappingProxyType({name: tuple(ids) for name, ids in pages.items()})))
+        self.pending = ForwardStep("decode", tuple(slices), self.epoch)
+        return self.pending
+
     def commit(self, step):
         if step is not self.pending:
             raise ValueError("stale or foreign forward completion")

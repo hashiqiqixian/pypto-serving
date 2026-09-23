@@ -9,7 +9,7 @@
 """V4-style runner lifecycle for explicit V4.1 composite bindings."""
 from .composite import CompositeBindings, MissingCompositeInterface
 from .execution_plan import V41ExecutionPlan
-from .metadata import prefill_requests
+from .metadata import prefill_requests, decode_requests
 from .request_state import RequestLedger
 from threading import RLock
 
@@ -105,7 +105,11 @@ class V41ModelRunner:
         raise MissingCompositeInterface("backbone/output composite dispatch is not connected yet")
 
     def run_decode(self, model, batch):
-        raise MissingCompositeInterface("decode request/state binding is not connected yet")
+        with self._lock:
+            ledger = self._request_ledger()
+            requests = decode_requests(batch, model.config, self.runtime, self.bindings.cache_groups)
+            step = ledger.begin_decode(requests)
+            return self._run_transaction(step, batch.hidden_states)
 
     def release_finished_requests(self, request_ids):
         with self._lock:

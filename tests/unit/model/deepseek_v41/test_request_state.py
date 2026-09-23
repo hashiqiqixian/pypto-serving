@@ -71,3 +71,25 @@ def test_cannot_release_until_forward_completes():
     ledger.commit(step)
     ledger.release(["a", "a", "unknown"], lambda *args: None)
     assert ledger.free[0] == [0]
+
+
+def test_decode_continues_prefill_and_cannot_skip_or_repeat_positions():
+    ledger = RequestLedger(max_requests=2, max_seq_len=128)
+    first = ledger.begin_prefill([item(length=2)])
+    slot = first.requests[0].state_slot
+    ledger.commit(first)
+    for position in range(2, 6):
+        step = ledger.begin_decode([("a", 0, position, 7, {"window": (3,)})])
+        assert step.positions == (position,) and step.requests[0].state_slot == slot
+        ledger.commit(step)
+    for position in (4, 7):
+        with pytest.raises(ValueError, match="committed position"):
+            ledger.begin_decode([("a", 0, position, 7, {"window": (3,)})])
+
+
+def test_decode_rejects_partial_prefill_and_unknown_requests():
+    ledger = RequestLedger(max_requests=2, max_seq_len=128)
+    ledger.commit(ledger.begin_prefill([item(length=4)]))
+    for key in ("a", "unknown"):
+        with pytest.raises(ValueError, match="completed prefill"):
+            ledger.begin_decode([(key, 0, 2, 7, {"window": (3,)})])
