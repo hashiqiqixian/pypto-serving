@@ -93,7 +93,8 @@ def load_composite_bindings() -> CompositeBindings:
     """
     raise MissingCompositeInterface(
         "V4.1 serving execution requires verified lib composite bindings: "
-        "packed-FP4 full-layer prefill/decode for all modes, initial residual/pre_mix, "
+        "all-mode prefill/decode adapters, initial residual/pre_mix, "
         "cache allocation/reset/completion and final HC/Norm/LM head. "
+        "The bounded SWA Attention/MoE segment is available separately; it is not a complete model backend. "
         "Track pypto-lib #1205, #1275 and #1287; no Torch fallback is enabled."
     )

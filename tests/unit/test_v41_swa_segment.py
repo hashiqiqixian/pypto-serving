@@ -9,13 +9,14 @@
 """CPU dispatch-contract tests; these do not execute NPU kernels."""
 from types import SimpleNamespace
 from unittest.mock import Mock
+import sys
 
 import pytest
 import torch
 
 from pypto_serving.model.deepseek_v41.composite import LayerState
 from pypto_serving.model.deepseek_v41.swa_segment import (
-    ATTENTION_ARGS, MOE_ARGS, SegmentTopology, SwaSegment,
+    ATTENTION_ARGS, MOE_ARGS, SegmentTopology, SwaSegment, make_segment_worker,
 )
 
 
@@ -96,5 +97,24 @@ def test_alias_rejected_before_dispatch(monkeypatch):
     segment, state, a, m = fixture(monkeypatch)
     m["x_next"] = state.residual
     with pytest.raises(ValueError, match="alias"):
+        segment.run_layer(state, a, m, group_counts=[16, 16])
+    segment.worker.run.assert_not_called()
+
+
+def test_retained_window_policy(monkeypatch):
+    constructor = Mock()
+    monkeypatch.setitem(sys.modules, "pypto.runtime", SimpleNamespace(DistributedWorker=constructor))
+    programs = [SimpleNamespace(compiled="a"), SimpleNamespace(compiled="m")]
+    make_segment_worker(programs, "config", ["source"])
+    constructor.assert_called_once_with(
+        ["a", "m"], config="config", persistent=True,
+        reset_persistent_windows=False, inherited_host_tensors=["source"],
+    )
+
+
+def test_attention_epoch_cannot_overflow_int32(monkeypatch):
+    segment, state, a, m = fixture(monkeypatch)
+    segment._epoch = (2**31 - 1) // 2
+    with pytest.raises(OverflowError):
         segment.run_layer(state, a, m, group_counts=[16, 16])
     segment.worker.run.assert_not_called()

@@ -113,10 +113,27 @@ def compile_segment(compiler, lib_root, topology):
     return swa, ffn
 
 
+def make_segment_worker(programs, run_config, inherited_host_tensors=()):
+    """Retain both programs' communication windows as in the V4 runner.
+
+    Attention waits for (epoch - 1) * 2 before publishing the next phase.
+    The runtime's default reset-on-reuse policy would erase that completion
+    signal and stall the second layer. Each compiled program owns its windows.
+    """
+    from pypto.runtime import DistributedWorker
+
+    return DistributedWorker(
+        [program.compiled for program in programs], config=run_config,
+        persistent=True, reset_persistent_windows=False,
+        inherited_host_tensors=inherited_host_tensors,
+    )
+
+
 class SwaSegment:
     """Synchronous half-layer dispatcher on one persistent DistributedWorker.
 
-    Metadata must be shared CPU tensors created before worker startup:
+    Construct the worker with make_segment_worker(). Metadata must be shared
+    CPU tensors created before worker startup:
     attention_counts [world, 1] and moe_counts [world], both int32.
     Per-layer argument maps contain all ABI tensors except input state, counts
     and epoch. They own separate output/scratch/cache buffers. No host copies
@@ -180,7 +197,7 @@ class SwaSegment:
                     raise ValueError("input and half-layer outputs must not alias")
                 seen.add(key)
         epoch = self._epoch + 1
-        if epoch >= 2**31:
+        if epoch > (2**31 - 1) // 2:
             raise OverflowError("communication epoch exhausted; recreate worker")
         a["attention_epoch"] = m["moe_epoch"] = ctypes.c_int32(epoch)
         # Resolve all arguments before the first collective: a missing MoE

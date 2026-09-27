@@ -28,12 +28,12 @@ def main():
     sys.path.insert(0, str(Path(args.lib_root).resolve()))
     import torch
     from pypto.ir import DistributedConfig
-    from pypto.runtime import DistributedWorker, RunConfig
+    from pypto.runtime import RunConfig
     from golden.spec import TensorSpec
     from pypto_serving.model.common.compiler.compiler import KernelCompiler
     from pypto_serving.model.deepseek_v41.composite import LayerState
     from pypto_serving.model.deepseek_v41.swa_segment import (
-        SegmentTopology, SwaSegment, compile_segment, load_segment_modules,
+        SegmentTopology, SwaSegment, compile_segment, load_segment_modules, make_segment_worker,
     )
 
     torch.set_num_threads(4)
@@ -57,14 +57,15 @@ def main():
         return {s.name: s.create_tensor().contiguous() for s in specs if isinstance(s, TensorSpec)}
 
     a = materialize(swa.build_hc_specs(fixture))
+    print("Attention fixture ready; preparing packed-FP4 expert weights", flush=True)
     m = materialize(moe.build_tensor_specs([16] * topology.world))
+    print("MoE fixture ready", flush=True)
     ac = torch.zeros(topology.world, 1, dtype=torch.int32).share_memory_()
     mc = torch.zeros(topology.world, dtype=torch.int32).share_memory_()
     readback = torch.empty_like(m["x_next"]).share_memory_()
     mix_readback = torch.empty_like(m["next_pre_mix"]).share_memory_()
     sources = [*a.values(), *m.values()]
-    with DistributedWorker([p.compiled for p in programs], persistent=True,
-                           inherited_host_tensors=sources, config=config) as worker:
+    with make_segment_worker(programs, config, sources) as worker:
         allocations = []
 
         def upload(values):
@@ -96,6 +97,8 @@ def main():
         worker.copy_stacked_from(final.pre_mix, mix_readback)
         assert torch.isfinite(readback).all() and torch.isfinite(mix_readback).all()
         assert readback.abs().max() > 0 and mix_readback.abs().max() > 0
+        assert not torch.equal(readback, a["x_hc"]), "residual was not updated"
+        assert not torch.equal(mix_readback, a["incoming_pre_mix"]), "pre_mix was not updated"
         print("DEVICE TWO-LAYER SMOKE PASS (finite/nonzero only; not numerical acceptance)", flush=True)
         for value in reversed(allocations):
             worker.free_stacked_tensor(value)
