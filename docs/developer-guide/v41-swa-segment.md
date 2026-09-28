@@ -268,6 +268,15 @@ relative L2 was 0.012873608 (maximum absolute 0.02734375). The baseline has
 precision fix; the candidate remains on a diagnostic branch and is not a
 production dependency. Neither reference arithmetic nor gates were changed.
 
+The Q-B plus O-B group-32 diagnostic (`0e166cd9`) also completed the same
+real-text/request workload. Residual passed on every rank (relative L2
+0.012825638, maximum absolute error 0.02734375), but pre_mix still failed in
+2/256 elements (relative L2 0.0022762596, maximum absolute error 0.0088607967).
+The smaller failure count is not acceptance: its maximum absolute error is
+higher than the Q-B-only candidate. It remains diagnostic, with no lib pin or
+reference change. Evidence: `swa-realweights-qb-ob32-text/comparison.pt` and
+`swa-precision-qb-ob32-text.log` under the validation artifact directory.
+
 The request ledger retains committed full-history pages for omitted/paused
 requests until their reset succeeds. A later batch cannot borrow those pages,
 and a continuation may only append to its committed page table. Relocation or
