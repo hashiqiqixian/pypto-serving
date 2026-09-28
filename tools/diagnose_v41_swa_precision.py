@@ -106,6 +106,8 @@ def main():
                         help="Diagnostic reference sensitivity only; keep the original gate result")
     parser.add_argument("--reference-fp64-linear", action="store_true",
                         help="Accumulate quantized attention projections in FP64 for diagnosis only")
+    parser.add_argument("--reference-kernel-norm", action="store_true",
+                        help="Use the standalone RMSNorm reference's chunk order in attention")
     parser.add_argument("--trace-layer", type=int, choices=(0, 1), default=1)
     parser.add_argument("--residual-profile", choices=("dsv4-layer", "v41-local"), default="dsv4-layer")
     parser.add_argument("--cut-after", type=int, choices=(0, 1, 2),
@@ -120,6 +122,8 @@ def main():
     torch.set_num_threads(4)
     topology = SegmentTopology(tp=2, dp=2)
     swa, moe = load_segment_modules(args.lib_root, topology)
+    if args.reference_kernel_norm:
+        swa.golden_rms_norm = moe.golden_rms_norm
     if args.reference_fp64_attention:
         from models.deepseek_v4_1_flash import decode_attn_swa
 
@@ -194,13 +198,14 @@ def main():
         torch.save(result, str(args.output) + f".cut-{args.cut_after}.pt")
         compare_saved(result, moe, topology, args.residual_profile)
         return
-    if args.reference_fp64_attention or args.reference_fp64_linear:
+    if args.reference_fp64_attention or args.reference_fp64_linear or args.reference_kernel_norm:
         from validate_v41_swa_segment import compare_saved
 
         result = {"actual_residual": saved["actual_residual"], "expected_residual": residual,
                   "actual_pre_mix": saved["actual_pre_mix"], "expected_pre_mix": mix}
         suffix = ".fp64-linear" if args.reference_fp64_linear else ""
         suffix += ".fp64-attention" if args.reference_fp64_attention else ""
+        suffix += ".kernel-norm" if args.reference_kernel_norm else ""
         torch.save(result, str(args.output) + suffix + ".pt")
         compare_saved(result, moe, topology, args.residual_profile)
         return
