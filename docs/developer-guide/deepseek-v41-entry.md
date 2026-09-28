@@ -92,8 +92,11 @@ layouts again when lib changes. Current FP4 tiles require K/N multiples of 256;
 native FP8 matrices require K divisible by 64 and N by 32. Unsupported geometry
 is rejected. Torch/safetensors must support the checkpoint E8M0 dtype.
 
-TP slices grouped/head projections and aligns their scales. Shared experts and
-router weights are replicated; EP selects whole routed experts, retaining
+TP slices main-attention grouped/head projections and aligns their scales.
+Indexer query/gating heads are replicated: the C1A/C2A composites at lib
+`fbe92bfc` use global `INDEX_H` on every TP rank and require complete scores.
+This overrides the earlier reference-derived index-head sharding assumption.
+Shared experts and router weights are replicated; EP selects whole routed experts, retaining
 global expert IDs. TP and EP ranks are explicit; mapping physical ranks to
 these coordinates belongs to the Executor. This loader does not certify a
 multi-device execution path.

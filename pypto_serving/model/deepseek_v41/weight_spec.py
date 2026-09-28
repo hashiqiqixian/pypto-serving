@@ -9,8 +9,8 @@
 """Checkpoint storage contracts for the V4.1 text backbone, excluding deferred modules.
 
 Names and dtypes describe the published checkpoint, not PyTorch module defaults.
-Conversion strings document the pinned reference's transformations and sharding;
-they do not execute conversion, define an Ascend pack ABI, or upload weights.
+Conversion strings describe transformations and placement for the selected lib
+boundary; they do not execute conversion, define a pack ABI, or upload weights.
 Engram, vision, DSpark and the unused VL router bias are outside this scope.
 """
 
@@ -162,8 +162,11 @@ def backbone_weight_specs(config: Mapping[str, Any]) -> dict[str, TensorSpec]:
                 add(prefix + ".wgate.weight", (head_dim, dim), "BF16", promotion)
         if layer in index_sources:
             prefix = attn + ".indexer"
-            dense(prefix + ".wq_b", index_heads * index_dim, q_rank, "tp_shard_axis0")
-            add(prefix + ".weights_proj.weight", (index_heads, dim), "BF16", "tp_shard_axis0")
+            # C1A/C2A composites at lib fbe92bfc compute complete index scores
+            # on every TP rank (INDEX_H is global). Main attention heads are
+            # sharded, but cutting index heads would omit part of each score.
+            dense(prefix + ".wq_b", index_heads * index_dim, q_rank)
+            add(prefix + ".weights_proj.weight", (index_heads, dim), "BF16", "replicate")
             if layer in kv_sources:
                 add(prefix + ".wk.weight", (index_dim, head_dim), "BF16")
                 add(prefix + ".k_norm.weight", (index_dim,), "BF16")

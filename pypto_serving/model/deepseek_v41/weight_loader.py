@@ -84,7 +84,7 @@ class V41WeightLoader:
         self.max_load_bytes = _positive(max_load_bytes, "max_load_bytes")
         if self.text["n_routed_experts"] % ep_size:
             raise ValueError("routed expert count must divide EP size")
-        for name in ("num_attention_heads", "o_groups", "index_n_heads", "vocab_size"):
+        for name in ("num_attention_heads", "o_groups", "vocab_size"):
             if self.text[name] % tp_size:
                 raise ValueError(f"{name} must divide TP size")
         index = json.loads((self.model_dir / "model.safetensors.index.json").read_text(encoding="utf-8"),

@@ -110,6 +110,21 @@ def test_input_axis_shard_keeps_scales_aligned(checkpoint):
     assert torch.equal(logical_scales(result.scale), scales.T.repeat_interleave(32, 1))
 
 
+def test_indexer_keeps_all_heads_on_every_tp_rank(checkpoint):
+    path, _, tensors = checkpoint
+    prefix = "layers.0.attn.indexer."
+    for rank in range(2):
+        loader = V41WeightLoader(path, tp_size=2, tp_rank=rank)
+        query = loader.load(prefix + "wq_b.weight")
+        expected = tensors[prefix + "wq_b.weight"].T.contiguous().view(torch.uint8)
+        assert torch.equal(query.weight.view(torch.uint8), expected)
+        scales = tensors[prefix + "wq_b.scale"].view(torch.uint8).T.repeat_interleave(32, 1)
+        assert torch.equal(logical_scales(query.scale), scales)
+        gate = loader.load(prefix + "weights_proj.weight")
+        assert torch.equal(gate.weight, tensors[prefix + "weights_proj.weight"].T)
+        assert query.tp_rank == gate.tp_rank == rank
+
+
 def test_wo_a_group_dequantization(checkpoint):
     path, _, tensors = checkpoint
     result = V41WeightLoader(path, tp_size=2, tp_rank=1).load("layers.0.attn.wo_a.weight")
