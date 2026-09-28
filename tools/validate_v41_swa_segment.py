@@ -80,7 +80,10 @@ def compare_saved(data, moe, topology):
     except AssertionError as exc:
         mix_error = str(exc)
     print("Final pre_mix reference check:", mix_error is None, mix_error or "", flush=True)
-    assert ok and mix_error is None, message + (mix_error or "")
+    stages_ok = all(result[0] for stage in data.get("stages", []) for result in stage["results"].values())
+    assert ok and mix_error is None and stages_ok, message + (mix_error or "") + (
+        "Half-layer stage comparison failed" if not stages_ok else ""
+    )
     print("TWO-LAYER TORCH REFERENCE PASS", flush=True)
 
 

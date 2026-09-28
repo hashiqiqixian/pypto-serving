@@ -78,6 +78,12 @@ computed on that half-layer's actual input. This localizes accumulated errors;
 it does not replace the independent end-to-end check or feed CPU values back
 to the device. The final check still determines success.
 
+At serving `7ef97ca`, all stage checks passed for both real-weight SWA/MoE
+layers, including Attention caches and MoE residuals. The independent two-layer
+check still failed with the errors above. Agreement on each stage's actual input
+does not establish the accumulated numerical budget across layers; that boundary
+still needs validation before full-model acceptance.
+
 To recheck a saved final comparison without compiling or allocating devices:
 
 ```bash
