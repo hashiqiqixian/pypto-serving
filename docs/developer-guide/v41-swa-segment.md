@@ -55,9 +55,18 @@ PYTHONPATH=. python tools/validate_v41_swa_segment.py \
   --model-dir /path/to/DeepSeek-V4.1-Flash --reference --ring-heap-mib 4096
 ```
 
-The diagnostic uses controlled activations and request metadata, including in
-checkpoint mode. It does not yet validate embedding initialization, real prompt
-semantics, Engram or generation. The reference runs only after the device worker
+The default `--input-source stress` uses controlled random HC activations and
+request metadata, including in checkpoint mode. `--input-source embeddings`
+instead loads checkpoint embedding rows, broadcasts each row to four HC lanes,
+and uses an identity pre-mix selecting lane zero. By default it selects sequential
+token IDs. Supply `--token-ids /path/to/ids.json` for an integer JSON array shaped
+`[DP, capacity]`, such as tokenizer-produced full token slabs. IDs are not padded,
+repeated or truncated by the diagnostic. Both controls retain fixture RoPE/pages;
+neither establishes complete prompt semantics, Engram or generation. The selected
+IDs and exact initial state are saved for CPU replay. This diagnostic input setup
+does not enable the production composite adapter.
+
+The reference runs only after the device worker
 closes, never supplies intermediate device inputs, and shares read-only weights
 with the device path. Final actual/expected residual and pre_mix are saved to
 `--artifact-dir/comparison.pt` even when the numerical comparison fails. The
@@ -83,6 +92,24 @@ layers, including Attention caches and MoE residuals. The independent two-layer
 check still failed with the errors above. Agreement on each stage's actual input
 does not establish the accumulated numerical budget across layers; that boundary
 still needs validation before full-model acceptance.
+
+The baseline embedding control also fails the unchanged accumulated gate:
+residual relative L2 is 0.01316 and pre-mix relative L2 is 0.00281, while the native
+half-layer checks pass. Its rank-zero outlier fraction is 3.896%, versus 32.572%
+on the original random stress input. The lower outlier fraction does not mean
+the relative L2 improved: these are distinct measurements on distinct workloads.
+The original stress failure remains an unresolved regression case.
+
+For precision bisection, follow lib's `docs/debug-and-tune/precision-tuning.md`
+and PyPTO's `docs/en/user/precision/00-workflow.md`. Check dtype, rounding and
+reference operation order before changing kernels. The full-chain gate currently
+reuses a single-MoE comparator; it is not an agreed model-wide error budget.
+Report relative L2, maximum absolute error and outlier fraction separately, and
+retain the existing failing gate while the accumulated contract is unresolved.
+FP8 trace comparisons decode payloads with their own scales; different encoding
+pairs can represent identical values. Local checks on actual device inputs and
+CPU boundary substitutions only localize errors, never replace full-chain
+acceptance or supply intermediate values to device execution.
 
 To recheck a saved final comparison without compiling or allocating devices:
 

@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """CPU replay of a saved two-layer device trace to bisect accumulated error.
 
-Uses the original seed-11 full-prefix fixture and checkpoint layers 0/1.
+Uses the saved initial state (or legacy seed-11 fixture) and checkpoint layers 0/1.
 No device execution, production operator composition or tolerance changes.
 """
 import argparse
@@ -29,6 +29,19 @@ def metrics(actual, expected):
     return {"rel_l2": float(diff.norm() / e.norm().clamp_min(1e-12)),
             "max_abs": float(diff.max()), "bad_fraction": float((relative > .003).double().mean()),
             "equal_fraction": float((a == e).double().mean())}
+
+
+def quantization_metrics(actual_payload, actual_codes, expected_payload, expected_codes):
+    """Compare physical FP8 values; payload distance alone ignores the shared exponent."""
+    import torch
+
+    def decode(payload, codes):
+        return payload.float().unflatten(-1, (-1, 32)) * torch.exp2(codes.float() - 127).unsqueeze(-1)
+
+    return {"dequantized": metrics(decode(actual_payload, actual_codes),
+                                   decode(expected_payload, expected_codes)),
+            "payload_changed": int((actual_payload != expected_payload).sum()),
+            "scale_changed": int((actual_codes != expected_codes).sum())}
 
 
 def trace_attention(swa, tensors, actual_hidden, reference_hidden):
@@ -70,6 +83,13 @@ def trace_attention(swa, tensors, actual_hidden, reference_hidden):
     finally:
         ref.official_linear, ref.official_rope = original_linear, original_rope
     for name in traces[0]:
+        if name.endswith(".scale"):
+            continue
+        if name.endswith(".quant"):
+            scale = name.removesuffix(".quant") + ".scale"
+            print("QUANT_TRACE", name, json.dumps(quantization_metrics(
+                traces[0][name], traces[0][scale], traces[1][name], traces[1][scale])), flush=True)
+            continue
         print("TRACE", name, json.dumps(metrics(traces[0][name], traces[1][name])), flush=True)
     return traces
 

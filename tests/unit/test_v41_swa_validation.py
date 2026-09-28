@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from tools.validate_v41_swa_segment import compare_saved
+from tools.diagnose_v41_swa_precision import quantization_metrics
 
 
 @pytest.mark.parametrize("failure", [None, "residual", "pre_mix", "stage"])
@@ -40,3 +41,16 @@ def test_saved_comparison_keeps_all_acceptance_gates(failure):
     else:
         with pytest.raises(AssertionError):
             compare_saved(data, moe, topology)
+
+
+def test_quantization_probe_compares_values_instead_of_payload_codes():
+    payload = torch.ones(2, 64)
+    codes = torch.full((2, 2), 127, dtype=torch.uint8)
+    # Different payload/exponent pairs can represent exactly the same values.
+    same = quantization_metrics(payload, codes, payload / 2, codes + 1)
+    assert same["dequantized"]["rel_l2"] == 0
+    assert same["payload_changed"] == 128 and same["scale_changed"] == 4
+    # Identical payloads are not equal physical values when exponents differ.
+    different = quantization_metrics(payload, codes + 1, payload, codes)
+    assert different["payload_changed"] == 0
+    assert different["dequantized"]["rel_l2"] == 1
