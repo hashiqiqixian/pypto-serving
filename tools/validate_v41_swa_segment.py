@@ -17,6 +17,34 @@ from types import SimpleNamespace
 import sys
 
 
+def compare_saved(data, moe, topology):
+    """Apply unchanged lib budgets to live or saved post-run outputs on CPU."""
+    import torch
+
+    actual = data["actual_residual"]
+    expected = data["expected_residual"]
+    for name in ("residual", "pre_mix"):
+        a, e = data["actual_" + name].double(), data["expected_" + name].double()
+        error = a - e
+        print(f"{name}: rel_l2={(error.norm() / e.norm().clamp_min(1e-12)).item():.8g} "
+              f"max_abs={error.abs().max().item():.8g}", flush=True)
+    counts = [topology.local_capacity] * topology.world
+    compare = moe._local_mhc_compare(counts)
+    ok, message = compare(
+        actual, expected, actual_outputs={"x_next": actual}, expected_outputs={"x_next": expected},
+        inputs={"num_tokens": torch.tensor(counts, dtype=torch.int32)}, rtol=1e-5, atol=1e-5,
+    )
+    print("Final residual reference check:", ok, message, flush=True)
+    mix_error = None
+    try:
+        torch.testing.assert_close(data["actual_pre_mix"], data["expected_pre_mix"], rtol=1e-2, atol=1e-4)
+    except AssertionError as exc:
+        mix_error = str(exc)
+    print("Final pre_mix reference check:", mix_error is None, mix_error or "", flush=True)
+    assert ok and mix_error is None, message + (mix_error or "")
+    print("TWO-LAYER TORCH REFERENCE PASS", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lib-root", required=True)
@@ -26,6 +54,7 @@ def main():
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--model-dir", help="Use actual checkpoint weights for layers 0 and 1")
     parser.add_argument("--reference", action="store_true", help="Compare against composed Torch references")
+    parser.add_argument("--compare-only", help="Recheck a saved comparison.pt on CPU without compilation/device use")
     parser.add_argument("--artifact-dir", default=".validation-artifacts/swa-segment")
     parser.add_argument("--ring-heap-mib", type=int, default=1024,
                         help="Per-ring temporary heap; lib MoE validation uses 1024 MiB")
@@ -46,6 +75,10 @@ def main():
     if len(devices) % args.tp or len(set(devices)) != len(devices):
         raise ValueError("unique devices must form complete TP groups")
     topology = SegmentTopology(tp=args.tp, dp=len(devices) // args.tp)
+    if args.compare_only:
+        _, moe = load_segment_modules(args.lib_root, topology)
+        compare_saved(torch.load(args.compare_only, map_location="cpu", weights_only=True), moe, topology)
+        return
     config = RunConfig(platform="a5", distributed_config=DistributedConfig(device_ids=devices),
                        ring_heap=args.ring_heap_mib << 20, ring_task_window=131072, ring_dep_pool=131072)
     compiler = KernelCompiler(run_config=config, cache_dir=args.build_dir)
@@ -140,14 +173,10 @@ def main():
             print(f"Torch reference layer {layer_id} complete", flush=True)
         artifact = Path(args.artifact_dir)
         artifact.mkdir(parents=True, exist_ok=True)
-        torch.save({"actual_residual": readback, "expected_residual": residual,
-                    "actual_pre_mix": mix_readback, "expected_pre_mix": mix}, artifact / "comparison.pt")
-        compare = moe._local_mhc_compare([16] * topology.world)
-        ok, message = compare(readback, residual)
-        print("Final residual reference check:", ok, message, flush=True)
-        assert ok, message
-        torch.testing.assert_close(mix_readback, mix, rtol=1e-2, atol=1e-4)
-        print("TWO-LAYER TORCH REFERENCE PASS", flush=True)
+        data = {"actual_residual": readback, "expected_residual": residual,
+                "actual_pre_mix": mix_readback, "expected_pre_mix": mix}
+        torch.save(data, artifact / "comparison.pt")
+        compare_saved(data, moe, topology)
 
 
 if __name__ == "__main__":
