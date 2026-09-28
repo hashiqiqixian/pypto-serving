@@ -16,6 +16,45 @@ from pathlib import Path
 from types import SimpleNamespace
 import sys
 
+ATTENTION_OUTPUTS = ("output", "next_pre_mix", "hidden", "attn_out", "window_cache", "window_cache_scale")
+MOE_OUTPUTS = ("x_next", "next_pre_mix", "x_mixed")
+
+
+def compare_stages(layers, captured, initial, swa, moe, topology):
+    """Localize errors against each half-layer's actual input, after execution."""
+    from golden.validation import ratio_allclose
+
+    residual, mix = initial
+    records = []
+    for layer_id, ((la, lm), (actual_a, actual_m)) in enumerate(zip(layers, captured)):
+        ra = dict(la, x_hc=residual, incoming_pre_mix=mix)
+        for name in ATTENTION_OUTPUTS:
+            ra[name] = la[name].clone()
+        swa.golden_prefill_swa_case(ra)
+        rm = dict(lm, x_hc=actual_a["output"], pre_mix=actual_a["next_pre_mix"])
+        for name in MOE_OUTPUTS:
+            rm[name] = lm[name].clone()
+        moe.golden_moe(rm)
+        checks = (
+            ("attention", actual_a, ra, swa.make_staged_compare()),
+            ("moe", actual_m, rm, {
+                "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+                "x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+                "x_next": moe._local_mhc_compare([topology.local_capacity] * topology.world),
+            }),
+        )
+        for label, actual, reference, comparators in checks:
+            results = {}
+            for name, compare in comparators.items():
+                ok, message = compare(actual[name], reference[name], actual_outputs=actual,
+                                      expected_outputs=reference, inputs=reference, rtol=1e-3, atol=1e-3)
+                print(f"STAGE layer={layer_id} {label}.{name}: {ok} {message}", flush=True)
+                results[name] = (bool(ok), message)
+            records.append({"layer": layer_id, "stage": label, "results": results,
+                            "actual": actual, "expected": {name: reference[name] for name in actual}})
+        residual, mix = actual_m["x_next"], actual_m["next_pre_mix"]
+    return records
+
 
 def compare_saved(data, moe, topology):
     """Apply unchanged lib budgets to live or saved post-run outputs on CPU."""
@@ -54,11 +93,15 @@ def main():
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--model-dir", help="Use actual checkpoint weights for layers 0 and 1")
     parser.add_argument("--reference", action="store_true", help="Compare against composed Torch references")
+    parser.add_argument("--stage-reference", action="store_true",
+                        help="Also localize errors on each half-layer's device input, after the full run")
     parser.add_argument("--compare-only", help="Recheck a saved comparison.pt on CPU without compilation/device use")
     parser.add_argument("--artifact-dir", default=".validation-artifacts/swa-segment")
     parser.add_argument("--ring-heap-mib", type=int, default=1024,
                         help="Per-ring temporary heap; lib MoE validation uses 1024 MiB")
     args = parser.parse_args()
+    if args.stage_reference:
+        args.reference = True
     sys.path.insert(0, str(Path(args.lib_root).resolve()))
     import torch
     from pypto.ir import DistributedConfig
@@ -123,6 +166,9 @@ def main():
     mc = torch.zeros(topology.world, dtype=torch.int32).share_memory_()
     readback = torch.empty_like(layers[-1][1]["x_next"]).share_memory_()
     mix_readback = torch.empty_like(layers[-1][1]["next_pre_mix"]).share_memory_()
+    captured = [({name: torch.empty_like(la[name]).share_memory_() for name in ATTENTION_OUTPUTS},
+                 {name: torch.empty_like(lm[name]).share_memory_() for name in MOE_OUTPUTS})
+                for la, lm in layers] if args.stage_reference else []
     sources = [v for pair in layers for mapping in pair for v in mapping.values()]
     print("Weights ready; executing two-layer device segment", flush=True)
     with make_segment_worker(programs, config, sources) as worker:
@@ -149,6 +195,11 @@ def main():
             print(f"Device layer {layer_id} complete", flush=True)
         worker.copy_stacked_from(state.residual, readback)
         worker.copy_stacked_from(state.pre_mix, mix_readback)
+        # Read only after both layers finish; never feed diagnostic state back.
+        for (da, dm), (ca, cm) in zip(device_layers, captured):
+            for device, cpu in ((da, ca), (dm, cm)):
+                for name, destination in cpu.items():
+                    worker.copy_stacked_from(device[name], destination)
         assert torch.isfinite(readback).all() and torch.isfinite(mix_readback).all()
         assert readback.abs().max() > 0 and mix_readback.abs().max() > 0
         assert not torch.equal(readback, a["x_hc"]), "residual was not updated"
@@ -176,6 +227,10 @@ def main():
         data = {"actual_residual": readback, "expected_residual": residual,
                 "actual_pre_mix": mix_readback, "expected_pre_mix": mix}
         torch.save(data, artifact / "comparison.pt")
+        if captured:
+            data["stages"] = compare_stages(layers, captured, (a["x_hc"], a["incoming_pre_mix"]),
+                                            swa, moe, topology)
+            torch.save(data, artifact / "comparison.pt")
         compare_saved(data, moe, topology)
 
 
