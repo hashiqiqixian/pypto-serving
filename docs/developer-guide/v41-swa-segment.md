@@ -93,12 +93,24 @@ check still failed with the errors above. Agreement on each stage's actual input
 does not establish the accumulated numerical budget across layers; that boundary
 still needs validation before full-model acceptance.
 
-The baseline embedding control also fails the unchanged accumulated gate:
-residual relative L2 is 0.01316 and pre-mix relative L2 is 0.00281, while the native
-half-layer checks pass. Its rank-zero outlier fraction is 3.896%, versus 32.572%
-on the original random stress input. The lower outlier fraction does not mean
-the relative L2 improved: these are distinct measurements on distinct workloads.
-The original stress failure remains an unresolved regression case.
+The baseline embedding controls also fail the unchanged accumulated gate, while
+their 18 native half-layer checks pass:
+
+| Initial state | Rank-zero outliers | Residual relative L2 | Pre-mix relative L2 |
+| --- | ---: | ---: | ---: |
+| Independent random HC streams | 32.572% | 0.00760 | 0.00105 |
+| Sequential checkpoint embedding rows | 3.896% | 0.01316 | 0.00281 |
+| Checkpoint embeddings for text token prefixes | 4.094% | 0.01348 | 0.00284 |
+
+The text control uses 32 tokens per DP group with fixture metadata. The lower
+outlier fraction does not mean relative L2 improved: these are distinct
+measurements on distinct workloads. The original stress failure remains an
+unresolved regression case. On the sequential embedding control, CPU replay
+matches the saved full reference bitwise; accumulated residual relative L2 at
+Attention 0, MoE 0, Attention 1, and MoE 1 is 0.00101, 0.00353, 0.01029, and
+0.01316 respectively. CPU router replay on inherited device inputs changes four
+second-layer expert sets in the random control and none in this embedding
+control. Routing changes alone therefore do not explain the chain failure.
 
 For precision bisection, follow lib's `docs/debug-and-tune/precision-tuning.md`
 and PyPTO's `docs/en/user/precision/00-workflow.md`. Check dtype, rounding and
