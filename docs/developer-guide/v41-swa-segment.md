@@ -170,3 +170,18 @@ The helper rejects over-capacity steps before allocation instead of truncating.
 It is used by the embedding diagnostic; cache lowering, device upload and the
 complete production adapter remain separate work. Never invoke it between layers
 to overwrite the residual/pre-mix produced by the previous composite.
+
+
+`swa_metadata.prepare_swa_window_metadata` lowers scheduler-owned full-history
+128-row window pages into the lib's INT64 write slots and INT32 causal read
+indices. TP peers receive identical metadata within each DP group; physical
+page IDs may be reused across DP groups but never shared by active requests in
+one group. Each query reads at most 128 positions ending at itself. Full-history
+pages avoid overwriting an early query's history when an entire new chunk is
+published before attention. Rolling/modulo page reuse is not implemented.
+
+The metadata helper covers page crossing, chunk continuation into decode,
+interleaved requests, padding and empty partitions. It does not allocate or clear
+the cache or choose a RoPE profile. Its positions must select the corresponding
+checkpoint RoPE rows before dispatch. Integration into a complete model adapter
+and device validation of that lifecycle remain pending.
