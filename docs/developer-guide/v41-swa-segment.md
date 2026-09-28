@@ -258,6 +258,16 @@ caches, compressor state, weights and communication windows. Step snapshots are
 read-only diagnostics; references execute after worker shutdown. This checks
 C2A continuation, not SWA chunk equivalence, full-model accuracy or request reset.
 
+That `31 + 1` continuation passed all 48 native stage/state checks on A5
+TP2/DP2/EP4 at serving `0355d40` and official lib `fbe92bfc`. Task
+`task_20260929_040845_198102410502` exited zero and released cards 0-3.
+Evidence: `c2a-chain-continuation-retry/comparison.pt` and
+`c2a-chain-continuation-retry.log` under the validation artifact directory.
+An earlier attempt stopped before device execution with an empty PTOAS error;
+the identical generated O-B source compiled in isolation. The successful retry
+explicitly limited `PYPTO_CODEGEN_MAX_WORKERS=4` as well as build/OMP workers.
+No source, reference or acceptance threshold changed between these attempts.
+
 The minimal Q-B group-32 diagnostic candidate (`cd759ce7`, based on official
 lib `fbe92bfc`) was also tested with the same real-text inputs and explicit
 request metadata, using serving `6f52516`. All native checks and all per-rank
