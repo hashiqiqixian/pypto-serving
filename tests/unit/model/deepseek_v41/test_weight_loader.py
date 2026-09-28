@@ -125,6 +125,29 @@ def test_indexer_keeps_all_heads_on_every_tp_rank(checkpoint):
         assert query.tp_rank == gate.tp_rank == rank
 
 
+def test_c2a_full_bundle_preserves_composite_dtypes_and_index_heads(checkpoint):
+    from pypto_serving.model.deepseek_v41.swa_segment import SegmentTopology
+    from pypto_serving.model.deepseek_v41.swa_weights import load_prefill_layer_weights, load_swa_layer_weights
+
+    path, _, tensors = checkpoint
+    topology = SegmentTopology(tp=2, dp=1)
+    with pytest.raises(ValueError, match="SWA"):
+        load_swa_layer_weights(path, 0, topology)
+    attention, moe = load_prefill_layer_weights(path, 0, topology)
+    assert attention["index_wq_b"].shape == (2, 256, 256)
+    assert attention["index_weights_proj"].shape == (2, 256, 8)
+    assert attention["wq_b"].shape == (2, 256, 256)  # Half of the 512 main-head columns.
+    for rank in range(2):
+        assert torch.equal(attention["compressor_wkv"][rank],
+                           tensors["layers.0.attn.compressor.wkv.weight"].float().T)
+        assert attention["compressor_wgate"].dtype == torch.float32
+        assert attention["index_wk"].dtype == torch.bfloat16
+        assert moe["routed_w1"].dtype == torch.uint8
+        assert moe["routed_w1"].shape[1] == 1  # One whole expert per EP rank.
+    assert torch.equal(attention["index_wq_b"][0].view(torch.uint8),
+                       attention["index_wq_b"][1].view(torch.uint8))
+
+
 def test_wo_a_group_dequantization(checkpoint):
     path, _, tensors = checkpoint
     result = V41WeightLoader(path, tp_size=2, tp_rank=1).load("layers.0.attn.wo_a.weight")

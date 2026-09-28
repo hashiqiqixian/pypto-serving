@@ -59,6 +59,21 @@ def load_swa_layer_weights(model_dir, layer_id, topology, *, max_bundle_bytes=32
     or the accumulated weights of other layers. Individual payload reads retain
     V41WeightLoader's separate pre-read budget.
     """
+    return _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, swa_only=True)
+
+
+def load_prefill_layer_weights(model_dir, layer_id, topology, *, max_bundle_bytes=32 << 30):
+    """Load this layer's real Attention/MoE weights for the prefill SP entries.
+
+    Full modes own compressor and index-key weights; Reindex owns only index
+    query/gating weights; Reuse owns neither. Producer-owned caches and unused
+    C1A ABI buffers must be supplied by the resource adapter, not fabricated by
+    the loader. Index heads are replicated, matching lib's global INDEX_H.
+    """
+    return _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, swa_only=False)
+
+
+def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_only):
     if type(max_bundle_bytes) is not int or max_bundle_bytes <= 0:
         raise ValueError("max_bundle_bytes must be positive")
     attention, moe = [], []
@@ -66,8 +81,10 @@ def load_swa_layer_weights(model_dir, layer_id, topology, *, max_bundle_bytes=32
     for rank in range(topology.world):
         loader = V41WeightLoader(model_dir, tp_size=topology.tp, tp_rank=rank % topology.tp,
                                  ep_size=topology.world, ep_rank=rank, max_load_bytes=512 << 20)
-        if (type(layer_id) is not int or not 0 <= layer_id < loader.config.num_hidden_layers
-                or loader.text["compress_ratios"][layer_id] != 0):
+        if type(layer_id) is not int or not 0 <= layer_id < loader.config.num_hidden_layers:
+            raise ValueError("selected layer must be a backbone layer")
+        ratio = loader.text["compress_ratios"][layer_id]
+        if swa_only and ratio != 0:
             raise ValueError("selected layer must be a SWA backbone layer")
         prefix = f"layers.{layer_id}."
         a, m = {}, {}
@@ -93,6 +110,20 @@ def load_swa_layer_weights(model_dir, layer_id, topology, *, max_bundle_bytes=32
             a[name] = bundle.weight
             if bundle.scale is not None:
                 a[name + "_scale"] = bundle.scale
+        if layer_id in loader.text["kv_source_layer_ids"]:
+            for target, source in {
+                "compressor_wkv": "attn.compressor.wkv.weight",
+                "compressor_norm_weight": "attn.compressor.norm.weight",
+                "index_wk": "attn.indexer.wk.weight",
+                "index_norm_weight": "attn.indexer.k_norm.weight",
+            }.items():
+                a[target] = load(source).weight
+            if ratio == 2:
+                a["compressor_wgate"] = load("attn.compressor.wgate.weight").weight
+        if layer_id in loader.text["index_source_layer_ids"]:
+            bundle = load("attn.indexer.wq_b.weight")
+            a["index_wq_b"], a["index_wq_b_scale"] = bundle.weight, bundle.scale
+            a["index_weights_proj"] = load("attn.indexer.weights_proj.weight").weight
         for target, source in {
             "hc_ffn_fn": "hc_ffn_fn", "hc_ffn_scale": "hc_ffn_scale", "hc_ffn_base": "hc_ffn_base",
             "norm_weight": "ffn_norm.weight", "gate_weight": "ffn.gate.weight",
