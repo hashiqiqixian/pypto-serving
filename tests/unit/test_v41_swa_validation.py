@@ -14,7 +14,29 @@ import pytest
 import torch
 
 from tools.validate_v41_swa_segment import compare_saved
-from tools.diagnose_v41_swa_precision import quantization_metrics
+from tools.diagnose_v41_swa_precision import quantization_metrics, trace_attention
+
+
+def test_attention_trace_uses_selected_rank_weights_and_cache(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    calls = []
+    linear, rope = object(), object()
+    reference = SimpleNamespace(official_linear=linear, official_rope=rope,
+                                official_reference=lambda inputs: calls.append(inputs))
+    package = ModuleType("models.deepseek_v4_1_flash")
+    package.decode_attn_swa = reference
+    monkeypatch.setitem(sys.modules, "models", ModuleType("models"))
+    monkeypatch.setitem(sys.modules, "models.deepseek_v4_1_flash", package)
+    tensors = {name: torch.arange(4).reshape(4, 1) for name in ("weight", "cache")}
+    actual, expected = torch.ones(1), torch.zeros(1)
+    assert trace_attention(SimpleNamespace(HC_INPUT_NAMES=("weight", "cache", "x_hc")),
+                           tensors, actual, expected, rank=2) == [{}, {}]
+    assert [int(c["weight"]) for c in calls] == [2, 2]
+    assert [int(c["cache"]) for c in calls] == [2, 2]
+    assert calls[0]["x"] is actual and calls[1]["x"] is expected
+    assert reference.official_linear is linear and reference.official_rope is rope
 
 
 @pytest.mark.parametrize("failure", [None, "residual", "pre_mix", "stage"])

@@ -44,7 +44,7 @@ def quantization_metrics(actual_payload, actual_codes, expected_payload, expecte
             "scale_changed": int((actual_codes != expected_codes).sum())}
 
 
-def trace_attention(swa, tensors, actual_hidden, reference_hidden):
+def trace_attention(swa, tensors, actual_hidden, reference_hidden, *, rank=0):
     """Bisect the second attention on CPU, recording its public reference calls."""
     from models.deepseek_v4_1_flash import decode_attn_swa as ref
 
@@ -74,7 +74,7 @@ def trace_attention(swa, tensors, actual_hidden, reference_hidden):
                 return result
 
             ref.official_linear, ref.official_rope = linear, rope
-            inputs = {name: tensors[name][0] for name in swa.HC_INPUT_NAMES if name not in (
+            inputs = {name: tensors[name][rank] for name in swa.HC_INPUT_NAMES if name not in (
                 "x_hc", "incoming_pre_mix", "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight",
             )}
             inputs["x"] = hidden
@@ -109,6 +109,8 @@ def main():
     parser.add_argument("--reference-kernel-norm", action="store_true",
                         help="Use the standalone RMSNorm reference's chunk order in attention")
     parser.add_argument("--trace-layer", type=int, choices=(0, 1), default=1)
+    parser.add_argument("--trace-rank", type=int, default=0,
+                        help="Logical rank for the per-operation Attention trace (including other DP groups)")
     parser.add_argument("--residual-profile", choices=("dsv4-layer", "v41-local"), default="dsv4-layer")
     parser.add_argument("--cut-after", type=int, choices=(0, 1, 2),
                         help="Restart the CPU reference from a saved device boundary; diagnostic only")
@@ -121,6 +123,8 @@ def main():
 
     torch.set_num_threads(4)
     topology = SegmentTopology(tp=2, dp=2)
+    if not 0 <= args.trace_rank < topology.world:
+        parser.error("--trace-rank must be inside the diagnostic world")
     swa, moe = load_segment_modules(args.lib_root, topology)
     if args.reference_kernel_norm:
         swa.golden_rms_norm = moe.golden_rms_norm
@@ -155,12 +159,14 @@ def main():
     if args.trace_attention:
         full = torch.load(args.output, map_location="cpu", weights_only=True)
         layer = args.trace_layer
-        print(f"Loading layer {layer} for attention trace", flush=True)
+        rank = args.trace_rank
+        print(f"Loading layer {layer}, rank {rank} for attention trace", flush=True)
         aw, unused_moe = load_swa_layer_weights(args.model_dir, layer, topology)
         del unused_moe
-        traces = trace_attention(swa, dict(a, **aw), saved["stages"][2 * layer]["actual"]["hidden"][0],
-                                 full[2 * layer]["expected"]["hidden"][0])
-        torch.save(traces, str(args.output) + f".attention-trace-layer{layer}.pt")
+        traces = trace_attention(swa, dict(a, **aw), saved["stages"][2 * layer]["actual"]["hidden"][rank],
+                                 full[2 * layer]["expected"]["hidden"][rank], rank=rank)
+        suffix = f"-rank{rank}" if rank else ""
+        torch.save(traces, str(args.output) + f".attention-trace-layer{layer}{suffix}.pt")
         return
     residual, mix = a["x_hc"], a["incoming_pre_mix"]
     records = []
