@@ -15,6 +15,7 @@ entire audited ABI and retain every program's communication windows.
 import importlib
 
 from .swa_segment import ATTENTION_ARGS, SwaSegment, load_segment_modules
+from .execution_plan import LayerPlan
 
 
 _WEIGHTS = (
@@ -41,6 +42,75 @@ PREFILL_ARGUMENTS = {
     "swa": ATTENTION_ARGS, "c2a_full": C2A_FULL_ARGS, "c2a_reuse": C2A_REUSE_ARGS,
     "c1a_full": C1A_ARGS, "c1a_reindex": C1A_ARGS, "c1a_reuse": C1A_ARGS,
 }
+
+
+def bind_prefill_producers(plans, arguments):
+    """Bind one ordered forward chain to its actual producer allocations.
+
+    Like V4's worker-owned cache arguments, handles stay resident for the whole
+    dispatch. V4.1 additionally shares compressed KV/index pools and physical
+    Top-K rows according to LayerPlan. This performs no tensor computation.
+    Every producer must execute earlier in this chain, so a previous request's
+    transient Top-K/candidate rows cannot satisfy a missing dependency.
+
+    C1A's common ABI retains unused Full weights in Reindex/Reuse. Bind those
+    slots to their real producer weights; never allocate placeholder weights.
+    Full/Reindex do not read compressed_indices; their own Top-K allocation is
+    a valid shape-compatible binding for that unused slot (lib fbe92bfc).
+    """
+    plans = tuple(plans)
+    if not plans or any(not isinstance(p, LayerPlan) for p in plans):
+        raise ValueError("prefill chain requires LayerPlan entries")
+    if any(b.layer_id != a.layer_id + 1 for a, b in zip(plans, plans[1:])):
+        raise ValueError("prefill chain must execute consecutive layers in order")
+    result, seen = {}, {}
+    for plan in plans:
+        if plan.mode not in PREFILL_ARGUMENTS:
+            raise ValueError("unsupported prefill mode")
+        current = dict(arguments[plan.layer_id])
+        if plan.mode != "swa":
+            family, mode = plan.mode.split("_")
+
+            def producer(source, kind):
+                if source == plan.layer_id:
+                    if mode != "full" and not (kind == "index" and mode == "reindex"):
+                        raise ValueError(f"{plan.mode} cannot produce its own {kind}")
+                    return current
+                if source not in seen or not seen[source].mode.startswith(family + "_"):
+                    raise ValueError(f"missing preceding {kind} producer for layer {plan.layer_id}")
+                source_mode = seen[source].mode.split("_")[1]
+                if source_mode != "full" and not (kind == "index" and source_mode == "reindex"):
+                    raise ValueError(f"invalid {kind} producer mode")
+                return result[source]
+
+            if mode == "full" and (plan.kv_source != plan.layer_id or plan.index_source != plan.layer_id):
+                raise ValueError("Full must own its KV and index outputs")
+            if mode == "reindex" and (family != "c1a" or plan.index_source != plan.layer_id):
+                raise ValueError("Reindex must own its C1A index output")
+            kv = producer(plan.kv_source, "KV")
+            index = producer(plan.index_source, "index")
+            if plan.index_source != plan.layer_id and seen[plan.index_source].kv_source != plan.kv_source:
+                raise ValueError("index selection must address the same KV producer")
+            for name in ("compressed_cache", "compressed_cache_scale"):
+                current[name] = kv[name]
+            if family == "c1a":
+                candidate = producer(plan.candidate_source, "candidate")
+                if plan.candidate_source != plan.kv_source:
+                    raise ValueError("C1A candidates must use the same KV producer")
+                for name in ("index_cache", "index_cache_scale", "compressor_wkv", "compressor_norm_weight",
+                             "index_wk", "index_norm_weight"):
+                    current[name] = kv[name]
+                current["candidate_mask"] = candidate["candidate_mask"]
+                if mode == "reuse":
+                    for name in ("index_wq_b", "index_wq_b_scale", "index_weights_proj", "topk_indices"):
+                        current[name] = index[name]
+                current["compressed_indices"] = index["topk_indices"]
+            elif mode == "reuse":
+                current["compressed_indices"] = index["topk_indices"]
+        elif any(source is not None for source in (plan.kv_source, plan.index_source, plan.candidate_source)):
+            raise ValueError("SWA must not declare compressed producers")
+        result[plan.layer_id], seen[plan.layer_id] = current, plan
+    return result
 
 
 def compile_prefill_segments(compiler, lib_root, topology, modes):
@@ -96,3 +166,33 @@ class PrefillSegment(SwaSegment):
             input_mix="incoming_pre_mix" if mode == "swa" else "pre_mix",
             output_residual="output" if mode == "swa" else "x_hc_out",
         )
+
+    def run_chain(self, state, plans, attention, moe, *, group_counts):
+        """Execute one request step through its producers and consumers in order.
+
+        The resource owner must prepare every layer for the SAME packed step
+        and retain all allocations until this synchronous call returns. This
+        is still a bounded prefill segment, not a complete serving backend.
+        """
+        from .swa_segment import MOE_ARGS
+
+        plans = tuple(plans)
+        bound = bind_prefill_producers(plans, attention)
+        self.topology.counts(group_counts)
+        # Resolve the whole chain before any cache mutation. Runtime state,
+        # active counts and per-program epochs are provided by run_layer.
+        dynamic = {"x_hc", "pre_mix", "incoming_pre_mix", "num_tokens", "attention_epoch", "moe_epoch"}
+        for plan in plans:
+            if plan.mode not in self.attention_programs:
+                raise ValueError(f"prefill mode was not compiled: {plan.mode}")
+            for name in PREFILL_ARGUMENTS[plan.mode]:
+                if name not in dynamic:
+                    bound[plan.layer_id][name]
+            for name in MOE_ARGS:
+                if name not in dynamic:
+                    moe[plan.layer_id][name]
+            self._check_weights(moe[plan.layer_id])
+        for plan in plans:
+            state = self.run_layer(state, bound[plan.layer_id], moe[plan.layer_id],
+                                   group_counts=group_counts, mode=plan.mode)
+        return state

@@ -205,7 +205,7 @@ MoE program advances every layer. Missing arguments are rejected before either
 half-layer runs. A failed dispatch poisons the entire worker.
 
 This dispatch support is not full-model readiness: real compressed-cache
-allocation/lowering, producer bindings and device numerical validation remain
+allocation, complete request integration and device numerical validation remain
 required. `tools/compile_v41_prefill_segments.py --lib-root ... --modes c2a_full`
 provides an explicit compilation-only check without allocating devices. All
 programs must be registered with the same persistent worker before execution.
@@ -218,3 +218,16 @@ Ratio-2 publishes at odd positions and rotates at the pair's first position;
 request state IDs survive batch reordering. Top-K/candidate selection remains
 inside lib, and producer buffers stay caller-owned. Host tests cover pair/page
 boundaries and continuation; this does not establish device lifecycle readiness.
+
+`PrefillSegment.run_chain` binds resident producer handles before dispatching
+consecutive layers for one packed request step. Full layers own compressed KV
+and index caches; Reindex consumes the earlier candidate mask and produces its
+own Top-K; Reuse consumes that index producer's physical Top-K rows directly.
+Every layer keeps its own SWA cache. C1A's unused common-ABI weight slots refer
+to real producer weights, without loading nonexistent Reuse weights. Each
+producer must appear earlier in the same chain, preventing stale transient
+selections from a previous step from satisfying an omitted producer. All
+argument names and compiled modes are checked before the first dispatch.
+The caller still owns allocation, step metadata, reset and buffer lifetime.
+Unit tests cover the checkpoint's 40-layer producer plan; this is not evidence
+of 40-layer device execution or numerical acceptance.
