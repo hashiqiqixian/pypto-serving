@@ -84,3 +84,20 @@ def test_quantization_probe_compares_values_instead_of_payload_codes():
     different = quantization_metrics(payload, codes + 1, payload, codes)
     assert different["payload_changed"] == 0
     assert different["dequantized"]["rel_l2"] == 1
+
+
+@pytest.mark.parametrize("error,passes", [(0.0005, True), (0.002, False)])
+def test_provisional_premix_budget_requires_every_element(error, passes):
+    residual = torch.ones(1, 2, 4, 3)
+    expected = torch.zeros(1, 2, 4)
+    actual = expected.clone()
+    actual[0, 0, 0] = error
+    data = {"actual_residual": residual, "expected_residual": residual.clone(),
+            "actual_pre_mix": actual, "expected_pre_mix": expected}
+    moe = SimpleNamespace(_local_mhc_compare=lambda counts: lambda *args, **kwargs: (True, ""))
+    topology = SimpleNamespace(local_capacity=2, world=1)
+    if passes:
+        compare_saved(data, moe, topology, "v41-local")
+    else:
+        with pytest.raises(AssertionError):
+            compare_saved(data, moe, topology, "v41-local")

@@ -114,7 +114,8 @@ def compare_saved(data, moe, topology, residual_profile="dsv4-layer"):
     print(f"Final residual reference check ({residual_profile}):", ok, message, flush=True)
     mix_error = None
     try:
-        torch.testing.assert_close(data["actual_pre_mix"], data["expected_pre_mix"], rtol=1e-2, atol=1e-4)
+        # User-approved provisional budget for this two-layer accumulated output only.
+        torch.testing.assert_close(data["actual_pre_mix"], data["expected_pre_mix"], rtol=1e-2, atol=1e-3)
     except AssertionError as exc:
         mix_error = str(exc)
     print("Final pre_mix reference check:", mix_error is None, mix_error or "", flush=True)

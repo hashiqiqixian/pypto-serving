@@ -73,8 +73,9 @@ with the device path. Final actual/expected residual and pre_mix are saved to
 residual gate defaults to `--residual-profile dsv4-layer`: the DSV4 complete-layer
 comparator `ratio_reldiff(diff_thd=0.01, pct_thd=0.05)`, applied separately to each
 rank. `--residual-profile v41-local` retains the historical V4.1 single-MoE
-comparator (0.003/2%, with its single-point cap). Pre_mix retains rtol=0.01 and
-atol=0.0001; local stage gates are unchanged. A completed smoke is not a numerical pass.
+comparator (0.003/2%, with its single-point cap). Accumulated pre_mix uses the user-approved provisional rtol=0.01 and
+atol=0.001, requiring every element to pass; local stage gates are unchanged.
+This is limited to this two-layer diagnostic, not a V4/vLLM multi-layer standard. A completed smoke is not a numerical pass.
 
 The real-weight TP2/DP2/EP4 diagnostic exhausted the temporary heap at both
 512 MiB and 1024 MiB per ring. With 4096 MiB per ring, both device layers and
@@ -130,8 +131,8 @@ Rechecking those same saved tensors with `dsv4-layer` passes residual on every
 rank. Worst-rank outlier fractions are 3.3542% (random streams), 0.02167%
 (sequential embeddings), and 0.12879% (text embeddings), below the 5% budget.
 This is a requested acceptance-profile change, not reduced numerical error.
-Pre_mix still fails in 14/256, 30/256 and 24/256 entries respectively, so the
-overall diagnostic still fails. DSV4's layer comparison is not an independent
+With the historical pre_mix atol=0.0001, 14/256, 30/256 and 24/256 entries
+respectively failed, so that historical overall diagnostic failed. DSV4's layer comparison is not an independent
 43-layer accuracy guarantee, and it does not specify V4.1's delayed pre_mix
 contract. These results do not establish complete model or M0 acceptance.
 
@@ -142,3 +143,13 @@ PYTHONPATH=. python tools/validate_v41_swa_segment.py \
   --lib-root /path/to/current/pypto-lib --tp 2 --devices 0,1,2,3 \
   --compare-only /path/to/comparison.pt
 ```
+
+
+On 2026-09-28 the user approved provisional accumulated pre_mix tolerances
+rtol=0.01, atol=0.001, with no allowed failing elements. CPU rechecks of the
+three saved device runs still fail in 2/256 (random), 7/256 (sequential
+embeddings), and 7/256 (text embeddings) entries. Residual and all native stage
+checks pass, but overall two-layer acceptance remains unresolved. This changes
+the acceptance budget only; numerical errors are unchanged. No new NPU run was
+performed. Evidence: `.validation-artifacts/approved-premix-budget-recheck.json`
+on the A5 validation checkout, using baseline lib `21645633`.
