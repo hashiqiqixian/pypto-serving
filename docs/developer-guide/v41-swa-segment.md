@@ -209,3 +209,12 @@ allocation/lowering, producer bindings and device numerical validation remain
 required. `tools/compile_v41_prefill_segments.py --lib-root ... --modes c2a_full`
 provides an explicit compilation-only check without allocating devices. All
 programs must be registered with the same persistent worker before execution.
+
+`compressed_metadata.prepare_compressed_metadata` prepares C1A/C2A positions,
+causal compressed lengths, publication slots, index page tables and stable
+compressor state IDs from a `ForwardStep`. It requires jointly numbered KV/index
+pools, as current composites publish their index key at the compressed KV slot.
+Ratio-2 publishes at odd positions and rotates at the pair's first position;
+request state IDs survive batch reordering. Top-K/candidate selection remains
+inside lib, and producer buffers stay caller-owned. Host tests cover pair/page
+boundaries and continuation; this does not establish device lifecycle readiness.

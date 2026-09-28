@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Compile the selected V4.1 prefill composites without allocating NPU devices."""
+"""Generate selected V4.1 prefill code without device binary assembly or execution."""
 import argparse
 
 
@@ -29,7 +29,7 @@ def main():
     config = RunConfig(platform="a5", distributed_config=DistributedConfig(device_ids=list(range(topology.world))))
     compiler = KernelCompiler(run_config=config, cache_dir=args.build_dir)
     attention, _ = compile_prefill_segments(compiler, args.lib_root, topology, args.modes)
-    print("COMPILE PASS:", ", ".join(attention), "+ packed-FP4 MoE; no device execution", flush=True)
+    print("CODEGEN PASS:", ", ".join(attention), "+ packed-FP4 MoE; no binary assembly/device execution", flush=True)
 
 
 if __name__ == "__main__":
