@@ -31,12 +31,57 @@ def metrics(actual, expected):
             "equal_fraction": float((a == e).double().mean())}
 
 
+def trace_attention(swa, tensors, actual_hidden, reference_hidden):
+    """Bisect the second attention on CPU, recording its public reference calls."""
+    from models.deepseek_v4_1_flash import decode_attn_swa as ref
+
+    original_linear, original_rope = ref.official_linear, ref.official_rope
+    traces = []
+    try:
+        for hidden in (actual_hidden, reference_hidden):
+            trace = {}
+            calls = iter(("q_a", "q_b", "kv", "o_b"))
+            ropes = iter(("q_rope", "kv_rope", "out_rope"))
+
+            def linear(x, weight, scale, fp32=False):
+                name = next(calls)
+                trace[name + ".input"] = x.clone()
+                payload, codes = ref.official_quantize(x)
+                trace[name + ".quant"] = payload.float()
+                trace[name + ".scale"] = codes.float()
+                result = original_linear(x, weight, scale, fp32=fp32)
+                trace[name + ".output"] = result.clone()
+                return result
+
+            def rope(x, cos, sin, inverse=False):
+                name = next(ropes)
+                trace[name + ".input"] = x.clone()
+                result = original_rope(x, cos, sin, inverse=inverse)
+                trace[name + ".output"] = result.clone()
+                return result
+
+            ref.official_linear, ref.official_rope = linear, rope
+            inputs = {name: tensors[name][0] for name in swa.HC_INPUT_NAMES if name not in (
+                "x_hc", "incoming_pre_mix", "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight",
+            )}
+            inputs["x"] = hidden
+            ref.official_reference(inputs)
+            traces.append(trace)
+    finally:
+        ref.official_linear, ref.official_rope = original_linear, original_rope
+    for name in traces[0]:
+        print("TRACE", name, json.dumps(metrics(traces[0][name], traces[1][name])), flush=True)
+    return traces
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lib-root", required=True)
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--saved", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--trace-attention", action="store_true",
+                        help="Use the saved full-reference replay to bisect layer-1 rank-0 attention")
     args = parser.parse_args()
     sys.path.insert(0, str(Path(args.lib_root).resolve()))
     import torch
@@ -52,6 +97,15 @@ def main():
                               fixture="checkpoint", dp_tokens=None, epochs=1, bench=False)
     a = {s.name: s.create_tensor().contiguous() for s in swa.build_hc_specs(fixture)
          if isinstance(s, TensorSpec)}
+    if args.trace_attention:
+        full = torch.load(args.output, map_location="cpu", weights_only=True)
+        print("Loading layer 1 for attention trace", flush=True)
+        aw, unused_moe = load_swa_layer_weights(args.model_dir, 1, topology)
+        del unused_moe
+        traces = trace_attention(swa, dict(a, **aw), saved["stages"][2]["actual"]["hidden"][0],
+                                 full[2]["expected"]["hidden"][0])
+        torch.save(traces, str(args.output) + ".attention-trace.pt")
+        return
     residual, mix = a["x_hc"], a["incoming_pre_mix"]
     records = []
     for layer in (0, 1):
