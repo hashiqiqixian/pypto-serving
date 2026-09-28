@@ -31,3 +31,21 @@ def test_select_ragged_prefix_without_mutating_saved_state():
 def test_select_prefix_rejects_invalid_counts_before_reading_state(counts):
     with pytest.raises(ValueError, match="active-token count"):
         select_active_state({}, SegmentTopology(tp=2, dp=2), counts)
+
+
+def test_continuation_repacks_the_next_token_across_tp_slabs():
+    topology = SegmentTopology(tp=2, dp=2)
+    residual = torch.arange(4 * 16 * 4 * 5120, dtype=torch.float32).reshape(4, 16, 4, 5120)
+    mix = torch.arange(4 * 16 * 4, dtype=torch.float32).reshape(4, 16, 4)
+    selected, selected_mix = select_active_state(
+        dict(actual_residual=residual, actual_pre_mix=mix), topology, [1, 0], [31, 0])
+    assert torch.equal(selected[0, 0], residual[1, 15])
+    assert torch.equal(selected_mix[0, 0], mix[1, 15])
+    assert not selected[0, 1:].count_nonzero() and not selected[1:].count_nonzero()
+    assert not selected_mix[0, 1:].count_nonzero() and not selected_mix[1:].count_nonzero()
+
+
+@pytest.mark.parametrize("starts", [[32, 0], [-1, 0], [0], [True, 0]])
+def test_continuation_cannot_exceed_saved_source(starts):
+    with pytest.raises(ValueError, match="saved causal source"):
+        select_active_state({}, SegmentTopology(tp=2, dp=2), [1, 0], starts)

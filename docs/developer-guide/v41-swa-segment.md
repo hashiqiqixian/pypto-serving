@@ -243,6 +243,21 @@ not resolve the incoming SWA accumulated error or establish a new accumulated
 four-layer acceptance standard. Source state and numerical artifacts must be
 reported with that limitation.
 
+The fresh real-weight C2A pair passed all 24 native checks on A5 TP2/DP2/EP4
+at serving `9f9a5c3` and official lib `fbe92bfc`. At serving `fabf011`, the
+`--group-counts 31,0` case also passed, covering an odd compressor tail and an
+empty DP group with untouched caches. Both device tasks exited zero and released
+all four cards. These remain stage/state checks with an unresolved incoming
+SWA accumulated error.
+
+`--continue-to-capacity` adds a second chunk for each initially nonempty request,
+using the remaining rows of the saved causal source. For example,
+`--group-counts 31,0 --continue-to-capacity` runs 31 then 1 token in the first DP
+group, with the second group empty. Both chunks use the same resident per-layer
+caches, compressor state, weights and communication windows. Step snapshots are
+read-only diagnostics; references execute after worker shutdown. This checks
+C2A continuation, not SWA chunk equivalence, full-model accuracy or request reset.
+
 The minimal Q-B group-32 diagnostic candidate (`cd759ce7`, based on official
 lib `fbe92bfc`) was also tested with the same real-text inputs and explicit
 request metadata, using serving `6f52516`. All native checks and all per-rank

@@ -18,11 +18,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
-def select_active_state(saved, topology, group_counts):
+def select_active_state(saved, topology, group_counts, starts=None):
     """Select causal prefixes for a ragged diagnostic, preserving the source artifact."""
     import torch
 
     topology.counts(group_counts)
+    starts = [0] * topology.dp if starts is None else starts
+    if len(starts) != topology.dp or any(type(start) is not int or start < 0 or
+            start + count > topology.capacity for start, count in zip(starts, group_counts)):
+        raise ValueError("diagnostic chunks must fit within the saved causal source")
     residual, mix = saved["actual_residual"], saved["actual_pre_mix"]
     if residual.shape != (topology.world, topology.local_capacity, 4, 5120) or mix.shape != residual.shape[:-1]:
         raise ValueError("saved SWA state has incompatible topology or shape")
@@ -30,14 +34,15 @@ def select_active_state(saved, topology, group_counts):
         raise ValueError("saved SWA state must preserve its FP32 storage")
     if not torch.isfinite(residual).all() or not torch.isfinite(mix).all():
         raise ValueError("saved SWA state must be finite")
-    residual, mix = residual.clone(), mix.clone()
-    for rank, count in enumerate(topology.counts(group_counts)[1]):
-        residual[rank, count:] = 0
-        mix[rank, count:] = 0
-    return residual, mix
+    selected, selected_mix = torch.zeros_like(residual), torch.zeros_like(mix)
+    for group, (start, count) in enumerate(zip(starts, group_counts)):
+        ranks = slice(group * topology.tp, (group + 1) * topology.tp)
+        selected[ranks].flatten(0, 1)[:count] = residual[ranks].flatten(0, 1)[start:start + count]
+        selected_mix[ranks].flatten(0, 1)[:count] = mix[ranks].flatten(0, 1)[start:start + count]
+    return selected, selected_mix
 
 
-def prepare(args, topology, module):
+def prepare(args, topology, module, weight_bundles=None):
     import torch
     from golden.spec import TensorSpec
     from models.deepseek_v4_1_flash.config import FLASH
@@ -55,8 +60,10 @@ def prepare(args, topology, module):
     if ids is None or tuple(ids.shape) != (topology.dp, topology.capacity):
         raise ValueError("saved SWA diagnostic must contain exactly the same packed token capacity")
     group_counts = args.group_counts
+    starts = getattr(args, "starts", [0] * topology.dp)
+    weight_bundles = {} if weight_bundles is None else weight_bundles
     global_counts, local_counts = topology.counts(group_counts)
-    residual, mix = select_active_state(saved, topology, group_counts)
+    residual, mix = select_active_state(saved, topology, group_counts, starts)
     raw = json.loads((Path(args.model_dir) / "config.json").read_text())
     plans = plan_layers(raw)[2:4]
     if tuple(p.mode for p in plans) != ("c2a_full", "c2a_reuse"):
@@ -72,7 +79,8 @@ def prepare(args, topology, module):
             raise ValueError(f"lib/checkpoint compressed RoPE mismatch: {source}")
     # Fresh first-chunk history at layer 2, private pages per DP group.
     pages = (topology.capacity + 127) // 128
-    step = ForwardStep("prefill", tuple(RequestSlice(str(g), g, 0, 0, tuple(row[:group_counts[g]].tolist()),
+    step = ForwardStep("prefill", tuple(RequestSlice(str(g), g, 0, starts[g],
+                       tuple(row[starts[g]:starts[g] + group_counts[g]].tolist()),
                        topology.capacity, {"window": tuple(range(pages)), "cmp": tuple(range(pages))})
                        for g, row in enumerate(ids) if group_counts[g]), 1)
     tables = precompute_rope_tables(topology.capacity, False)
@@ -84,8 +92,10 @@ def prepare(args, topology, module):
         mode = plan.mode.removeprefix("c2a_")
         values = {s.name: s.create_tensor().contiguous() for s in module.build_specs(fixture, mode, {})
                   if isinstance(s, TensorSpec)}
-        print(f"Loading real checkpoint layer {plan.layer_id}", flush=True)
-        aw, mw = load_prefill_layer_weights(args.model_dir, plan.layer_id, topology)
+        if plan.layer_id not in weight_bundles:
+            print(f"Loading real checkpoint layer {plan.layer_id}", flush=True)
+            weight_bundles[plan.layer_id] = load_prefill_layer_weights(args.model_dir, plan.layer_id, topology)
+        aw, mw = weight_bundles[plan.layer_id]
         values.update(aw, x_hc=residual, pre_mix=mix)
         values["num_tokens"] = torch.tensor(global_counts, dtype=torch.int32).reshape(-1, 1)
         window = prepare_swa_window_metadata(step, topology, cache_pages=values["window_cache"].shape[1])
@@ -127,6 +137,8 @@ def main():
     parser.add_argument("--devices", default="0,1,2,3")
     parser.add_argument("--tp", type=int, default=2)
     parser.add_argument("--group-counts", help="Comma-separated causal prefix lengths per DP group")
+    parser.add_argument("--continue-to-capacity", action="store_true",
+                        help="Run a second chunk of each nonempty request using its resident caches")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--build-dir", default="build_output/v41-c2a-chain")
     parser.add_argument("--artifact-dir", default=".validation-artifacts/c2a-chain")
@@ -147,14 +159,29 @@ def main():
     torch.set_num_threads(4)
     _, moe_module = load_segment_modules(args.lib_root, topology)
     from models.deepseek_v4_1_flash import prefill_c2a_full as c2a
-    plans, attention, moe, residual, mix = prepare(args, topology, c2a)
-    bound = bind_prefill_producers(plans, attention)
+    chunks = [(args.group_counts, [0] * topology.dp)]
+    if args.continue_to_capacity:
+        remaining = [topology.capacity - n if n else 0 for n in args.group_counts]
+        if not any(remaining):
+            raise ValueError("continuation requires an unfinished nonempty request")
+        chunks.append((remaining, list(args.group_counts)))
+    prepared, weights = [], {}
+    for counts, starts in chunks:
+        options = SimpleNamespace(**{**vars(args), "group_counts": counts, "starts": starts})
+        plans, attention, moe, residual, mix = prepare(options, topology, c2a, weights)
+        if prepared:
+            for plan in plans:
+                for name in c2a.ATTENTION_STATE[plan.mode.removeprefix("c2a_")]:
+                    if "cache" in name:
+                        attention[plan.layer_id][name] = prepared[0][0][plan.layer_id][name]
+        prepared.append((bind_prefill_producers(plans, attention), moe, residual, mix, counts))
     from pypto_serving.model.deepseek_v41.prefill_segment import PREFILL_ARGUMENTS
     dynamic = {"attention_epoch", "num_tokens"}
-    for plan in plans:
-        for name in PREFILL_ARGUMENTS[plan.mode]:
-            if name not in dynamic:
-                assert isinstance(bound[plan.layer_id][name], torch.Tensor), name
+    for bound, *_ in prepared:
+        for plan in plans:
+            for name in PREFILL_ARGUMENTS[plan.mode]:
+                if name not in dynamic:
+                    assert isinstance(bound[plan.layer_id][name], torch.Tensor), name
     print("REAL CHECKPOINT C2A PREPARATION PASS", flush=True)
     if args.prepare_only:
         return
@@ -174,15 +201,19 @@ def main():
     programs, ffn = compile_prefill_segments(compiler, args.lib_root, topology, [p.mode for p in plans])
     ac = torch.zeros(topology.world, 1, dtype=torch.int32).share_memory_()
     mc = torch.zeros(topology.world, dtype=torch.int32).share_memory_()
-    captured = {}
-    for plan in plans:
-        layer = plan.layer_id
-        names = ("attn_input", "attn_output", "next_pre_mix", "x_hc_out") + c2a.ATTENTION_STATE[
-            plan.mode.removeprefix("c2a_")]
-        captured[layer] = ({n: torch.empty_like(bound[layer][n]).share_memory_() for n in names},
-                          {n: torch.empty_like(moe[layer][n]).share_memory_()
-                           for n in ("x_next", "next_pre_mix", "x_mixed")})
-    sources = [v for maps in (bound, moe) for values in maps.values() for v in values.values()]
+    captures = []
+    for bound, moe, *_ in prepared:
+        captured = {}
+        for plan in plans:
+            layer = plan.layer_id
+            names = ("attn_input", "attn_output", "next_pre_mix", "x_hc_out") + c2a.ATTENTION_STATE[
+                plan.mode.removeprefix("c2a_")]
+            captured[layer] = ({n: torch.empty_like(bound[layer][n]).share_memory_() for n in names},
+                              {n: torch.empty_like(moe[layer][n]).share_memory_()
+                               for n in ("x_next", "next_pre_mix", "x_mixed")})
+        captures.append(captured)
+    sources = [v for bound, moe, *_ in prepared for maps in (bound, moe)
+               for values in maps.values() for v in values.values()]
     with make_segment_worker([*programs.values(), ffn], config, sources) as worker:
         uploaded = {}
         def upload(values):
@@ -194,55 +225,63 @@ def main():
                     uploaded[id(value)] = worker.alloc_stacked_tensor(value)
                 result[name] = uploaded[id(value)]
             return result
-        da = {layer: upload(values) for layer, values in bound.items()}
-        dm = {layer: upload(values) for layer, values in moe.items()}
+        device_steps = [({layer: upload(values) for layer, values in bound.items()},
+                         {layer: upload(values) for layer, values in moe.items()})
+                        for bound, moe, *_ in prepared]
         runner = PrefillSegment(worker, programs, ffn, topology, ac, mc, config)
-        runner.run_chain(LayerState(da[2]["x_hc"], da[2]["pre_mix"], "tp_local_token"),
-                         plans, da, dm, group_counts=args.group_counts)
-        for layer, (ca, cm) in captured.items():
-            for device, host in ((da[layer], ca), (dm[layer], cm)):
-                for name, destination in host.items():
-                    worker.copy_stacked_from(device[name], destination)
+        for step_id, ((da, dm), captured) in enumerate(zip(device_steps, captures)):
+            runner.run_chain(LayerState(da[2]["x_hc"], da[2]["pre_mix"], "tp_local_token"),
+                             plans, da, dm, group_counts=prepared[step_id][4])
+            for layer, (ca, cm) in captured.items():
+                for device, host in ((da[layer], ca), (dm[layer], cm)):
+                    for name, destination in host.items():
+                        worker.copy_stacked_from(device[name], destination)
+            print(f"C2A DEVICE CHUNK {step_id} COMPLETE", flush=True)
         for handle in reversed(list(uploaded.values())):
             worker.free_stacked_tensor(handle)
     # CPU same-input references run only after worker shutdown. Device state
     # never depends on these diagnostic readbacks or reference results.
     records, passed = [], True
-    for plan in plans:
-        layer, mode = plan.layer_id, plan.mode.removeprefix("c2a_")
-        actual_a, actual_m = captured[layer]
-        inputs = dict(bound[layer], x_hc=residual, pre_mix=mix)
-        if mode == "reuse":
-            for name in ("compressed_cache", "compressed_cache_scale"):
-                inputs[name] = captured[2][0][name]
-            inputs["compressed_indices"] = captured[2][0]["topk_indices"]
-        initial_cache = {n: inputs[n].clone() for n in c2a.MODES[mode][1]}
-        expected_a = dict(inputs)
-        for name in actual_a:
-            expected_a[name] = inputs[name].clone()
-        c2a.make_golden(mode, 1)(expected_a)
-        expected_m = dict(moe[layer], x_hc=actual_a["x_hc_out"], pre_mix=actual_a["next_pre_mix"])
-        for name in actual_m:
-            expected_m[name] = moe[layer][name].clone()
-        moe_module.golden_moe(expected_m)
-        mc_check = {
-            "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-            "x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            "x_next": moe_module._local_mhc_compare(list(topology.counts(args.group_counts)[1])),
-        }
-        for label, actual, expected, checks in (("attention", actual_a, expected_a,
-                c2a.make_compare(mode, 1, initial_cache)), ("moe", actual_m, expected_m, mc_check)):
-            results = {}
-            for name, check in checks.items():
-                ok, detail = check(actual[name], expected[name], inputs=expected,
-                    actual_outputs=actual, expected_outputs=expected, rtol=1e-3, atol=1e-3)
-                print(f"NATIVE STAGE layer={layer} {label}.{name}: {ok} {detail}", flush=True)
-                results[name] = (bool(ok), detail)
-                passed &= bool(ok)
-            records.append(dict(layer=layer, stage=label, results=results, actual=actual,
-                                expected={n: expected[n] for n in actual}))
-        residual, mix = actual_m["x_next"], actual_m["next_pre_mix"]
-    torch.save({"input_state": str(args.input_state), "group_counts": args.group_counts, "stages": records,
+    for step_id, ((bound, moe, residual, mix, counts), captured) in enumerate(zip(prepared, captures)):
+        for plan in plans:
+            layer, mode = plan.layer_id, plan.mode.removeprefix("c2a_")
+            actual_a, actual_m = captured[layer]
+            inputs = dict(bound[layer], x_hc=residual, pre_mix=mix)
+            if step_id:
+                for name, value in captures[step_id - 1][layer][0].items():
+                    if "cache" in name:
+                        inputs[name] = value
+            if mode == "reuse":
+                for name in ("compressed_cache", "compressed_cache_scale"):
+                    inputs[name] = captured[2][0][name]
+                inputs["compressed_indices"] = captured[2][0]["topk_indices"]
+            initial_cache = {n: inputs[n].clone() for n in c2a.MODES[mode][1]}
+            expected_a = dict(inputs)
+            for name in actual_a:
+                expected_a[name] = inputs[name].clone()
+            c2a.make_golden(mode, 1)(expected_a)
+            expected_m = dict(moe[layer], x_hc=actual_a["x_hc_out"], pre_mix=actual_a["next_pre_mix"])
+            for name in actual_m:
+                expected_m[name] = moe[layer][name].clone()
+            moe_module.golden_moe(expected_m)
+            mc_check = {
+                "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+                "x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+                "x_next": moe_module._local_mhc_compare(list(topology.counts(counts)[1])),
+            }
+            for label, actual, expected, checks in (("attention", actual_a, expected_a,
+                    c2a.make_compare(mode, 1, initial_cache)), ("moe", actual_m, expected_m, mc_check)):
+                results = {}
+                for name, check in checks.items():
+                    ok, detail = check(actual[name], expected[name], inputs=expected,
+                        actual_outputs=actual, expected_outputs=expected, rtol=1e-3, atol=1e-3)
+                    print(f"NATIVE STAGE chunk={step_id} layer={layer} {label}.{name}: {ok} {detail}", flush=True)
+                    results[name] = (bool(ok), detail)
+                    passed &= bool(ok)
+                records.append(dict(chunk=step_id, layer=layer, stage=label, results=results, actual=actual,
+                                    expected={n: expected[n] for n in actual}))
+            residual, mix = actual_m["x_next"], actual_m["next_pre_mix"]
+    torch.save({"input_state": str(args.input_state), "group_counts": args.group_counts, "chunks": chunks, "stages": records,
                 "actual_residual": residual, "actual_pre_mix": mix}, artifact / "comparison.pt")
     if not passed:
         raise AssertionError("C2A chain native stage check failed; see comparison.pt")
