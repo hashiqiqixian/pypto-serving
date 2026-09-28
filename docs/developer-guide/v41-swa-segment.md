@@ -195,3 +195,17 @@ RoPE instead of fixture history/angles, saving all request inputs for exact
 CPU replay. It currently exercises one full first chunk per DP group; it is
 not a continuation, generation or complete backend acceptance test. Keep the
 historical fixture failures separate from results on this changed workload.
+
+`prefill_segment.PrefillSegment` extends the same device handoff to the audited
+C2A Full/Reuse and C1A Full/Reindex/Reuse SP entry signatures. It calls existing
+lib composites, with caller-supplied weights, metadata, scratch and caches.
+C1A uses `prefill_c1a_sp.make_program`, preserving TP-local residuals. Each
+compiled Attention program has its own retained-window epoch, while one shared
+MoE program advances every layer. Missing arguments are rejected before either
+half-layer runs. A failed dispatch poisons the entire worker.
+
+This dispatch support is not full-model readiness: real compressed-cache
+allocation/lowering, producer bindings and device numerical validation remain
+required. `tools/compile_v41_prefill_segments.py --lib-root ... --modes c2a_full`
+provides an explicit compilation-only check without allocating devices. All
+programs must be registered with the same persistent worker before execution.

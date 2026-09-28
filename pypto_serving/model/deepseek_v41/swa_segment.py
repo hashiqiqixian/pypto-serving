@@ -152,6 +152,7 @@ class SwaSegment:
         self.attention_counts, self.moe_counts = attention_counts, moe_counts
         self.run_config = run_config
         self._epoch = 0
+        self._attention_epochs = {}
         self._failed = False
 
     def _check_state(self, state):
@@ -173,13 +174,20 @@ class SwaSegment:
         Request packing, RoPE, page mapping and cache initialization are owned
         by the caller and must use the same contiguous group/slab ordering.
         """
+        return self._run_layer(state, attention, moe, group_counts=group_counts,
+                               attention_program=self.programs[0], argument_names=ATTENTION_ARGS,
+                               input_mix="incoming_pre_mix", output_residual="output")
+
+    def _run_layer(self, state, attention, moe, *, group_counts, attention_program,
+                   argument_names, input_mix, output_residual):
+        """Dispatch an audited TP-local Attention ABI and the shared MoE entry."""
         if self._failed:
             raise RuntimeError("segment dispatch failed; close this worker before attempting recovery")
         self._check_state(state)
         group, local = self.topology.counts(group_counts)
-        a = dict(attention, x_hc=state.residual, incoming_pre_mix=state.pre_mix,
-                 num_tokens=self.attention_counts)
-        attention_state = LayerState(a["output"], a["next_pre_mix"], "tp_local_token")
+        a = dict(attention, x_hc=state.residual, num_tokens=self.attention_counts)
+        a[input_mix] = state.pre_mix
+        attention_state = LayerState(a[output_residual], a["next_pre_mix"], "tp_local_token")
         m = dict(moe, x_hc=attention_state.residual, pre_mix=attention_state.pre_mix,
                  num_tokens=self.moe_counts)
         result = LayerState(m["x_next"], m["next_pre_mix"], "tp_local_token")
@@ -197,20 +205,26 @@ class SwaSegment:
                     raise ValueError("input and half-layer outputs must not alias")
                 seen.add(key)
         epoch = self._epoch + 1
-        if epoch > (2**31 - 1) // 2:
+        program_key = id(attention_program.compiled)
+        attention_epoch = self._attention_epochs.get(program_key, 0) + 1
+        if max(epoch, attention_epoch) > (2**31 - 1) // 2:
             raise OverflowError("communication epoch exhausted; recreate worker")
-        a["attention_epoch"] = m["moe_epoch"] = ctypes.c_int32(epoch)
+        # Each compiled Attention owns separate retained signal windows. A
+        # mode's first call must use epoch 1 even after another mode ran.
+        a["attention_epoch"] = ctypes.c_int32(attention_epoch)
+        m["moe_epoch"] = ctypes.c_int32(epoch)
         # Resolve all arguments before the first collective: a missing MoE
         # weight must not leave an already-mutated Attention cache behind.
-        a_args = [a[name] for name in ATTENTION_ARGS]
+        a_args = [a[name] for name in argument_names]
         m_args = [m[name] for name in MOE_ARGS]
         self._check_weights(m)
         for rank, (global_n, local_n) in enumerate(zip(group, local)):
             self.attention_counts[rank, 0] = global_n
             self.moe_counts[rank] = local_n
         self._epoch = epoch
+        self._attention_epochs[program_key] = attention_epoch
         try:
-            self.worker.run(self.programs[0].compiled, *a_args, config=self.run_config)
+            self.worker.run(attention_program.compiled, *a_args, config=self.run_config)
             self.worker.run(self.programs[1].compiled, *m_args, config=self.run_config)
         except BaseException:
             self._failed = True

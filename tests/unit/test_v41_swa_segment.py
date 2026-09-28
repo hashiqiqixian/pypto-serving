@@ -18,6 +18,7 @@ from pypto_serving.model.deepseek_v41.composite import LayerState
 from pypto_serving.model.deepseek_v41.swa_segment import (
     ATTENTION_ARGS, MOE_ARGS, SegmentTopology, SwaSegment, make_segment_worker,
 )
+from pypto_serving.model.deepseek_v41.prefill_segment import PREFILL_ARGUMENTS, PrefillSegment
 
 
 @pytest.mark.parametrize("counts,expected", [
@@ -73,6 +74,47 @@ def test_device_handle_handoff_and_next_layer(monkeypatch):
     assert segment.worker.run.call_args_list[2].args[1] is first.residual
     assert segment.worker.run.call_args_list[2].args[-1].value == 2
     assert segment.moe_counts.tolist() == [16, 3]
+
+
+def test_switching_attention_modes_keeps_per_program_epochs(monkeypatch):
+    base, state, a, m = fixture(monkeypatch)
+    programs = {mode: SimpleNamespace(compiled=object()) for mode in ("swa", "c2a_full", "c1a_reindex")}
+    segment = PrefillSegment(base.worker, programs, base.programs[1], base.topology,
+                             base.attention_counts, base.moe_counts, None)
+    # The scratch/output allocations are owned and distinct for each half-layer.
+    original = state
+    sequence = ("swa", "swa", "c2a_full", "c1a_reindex", "c2a_full", "swa")
+    for mode in sequence:
+        args = dict.fromkeys(PREFILL_ARGUMENTS[mode])
+        args.update(output=a["output"], x_hc_out=a["output"], next_pre_mix=a["next_pre_mix"])
+        result = segment.run_layer(state, args, m, group_counts=[16, 3], mode=mode)
+        last = segment.worker.run.call_args_list[-2:]
+        assert last[0].args[0] is programs[mode].compiled
+        assert last[0].args[1] is state.residual
+        assert last[0].args[2] is state.pre_mix
+        assert last[1].args[1] is a["output"]
+        assert result.residual is m["x_next"]
+        m.update(x_next=state.residual, next_pre_mix=state.pre_mix)
+        state = result
+    calls = segment.worker.run.call_args_list
+    assert [c.args[-1].value for c in calls[::2]] == [1, 2, 1, 1, 2, 3]
+    assert [c.args[-1].value for c in calls[1::2]] == [1, 2, 3, 4, 5, 6]
+    assert original.layout == "tp_local_token"
+
+
+def test_missing_compressed_metadata_fails_before_mutating_any_cache(monkeypatch):
+    base, state, a, m = fixture(monkeypatch)
+    segment = PrefillSegment(base.worker, {"c2a_full": base.programs[0]}, base.programs[1],
+                             base.topology, base.attention_counts, base.moe_counts, None)
+    args = dict.fromkeys(PREFILL_ARGUMENTS["c2a_full"])
+    args.update(x_hc_out=a["output"], next_pre_mix=a["next_pre_mix"])
+    del args["state_block_table"]
+    with pytest.raises(KeyError, match="state_block_table"):
+        segment.run_layer(state, args, m, group_counts=[16, 0], mode="c2a_full")
+    with pytest.raises(ValueError, match="not compiled"):
+        segment.run_layer(state, args, m, group_counts=[16, 0], mode="c1a_full")
+    assert not segment.worker.run.called
+    assert segment._epoch == 0 and segment._attention_epochs == {}
 
 
 def test_failed_dispatch_poisoned(monkeypatch):
