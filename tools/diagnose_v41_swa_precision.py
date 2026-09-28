@@ -82,6 +82,7 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--trace-attention", action="store_true",
                         help="Use the saved full-reference replay to bisect layer-1 rank-0 attention")
+    parser.add_argument("--trace-layer", type=int, choices=(0, 1), default=1)
     parser.add_argument("--cut-after", type=int, choices=(0, 1, 2),
                         help="Restart the CPU reference from a saved device boundary; diagnostic only")
     args = parser.parse_args()
@@ -101,12 +102,13 @@ def main():
          if isinstance(s, TensorSpec)}
     if args.trace_attention:
         full = torch.load(args.output, map_location="cpu", weights_only=True)
-        print("Loading layer 1 for attention trace", flush=True)
-        aw, unused_moe = load_swa_layer_weights(args.model_dir, 1, topology)
+        layer = args.trace_layer
+        print(f"Loading layer {layer} for attention trace", flush=True)
+        aw, unused_moe = load_swa_layer_weights(args.model_dir, layer, topology)
         del unused_moe
-        traces = trace_attention(swa, dict(a, **aw), saved["stages"][2]["actual"]["hidden"][0],
-                                 full[2]["expected"]["hidden"][0])
-        torch.save(traces, str(args.output) + ".attention-trace.pt")
+        traces = trace_attention(swa, dict(a, **aw), saved["stages"][2 * layer]["actual"]["hidden"][0],
+                                 full[2 * layer]["expected"]["hidden"][0])
+        torch.save(traces, str(args.output) + f".attention-trace-layer{layer}.pt")
         return
     residual, mix = a["x_hc"], a["incoming_pre_mix"]
     records = []
