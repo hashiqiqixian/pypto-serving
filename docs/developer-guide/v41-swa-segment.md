@@ -70,8 +70,11 @@ The reference runs only after the device worker
 closes, never supplies intermediate device inputs, and shares read-only weights
 with the device path. Final actual/expected residual and pre_mix are saved to
 `--artifact-dir/comparison.pt` even when the numerical comparison fails. The
-residual gate uses lib's local MoE relative-error comparator; pre_mix uses
-rtol=0.01 and atol=0.0001. A completed smoke is not a numerical pass.
+residual gate defaults to `--residual-profile dsv4-layer`: the DSV4 complete-layer
+comparator `ratio_reldiff(diff_thd=0.01, pct_thd=0.05)`, applied separately to each
+rank. `--residual-profile v41-local` retains the historical V4.1 single-MoE
+comparator (0.003/2%, with its single-point cap). Pre_mix retains rtol=0.01 and
+atol=0.0001; local stage gates are unchanged. A completed smoke is not a numerical pass.
 
 The real-weight TP2/DP2/EP4 diagnostic exhausted the temporary heap at both
 512 MiB and 1024 MiB per ring. With 4096 MiB per ring, both device layers and
@@ -93,7 +96,7 @@ check still failed with the errors above. Agreement on each stage's actual input
 does not establish the accumulated numerical budget across layers; that boundary
 still needs validation before full-model acceptance.
 
-The baseline embedding controls also fail the unchanged accumulated gate, while
+Under the historical `v41-local` profile, the baseline embedding controls fail the accumulated gate, while
 their 18 native half-layer checks pass:
 
 | Initial state | Rank-zero outliers | Residual relative L2 | Pre-mix relative L2 |
@@ -114,14 +117,23 @@ control. Routing changes alone therefore do not explain the chain failure.
 
 For precision bisection, follow lib's `docs/debug-and-tune/precision-tuning.md`
 and PyPTO's `docs/en/user/precision/00-workflow.md`. Check dtype, rounding and
-reference operation order before changing kernels. The full-chain gate currently
-reuses a single-MoE comparator; it is not an agreed model-wide error budget.
+reference operation order before changing kernels. The historical full-chain gate
+reused a single-MoE comparator; it was not an agreed model-wide error budget.
 Report relative L2, maximum absolute error and outlier fraction separately, and
-retain the existing failing gate while the accumulated contract is unresolved.
+retain the historical results when changing acceptance profiles.
 FP8 trace comparisons decode payloads with their own scales; different encoding
 pairs can represent identical values. Local checks on actual device inputs and
 CPU boundary substitutions only localize errors, never replace full-chain
 acceptance or supply intermediate values to device execution.
+
+Rechecking those same saved tensors with `dsv4-layer` passes residual on every
+rank. Worst-rank outlier fractions are 3.3542% (random streams), 0.02167%
+(sequential embeddings), and 0.12879% (text embeddings), below the 5% budget.
+This is a requested acceptance-profile change, not reduced numerical error.
+Pre_mix still fails in 14/256, 30/256 and 24/256 entries respectively, so the
+overall diagnostic still fails. DSV4's layer comparison is not an independent
+43-layer accuracy guarantee, and it does not specify V4.1's delayed pre_mix
+contract. These results do not establish complete model or M0 acceptance.
 
 To recheck a saved final comparison without compiling or allocating devices:
 

@@ -37,10 +37,40 @@ def test_saved_comparison_keeps_all_acceptance_gates(failure):
     moe = SimpleNamespace(_local_mhc_compare=lambda counts: comparator)
     topology = SimpleNamespace(local_capacity=2, world=1)
     if failure is None:
-        compare_saved(data, moe, topology)
+        compare_saved(data, moe, topology, "v41-local")
     else:
         with pytest.raises(AssertionError):
-            compare_saved(data, moe, topology)
+            compare_saved(data, moe, topology, "v41-local")
+
+
+@pytest.mark.parametrize("failure", [None, "rank", "pre_mix", "stage"])
+def test_dsv4_profile_keeps_per_rank_and_auxiliary_gates(monkeypatch, failure):
+    import sys
+
+    calls = []
+    def factory(**settings):
+        assert settings == {"diff_thd": 0.01, "pct_thd": 0.05}
+        def comparator(actual, expected, **kwargs):
+            calls.append(actual.shape)
+            return torch.equal(actual, expected), "rank mismatch"
+        return comparator
+    monkeypatch.setitem(sys.modules, "golden.validation", SimpleNamespace(ratio_reldiff=factory))
+    actual = torch.ones(2, 2, 4, 3)
+    data = {"actual_residual": actual, "expected_residual": actual.clone(),
+            "actual_pre_mix": torch.ones(2, 2, 4), "expected_pre_mix": torch.ones(2, 2, 4)}
+    if failure == "rank":
+        actual[1].add_(1)
+    elif failure == "pre_mix":
+        data["actual_pre_mix"].add_(1)
+    elif failure == "stage":
+        data["stages"] = [{"results": {"output": (False, "stage mismatch")}}]
+    topology = SimpleNamespace(local_capacity=2, world=2)
+    if failure is None:
+        compare_saved(data, None, topology)
+    else:
+        with pytest.raises(AssertionError):
+            compare_saved(data, None, topology)
+    assert calls == [(2, 4, 3), (2, 4, 3)]
 
 
 def test_quantization_probe_compares_values_instead_of_payload_codes():

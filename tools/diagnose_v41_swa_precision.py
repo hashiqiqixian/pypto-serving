@@ -105,6 +105,7 @@ def main():
     parser.add_argument("--reference-fp64-attention", action="store_true",
                         help="Diagnostic reference sensitivity only; keep the original gate result")
     parser.add_argument("--trace-layer", type=int, choices=(0, 1), default=1)
+    parser.add_argument("--residual-profile", choices=("dsv4-layer", "v41-local"), default="dsv4-layer")
     parser.add_argument("--cut-after", type=int, choices=(0, 1, 2),
                         help="Restart the CPU reference from a saved device boundary; diagnostic only")
     args = parser.parse_args()
@@ -177,7 +178,7 @@ def main():
         result = {"actual_residual": saved["actual_residual"], "expected_residual": residual,
                   "actual_pre_mix": saved["actual_pre_mix"], "expected_pre_mix": mix}
         torch.save(result, str(args.output) + f".cut-{args.cut_after}.pt")
-        compare_saved(result, moe, topology)
+        compare_saved(result, moe, topology, args.residual_profile)
         return
     if args.reference_fp64_attention:
         from validate_v41_swa_segment import compare_saved
@@ -185,7 +186,7 @@ def main():
         result = {"actual_residual": saved["actual_residual"], "expected_residual": residual,
                   "actual_pre_mix": saved["actual_pre_mix"], "expected_pre_mix": mix}
         torch.save(result, str(args.output) + ".fp64-attention.pt")
-        compare_saved(result, moe, topology)
+        compare_saved(result, moe, topology, args.residual_profile)
         return
     print("Replay matches saved reference:", torch.equal(residual, saved["expected_residual"]),
           torch.equal(mix, saved["expected_pre_mix"]), flush=True)

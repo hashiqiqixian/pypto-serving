@@ -80,24 +80,38 @@ def compare_stages(layers, captured, initial, swa, moe, topology):
     return records
 
 
-def compare_saved(data, moe, topology):
-    """Apply unchanged lib budgets to live or saved post-run outputs on CPU."""
+def compare_saved(data, moe, topology, residual_profile="dsv4-layer"):
+    """Apply the selected residual budget, retaining pre-mix and local-stage gates."""
     import torch
 
     actual = data["actual_residual"]
     expected = data["expected_residual"]
+    if actual.shape != expected.shape or actual.shape[0] != topology.world:
+        raise ValueError("residual shapes must match and contain every logical rank")
     for name in ("residual", "pre_mix"):
         a, e = data["actual_" + name].double(), data["expected_" + name].double()
         error = a - e
         print(f"{name}: rel_l2={(error.norm() / e.norm().clamp_min(1e-12)).item():.8g} "
               f"max_abs={error.abs().max().item():.8g}", flush=True)
     counts = [topology.local_capacity] * topology.world
-    compare = moe._local_mhc_compare(counts)
-    ok, message = compare(
-        actual, expected, actual_outputs={"x_next": actual}, expected_outputs={"x_next": expected},
-        inputs={"num_tokens": torch.tensor(counts, dtype=torch.int32)}, rtol=1e-5, atol=1e-5,
-    )
-    print("Final residual reference check:", ok, message, flush=True)
+    kwargs = dict(actual_outputs={"x_next": actual}, expected_outputs={"x_next": expected},
+                  inputs={"num_tokens": torch.tensor(counts, dtype=torch.int32)}, rtol=1e-5, atol=1e-5)
+    if residual_profile == "v41-local":
+        ok, message = moe._local_mhc_compare(counts)(actual, expected, **kwargs)
+    elif residual_profile == "dsv4-layer":
+        from golden.validation import ratio_reldiff
+
+        compare = ratio_reldiff(diff_thd=0.01, pct_thd=0.05)
+        results = []
+        for rank, count in enumerate(counts):
+            passed, detail = compare(actual[rank, :count], expected[rank, :count], **kwargs)
+            print(f"Final residual rank={rank} profile={residual_profile}: {passed} {detail}", flush=True)
+            results.append((passed, detail))
+        ok = all(passed for passed, _ in results)
+        message = "\n".join(detail for passed, detail in results if not passed)
+    else:
+        raise ValueError(f"Unknown residual profile: {residual_profile}")
+    print(f"Final residual reference check ({residual_profile}):", ok, message, flush=True)
     mix_error = None
     try:
         torch.testing.assert_close(data["actual_pre_mix"], data["expected_pre_mix"], rtol=1e-2, atol=1e-4)
@@ -126,6 +140,8 @@ def main():
     parser.add_argument("--stage-reference", action="store_true",
                         help="Also localize errors on each half-layer's device input, after the full run")
     parser.add_argument("--compare-only", help="Recheck a saved comparison.pt on CPU without compilation/device use")
+    parser.add_argument("--residual-profile", choices=("dsv4-layer", "v41-local"), default="dsv4-layer",
+                        help="DSV4 layer residual budget (0.01/5%%), or the historical V4.1 local MoE budget")
     parser.add_argument("--dump-tagged", action="store_true",
                         help="Enable selective runtime dumps from a separately instrumented lib checkout")
     parser.add_argument("--artifact-dir", default=".validation-artifacts/swa-segment")
@@ -156,7 +172,8 @@ def main():
     topology = SegmentTopology(tp=args.tp, dp=len(devices) // args.tp)
     if args.compare_only:
         _, moe = load_segment_modules(args.lib_root, topology)
-        compare_saved(torch.load(args.compare_only, map_location="cpu", weights_only=True), moe, topology)
+        compare_saved(torch.load(args.compare_only, map_location="cpu", weights_only=True), moe, topology,
+                      args.residual_profile)
         return
     config = RunConfig(platform="a5", distributed_config=DistributedConfig(device_ids=devices),
                        ring_heap=args.ring_heap_mib << 20, ring_task_window=131072, ring_dep_pool=131072,
@@ -288,7 +305,7 @@ def main():
             data["stages"] = compare_stages(layers, captured, (a["x_hc"], a["incoming_pre_mix"]),
                                             swa, moe, topology)
             torch.save(data, artifact / "comparison.pt")
-        compare_saved(data, moe, topology)
+        compare_saved(data, moe, topology, args.residual_profile)
 
 
 if __name__ == "__main__":
