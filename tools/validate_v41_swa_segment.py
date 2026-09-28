@@ -199,6 +199,18 @@ def main():
         for layer_id, (da, dm) in enumerate(device_layers):
             state = runner.run_layer(state, da, dm, group_counts=[topology.capacity] * topology.dp)
             print(f"Device layer {layer_id} complete", flush=True)
+            if args.dump_tagged:
+                # Preserve completed runtime dumps before the next dispatch reuses its path.
+                import shutil
+
+                destination = Path(args.artifact_dir) / f"layer-{layer_id}-dumps"
+                for manifest in Path(args.build_dir).rglob("args_dump.json"):
+                    relative = manifest.parent.relative_to(Path(args.build_dir))
+                    target = destination / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if target.exists():
+                        raise FileExistsError(f"Refusing to overwrite diagnostic dumps: {target}")
+                    shutil.move(str(manifest.parent), str(target))
         worker.copy_stacked_from(state.residual, readback)
         worker.copy_stacked_from(state.pre_mix, mix_readback)
         # Read only after both layers finish; never feed diagnostic state back.
