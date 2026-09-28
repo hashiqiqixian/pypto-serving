@@ -33,7 +33,7 @@ smoke checks completion and finite/nonzero outputs, not numerical acceptance.
 CPU dispatch tests use a mocked worker and do not establish NPU correctness.
 
 This segment does not enable `load_composite_bindings()` for complete serving:
-checkpoint-to-resident bundle assembly, input initialization, all attention
+production resident bundle management, input initialization, all attention
 modes, decode, cache lifecycle and the final output boundary still need adapters
 and validation. Engram is excluded. Full TP4/DP2/EP8 8K-to-128 M0 is not claimed.
 
@@ -52,7 +52,7 @@ state against composed Torch references:
 ```bash
 PYTHONPATH=. python tools/validate_v41_swa_segment.py \
   --lib-root /path/to/current/pypto-lib --tp 2 --devices 0,1,2,3 \
-  --model-dir /path/to/DeepSeek-V4.1-Flash --reference
+  --model-dir /path/to/DeepSeek-V4.1-Flash --reference --ring-heap-mib 4096
 ```
 
 The diagnostic uses controlled activations and request metadata, including in
@@ -63,3 +63,25 @@ with the device path. Final actual/expected residual and pre_mix are saved to
 `--artifact-dir/comparison.pt` even when the numerical comparison fails. The
 residual gate uses lib's local MoE relative-error comparator; pre_mix uses
 rtol=0.01 and atol=0.0001. A completed smoke is not a numerical pass.
+
+The real-weight TP2/DP2/EP4 diagnostic exhausted the temporary heap at both
+512 MiB and 1024 MiB per ring. With 4096 MiB per ring, both device layers and
+their Torch references completed. This runtime has four rings, so a per-ring
+setting is not the total allocation; check device headroom before running.
+The saved final outputs did not pass the numerical gate (residual relative L2
+about 0.00760, pre_mix about 0.00105). These are diagnostic observations, not
+an accepted end-to-end tolerance or a production memory recommendation.
+
+`--stage-reference` also captures each half-layer's outputs after the entire
+device chain completes, and applies lib's stage comparators to references
+computed on that half-layer's actual input. This localizes accumulated errors;
+it does not replace the independent end-to-end check or feed CPU values back
+to the device. The final check still determines success.
+
+To recheck a saved final comparison without compiling or allocating devices:
+
+```bash
+PYTHONPATH=. python tools/validate_v41_swa_segment.py \
+  --lib-root /path/to/current/pypto-lib --tp 2 --devices 0,1,2,3 \
+  --compare-only /path/to/comparison.pt
+```
