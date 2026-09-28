@@ -130,3 +130,20 @@ def test_loader_budget_is_preserved(embedding_checkpoint):
 def test_invalid_limits(embedding_checkpoint, options):
     with pytest.raises(ValueError, match="positive integer"):
         lookup_token_embeddings(embedding_checkpoint[0], torch.tensor([0]), **options)
+
+def test_segment_embedding_control_has_identity_hc_state(embedding_checkpoint):
+    from types import SimpleNamespace
+    from tools.validate_v41_swa_segment import prepare_checkpoint_inputs
+
+    loaders, table = embedding_checkpoint
+    topology = SimpleNamespace(tp=2, dp=1, world=2, capacity=4, local_capacity=2)
+    tensors = {"x_hc": torch.empty(2, 2, 4, 32),
+               "incoming_pre_mix": torch.full((2, 2, 4), 17.0)}
+    ids = prepare_checkpoint_inputs(tensors, loaders[0].model_dir, topology)
+    expected = table[ids].reshape(2, 2, 32).float()
+    collapsed = (tensors["x_hc"] * tensors["incoming_pre_mix"].unsqueeze(-1)).sum(2)
+    assert torch.equal(collapsed, expected)
+    assert torch.equal(tensors["x_hc"][:, :, 3], expected)
+    assert tensors["x_hc"].dtype == torch.float32 and tensors["x_hc"].is_contiguous()
+    tensors["x_hc"][0, 0, 0].zero_()
+    assert torch.equal(tensors["x_hc"][0, 0, 1], expected[0, 0])

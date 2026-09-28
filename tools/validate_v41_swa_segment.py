@@ -20,6 +20,25 @@ ATTENTION_OUTPUTS = ("output", "next_pre_mix", "hidden", "attn_out", "window_cac
 MOE_OUTPUTS = ("x_next", "next_pre_mix", "x_mixed")
 
 
+def prepare_checkpoint_inputs(tensors, model_dir, topology):
+    """Prepare an embedding-broadcast control; retain the random stress fixture separately."""
+    import torch
+    from pypto_serving.model.deepseek_v41.input_preparation import lookup_token_embeddings
+    from pypto_serving.model.deepseek_v41.weight_loader import V41WeightLoader
+
+    loaders = [V41WeightLoader(model_dir, tp_size=topology.tp, tp_rank=rank,
+                              ep_size=topology.world, ep_rank=rank, max_load_bytes=512 << 20)
+               for rank in range(topology.tp)]
+    ids = torch.arange(1, topology.dp * topology.capacity + 1, dtype=torch.int64).reshape(
+        topology.dp, topology.capacity)
+    embeddings = lookup_token_embeddings(loaders, ids)
+    rows = embeddings.reshape(topology.world, topology.local_capacity, -1)
+    tensors["x_hc"] = rows.unsqueeze(2).expand_as(tensors["x_hc"]).float().contiguous()
+    tensors["incoming_pre_mix"].zero_()
+    tensors["incoming_pre_mix"][..., 0] = 1
+    return ids
+
+
 def compare_stages(layers, captured, initial, swa, moe, topology):
     """Localize errors against each half-layer's actual input, after execution."""
     from golden.validation import ratio_allclose
@@ -94,6 +113,8 @@ def main():
     parser.add_argument("--tp", type=int, default=2)
     parser.add_argument("--build-dir", default="build_output/v41-swa-segment")
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--input-source", choices=("stress", "embeddings"), default="stress",
+                        help="Keep the random stress input, or load real embedding rows and broadcast HC streams")
     parser.add_argument("--model-dir", help="Use actual checkpoint weights for layers 0 and 1")
     parser.add_argument("--reference", action="store_true", help="Compare against composed Torch references")
     parser.add_argument("--stage-reference", action="store_true",
@@ -105,6 +126,8 @@ def main():
     parser.add_argument("--ring-heap-mib", type=int, default=1024,
                         help="Per-ring temporary heap; lib MoE validation uses 1024 MiB")
     args = parser.parse_args()
+    if args.input_source == "embeddings" and not args.model_dir:
+        parser.error("--input-source embeddings requires --model-dir")
     if args.stage_reference:
         args.reference = True
     sys.path.insert(0, str(Path(args.lib_root).resolve()))
@@ -144,7 +167,11 @@ def main():
         return {s.name: s.create_tensor().contiguous() for s in specs if isinstance(s, TensorSpec)}
 
     a = materialize(swa.build_hc_specs(fixture))
-    print("Attention fixture ready", flush=True)
+    token_ids = None
+    if args.input_source == "embeddings":
+        token_ids = prepare_checkpoint_inputs(a, args.model_dir, topology)
+    initial_state = {"residual": a["x_hc"].clone(), "pre_mix": a["incoming_pre_mix"].clone()}
+    print(f"Attention fixture ready: input_source={args.input_source}", flush=True)
     if args.model_dir:
         from pypto_serving.model.deepseek_v41.swa_weights import load_swa_layer_weights
 
@@ -242,7 +269,8 @@ def main():
             print(f"Torch reference layer {layer_id} complete", flush=True)
         artifact = Path(args.artifact_dir)
         artifact.mkdir(parents=True, exist_ok=True)
-        data = {"actual_residual": readback, "expected_residual": residual,
+        data = {"input_source": args.input_source, "token_ids": token_ids, "initial_state": initial_state,
+                "actual_residual": readback, "expected_residual": residual,
                 "actual_pre_mix": mix_readback, "expected_pre_mix": mix}
         torch.save(data, artifact / "comparison.pt")
         if captured:

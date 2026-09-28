@@ -108,6 +108,9 @@ def main():
                               fixture="checkpoint", dp_tokens=None, epochs=1, bench=False)
     a = {s.name: s.create_tensor().contiguous() for s in swa.build_hc_specs(fixture)
          if isinstance(s, TensorSpec)}
+    if "initial_state" in saved:
+        a["x_hc"] = saved["initial_state"]["residual"].clone()
+        a["incoming_pre_mix"] = saved["initial_state"]["pre_mix"].clone()
     if args.trace_attention:
         full = torch.load(args.output, map_location="cpu", weights_only=True)
         layer = args.trace_layer
