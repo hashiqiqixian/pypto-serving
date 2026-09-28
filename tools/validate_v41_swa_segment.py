@@ -24,6 +24,9 @@ def prepare_checkpoint_inputs(tensors, model_dir, topology, token_ids=None):
     """Prepare an embedding-broadcast control; retain the random stress fixture separately."""
     import torch
     from pypto_serving.model.deepseek_v41.input_preparation import lookup_token_embeddings
+    from pypto_serving.model.deepseek_v41.request_state import ForwardStep, RequestSlice
+    from pypto_serving.model.deepseek_v41.segment_inputs import prepare_segment_inputs
+    from pypto_serving.model.deepseek_v41.swa_segment import SegmentTopology
     from pypto_serving.model.deepseek_v41.weight_loader import V41WeightLoader
 
     if token_ids is None:
@@ -37,10 +40,16 @@ def prepare_checkpoint_inputs(tensors, model_dir, topology, token_ids=None):
                               ep_size=topology.world, ep_rank=rank, max_load_bytes=512 << 20)
                for rank in range(topology.tp)]
     embeddings = lookup_token_embeddings(loaders, ids)
-    rows = embeddings.reshape(topology.world, topology.local_capacity, -1)
-    tensors["x_hc"] = rows.unsqueeze(2).expand_as(tensors["x_hc"]).float().contiguous()
-    tensors["incoming_pre_mix"].zero_()
-    tensors["incoming_pre_mix"][..., 0] = 1
+    step = ForwardStep("prefill", tuple(
+        RequestSlice(str(group), group, 0, 0, tuple(row.tolist()), topology.capacity, {})
+        for group, row in enumerate(ids)
+    ), 1)
+    prepared = prepare_segment_inputs(
+        embeddings.flatten(0, 1), step,
+        SegmentTopology(tp=topology.tp, dp=topology.dp, local_capacity=topology.local_capacity),
+    )
+    tensors["x_hc"] = prepared.residual
+    tensors["incoming_pre_mix"] = prepared.pre_mix
     return ids
 
 

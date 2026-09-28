@@ -153,3 +153,20 @@ checks pass, but overall two-layer acceptance remains unresolved. This changes
 the acceptance budget only; numerical errors are unchanged. No new NPU run was
 performed. Evidence: `.validation-artifacts/approved-premix-budget-recheck.json`
 on the A5 validation checkout, using baseline lib `21645633`.
+
+
+`segment_inputs.prepare_segment_inputs` prepares fresh host HC input buffers
+from packed BF16 embeddings and a `ForwardStep`. Like V4 host input preparation,
+it maps request rows before device upload. The initial four FP32 lanes and
+lane-zero pre-mix follow lib `input_pack.pack_x_hc` and `golden.identity_pre_mix`
+at `fbe92bfc`. This is data packing only; it does not run mHC or normalization.
+
+Requests may interleave DP partitions. Each partition keeps its own stable
+packed order, split into contiguous TP token slabs. Returned source-row indices
+also define the mapping for positions and other token metadata; returned final
+row locations preserve the original request order for later output selection.
+Inactive rows have zero residual/pre-mix, including fully empty DP partitions.
+The helper rejects over-capacity steps before allocation instead of truncating.
+It is used by the embedding diagnostic; cache lowering, device upload and the
+complete production adapter remain separate work. Never invoke it between layers
+to overwrite the residual/pre-mix produced by the previous composite.
