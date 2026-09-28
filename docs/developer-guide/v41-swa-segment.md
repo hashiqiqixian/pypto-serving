@@ -1,4 +1,4 @@
-﻿# V4.1 bounded SWA segment
+# V4.1 bounded SWA segment
 
 `pypto_serving/model/deepseek_v41/swa_segment.py` adds the concrete half-layer
 execution boundary inspected against lib `216456332c2a74d89cca23b7824dab264ce34bff`:
@@ -36,3 +36,30 @@ This segment does not enable `load_composite_bindings()` for complete serving:
 checkpoint-to-resident bundle assembly, input initialization, all attention
 modes, decode, cache lifecycle and the final output boundary still need adapters
 and validation. Engram is excluded. Full TP4/DP2/EP8 8K-to-128 M0 is not claimed.
+
+## Real checkpoint bundles and numerical diagnostic
+
+`load_swa_layer_weights(model_dir, layer_id, topology)` returns CPU Attention
+and MoE weight maps for a SWA layer. It uses the selective checkpoint loader;
+TP projections and EP expert ownership retain their existing rules. Routed
+payloads stay packed FP4. Per-expert scales must be unpacked and repacked into
+the combined expert/K-group MX layout, not concatenated in their already packed
+order. The caller still owns upload, request metadata and cache allocation.
+
+To exercise distinct real weights for layers 0 and 1 and compare the final
+state against composed Torch references:
+
+```bash
+PYTHONPATH=. python tools/validate_v41_swa_segment.py \
+  --lib-root /path/to/current/pypto-lib --tp 2 --devices 0,1,2,3 \
+  --model-dir /path/to/DeepSeek-V4.1-Flash --reference
+```
+
+The diagnostic uses controlled activations and request metadata, including in
+checkpoint mode. It does not yet validate embedding initialization, real prompt
+semantics, Engram or generation. The reference runs only after the device worker
+closes, never supplies intermediate device inputs, and shares read-only weights
+with the device path. Final actual/expected residual and pre_mix are saved to
+`--artifact-dir/comparison.pt` even when the numerical comparison fails. The
+residual gate uses lib's local MoE relative-error comparator; pre_mix uses
+rtol=0.01 and atol=0.0001. A completed smoke is not a numerical pass.
