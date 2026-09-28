@@ -82,6 +82,8 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--trace-attention", action="store_true",
                         help="Use the saved full-reference replay to bisect layer-1 rank-0 attention")
+    parser.add_argument("--cut-after", type=int, choices=(0, 1, 2),
+                        help="Restart the CPU reference from a saved device boundary; diagnostic only")
     args = parser.parse_args()
     sys.path.insert(0, str(Path(args.lib_root).resolve()))
     import torch
@@ -109,12 +111,19 @@ def main():
     residual, mix = a["x_hc"], a["incoming_pre_mix"]
     records = []
     for layer in (0, 1):
+        if args.cut_after is not None and args.cut_after >= 2 * layer + 1:
+            cut = saved["stages"][2 * layer + 1]["actual"]
+            residual, mix = cut["x_next"], cut["next_pre_mix"]
+            continue
         print(f"Loading layer {layer}", flush=True)
         aw, mw = load_swa_layer_weights(args.model_dir, layer, topology)
         la = dict(a, **aw, x_hc=residual, incoming_pre_mix=mix)
         for name in ("output", "next_pre_mix", "hidden", "attn_out", "window_cache", "window_cache_scale"):
             la[name] = a[name].clone()
         swa.golden_prefill_swa_case(la)
+        if args.cut_after == 2 * layer:
+            cut = saved["stages"][2 * layer]["actual"]
+            la["output"], la["next_pre_mix"] = cut["output"], cut["next_pre_mix"]
         lm = dict(mw, x_hc=la["output"], pre_mix=la["next_pre_mix"],
                   next_pre_mix=torch.zeros_like(mix), x_mixed=torch.zeros_like(a["attn_out"]),
                   x_next=torch.zeros_like(residual), num_tokens=torch.full((4,), 16, dtype=torch.int32))
@@ -128,6 +137,15 @@ def main():
                             "expected": {name: expected[name].clone() for name in actual}})
         residual, mix = lm["x_next"], lm["next_pre_mix"]
         del aw, mw, la, lm
+    if args.cut_after is not None:
+        print("CUT", args.cut_after, "final residual", json.dumps(metrics(saved["actual_residual"], residual)),
+              "final pre_mix", json.dumps(metrics(saved["actual_pre_mix"], mix)), flush=True)
+        from validate_v41_swa_segment import compare_saved
+        result = {"actual_residual": saved["actual_residual"], "expected_residual": residual,
+                  "actual_pre_mix": saved["actual_pre_mix"], "expected_pre_mix": mix}
+        torch.save(result, str(args.output) + f".cut-{args.cut_after}.pt")
+        compare_saved(result, moe, topology)
+        return
     print("Replay matches saved reference:", torch.equal(residual, saved["expected_residual"]),
           torch.equal(mix, saved["expected_pre_mix"]), flush=True)
     assert torch.equal(residual, saved["expected_residual"])
