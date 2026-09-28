@@ -242,3 +242,21 @@ same-input stage comparators after worker shutdown. A native-stage pass does
 not resolve the incoming SWA accumulated error or establish a new accumulated
 four-layer acceptance standard. Source state and numerical artifacts must be
 reported with that limitation.
+
+The minimal Q-B group-32 diagnostic candidate (`cd759ce7`, based on official
+lib `fbe92bfc`) was also tested with the same real-text inputs and explicit
+request metadata, using serving `6f52516`. All native checks and all per-rank
+V4 residual checks passed, but accumulated pre_mix still failed: 3/256 elements,
+relative L2 0.0025390928 and maximum absolute error 0.0076903105. Residual
+relative L2 was 0.012873608 (maximum absolute 0.02734375). The baseline has
+7/256 pre_mix failures on this workload. This is an improvement, not an accepted
+precision fix; the candidate remains on a diagnostic branch and is not a
+production dependency. Neither reference arithmetic nor gates were changed.
+
+The request ledger retains committed full-history pages for omitted/paused
+requests until their reset succeeds. A later batch cannot borrow those pages,
+and a continuation may only append to its committed page table. Relocation or
+dropping history is rejected because no device cache-copy contract is integrated.
+Page IDs remain independent across DP partitions and cache groups. These host
+ownership checks complement per-batch metadata validation; device reset/reuse
+still requires its own validation.
