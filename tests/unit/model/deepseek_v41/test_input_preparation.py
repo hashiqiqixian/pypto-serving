@@ -147,3 +147,18 @@ def test_segment_embedding_control_has_identity_hc_state(embedding_checkpoint):
     assert tensors["x_hc"].dtype == torch.float32 and tensors["x_hc"].is_contiguous()
     tensors["x_hc"][0, 0, 0].zero_()
     assert torch.equal(tensors["x_hc"][0, 0, 1], expected[0, 0])
+
+
+def test_segment_embedding_control_preserves_supplied_dp_tokens(embedding_checkpoint):
+    from types import SimpleNamespace
+    from tools.validate_v41_swa_segment import prepare_checkpoint_inputs
+
+    loaders, table = embedding_checkpoint
+    topology = SimpleNamespace(tp=2, dp=1, world=2, capacity=4, local_capacity=2)
+    tensors = {"x_hc": torch.empty(2, 2, 4, 32), "incoming_pre_mix": torch.empty(2, 2, 4)}
+    ids = prepare_checkpoint_inputs(tensors, loaders[0].model_dir, topology, [[255, 1, 128, 255]])
+    assert ids.tolist() == [[255, 1, 128, 255]]
+    assert torch.equal(tensors["x_hc"][:, :, 0], table[ids].reshape(2, 2, 32).float())
+    for invalid in ([[1, 2]], [[1.0, 2.0, 3.0, 4.0]], [[True] * 4]):
+        with pytest.raises(ValueError, match="full integer token row"):
+            prepare_checkpoint_inputs(tensors, loaders[0].model_dir, topology, invalid)

@@ -20,17 +20,22 @@ ATTENTION_OUTPUTS = ("output", "next_pre_mix", "hidden", "attn_out", "window_cac
 MOE_OUTPUTS = ("x_next", "next_pre_mix", "x_mixed")
 
 
-def prepare_checkpoint_inputs(tensors, model_dir, topology):
+def prepare_checkpoint_inputs(tensors, model_dir, topology, token_ids=None):
     """Prepare an embedding-broadcast control; retain the random stress fixture separately."""
     import torch
     from pypto_serving.model.deepseek_v41.input_preparation import lookup_token_embeddings
     from pypto_serving.model.deepseek_v41.weight_loader import V41WeightLoader
 
+    if token_ids is None:
+        ids = torch.arange(1, topology.dp * topology.capacity + 1, dtype=torch.int64).reshape(
+            topology.dp, topology.capacity)
+    else:
+        ids = torch.as_tensor(token_ids)
+        if ids.dtype not in (torch.int32, torch.int64) or ids.shape != (topology.dp, topology.capacity):
+            raise ValueError("token_ids must contain exactly one full integer token row per DP group")
     loaders = [V41WeightLoader(model_dir, tp_size=topology.tp, tp_rank=rank,
                               ep_size=topology.world, ep_rank=rank, max_load_bytes=512 << 20)
                for rank in range(topology.tp)]
-    ids = torch.arange(1, topology.dp * topology.capacity + 1, dtype=torch.int64).reshape(
-        topology.dp, topology.capacity)
     embeddings = lookup_token_embeddings(loaders, ids)
     rows = embeddings.reshape(topology.world, topology.local_capacity, -1)
     tensors["x_hc"] = rows.unsqueeze(2).expand_as(tensors["x_hc"]).float().contiguous()
@@ -115,6 +120,7 @@ def main():
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--input-source", choices=("stress", "embeddings"), default="stress",
                         help="Keep the random stress input, or load real embedding rows and broadcast HC streams")
+    parser.add_argument("--token-ids", help="JSON array [DP, capacity] of embedding control IDs; no padding")
     parser.add_argument("--model-dir", help="Use actual checkpoint weights for layers 0 and 1")
     parser.add_argument("--reference", action="store_true", help="Compare against composed Torch references")
     parser.add_argument("--stage-reference", action="store_true",
@@ -128,6 +134,8 @@ def main():
     args = parser.parse_args()
     if args.input_source == "embeddings" and not args.model_dir:
         parser.error("--input-source embeddings requires --model-dir")
+    if args.token_ids and args.input_source != "embeddings":
+        parser.error("--token-ids requires --input-source embeddings")
     if args.stage_reference:
         args.reference = True
     sys.path.insert(0, str(Path(args.lib_root).resolve()))
@@ -169,7 +177,10 @@ def main():
     a = materialize(swa.build_hc_specs(fixture))
     token_ids = None
     if args.input_source == "embeddings":
-        token_ids = prepare_checkpoint_inputs(a, args.model_dir, topology)
+        import json
+
+        supplied_ids = json.loads(Path(args.token_ids).read_text(encoding="utf-8")) if args.token_ids else None
+        token_ids = prepare_checkpoint_inputs(a, args.model_dir, topology, supplied_ids)
     initial_state = {"residual": a["x_hc"].clone(), "pre_mix": a["incoming_pre_mix"].clone()}
     print(f"Attention fixture ready: input_source={args.input_source}", flush=True)
     if args.model_dir:
