@@ -99,6 +99,8 @@ def main():
     parser.add_argument("--stage-reference", action="store_true",
                         help="Also localize errors on each half-layer's device input, after the full run")
     parser.add_argument("--compare-only", help="Recheck a saved comparison.pt on CPU without compilation/device use")
+    parser.add_argument("--dump-tagged", action="store_true",
+                        help="Enable selective runtime dumps from a separately instrumented lib checkout")
     parser.add_argument("--artifact-dir", default=".validation-artifacts/swa-segment")
     parser.add_argument("--ring-heap-mib", type=int, default=1024,
                         help="Per-ring temporary heap; lib MoE validation uses 1024 MiB")
@@ -126,7 +128,8 @@ def main():
         compare_saved(torch.load(args.compare_only, map_location="cpu", weights_only=True), moe, topology)
         return
     config = RunConfig(platform="a5", distributed_config=DistributedConfig(device_ids=devices),
-                       ring_heap=args.ring_heap_mib << 20, ring_task_window=131072, ring_dep_pool=131072)
+                       ring_heap=args.ring_heap_mib << 20, ring_task_window=131072, ring_dep_pool=131072,
+                       enable_dump_args=1 if args.dump_tagged else 0)
     compiler = KernelCompiler(run_config=config, cache_dir=args.build_dir)
     programs = compile_segment(compiler, args.lib_root, topology)
     print("COMPILE PASS", flush=True)
