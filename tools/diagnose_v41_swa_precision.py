@@ -119,7 +119,7 @@ def main():
     import torch
     from golden.spec import TensorSpec
     from pypto_serving.model.deepseek_v41.swa_segment import SegmentTopology, load_segment_modules
-    from pypto_serving.model.deepseek_v41.swa_weights import load_swa_layer_weights
+    from pypto_serving.model.deepseek_v41.swa_weights import load_prefill_attention_weights, load_swa_layer_weights
 
     torch.set_num_threads(4)
     topology = SegmentTopology(tp=2, dp=2)
@@ -161,8 +161,7 @@ def main():
         layer = args.trace_layer
         rank = args.trace_rank
         print(f"Loading layer {layer}, rank {rank} for attention trace", flush=True)
-        aw, unused_moe = load_swa_layer_weights(args.model_dir, layer, topology)
-        del unused_moe
+        aw = load_prefill_attention_weights(args.model_dir, layer, topology)
         traces = trace_attention(swa, dict(a, **aw), saved["stages"][2 * layer]["actual"]["hidden"][rank],
                                  full[2 * layer]["expected"]["hidden"][rank], rank=rank)
         suffix = f"-rank{rank}" if rank else ""

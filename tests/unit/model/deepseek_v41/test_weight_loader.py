@@ -159,6 +159,25 @@ def test_wo_a_group_dequantization(checkpoint):
     assert result.scale is None
 
 
+def test_attention_only_bundle_does_not_open_expert_payloads(checkpoint):
+    from pypto_serving.model.deepseek_v41.swa_segment import SegmentTopology
+    from pypto_serving.model.deepseek_v41.swa_weights import load_prefill_attention_weights
+
+    path, _, tensors = checkpoint
+    index_path = path / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    for name in index["weight_map"]:
+        if ".ffn." in name or "hc_ffn" in name or ".ffn_norm." in name:
+            index["weight_map"][name] = "unavailable-experts.safetensors"
+    index_path.write_text(json.dumps(index))
+    result = load_prefill_attention_weights(path, 0, SegmentTopology(tp=2, dp=1))
+    assert result["wq_b"].shape == (2, 256, 256)
+    assert result["index_wq_b"].shape == (2, 256, 256)
+    assert torch.equal(result["hc_attn_fn"][0], tensors["layers.0.hc_attn_fn"])
+    with pytest.raises(ValueError, match="budget"):
+        load_prefill_attention_weights(path, 0, SegmentTopology(tp=2, dp=1), max_bundle_bytes=1)
+
+
 def test_dense_promotions_and_transpose(checkpoint):
     path, _, tensors = checkpoint
     loader = V41WeightLoader(path)

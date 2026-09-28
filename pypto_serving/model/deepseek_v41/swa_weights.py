@@ -73,7 +73,18 @@ def load_prefill_layer_weights(model_dir, layer_id, topology, *, max_bundle_byte
     return _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, swa_only=False)
 
 
-def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_only):
+def load_prefill_attention_weights(model_dir, layer_id, topology, *, max_bundle_bytes=4 << 30):
+    """Read only Attention weights for isolated tracing or bounded preparation.
+
+    Uses the identical packing/placement as the complete layer bundle. In
+    particular, an Attention probe must not read all routed expert payloads.
+    """
+    attention, _ = _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes,
+                                       swa_only=False, include_moe=False)
+    return attention
+
+
+def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_only, include_moe=True):
     if type(max_bundle_bytes) is not int or max_bundle_bytes <= 0:
         raise ValueError("max_bundle_bytes must be positive")
     attention, moe = [], []
@@ -124,6 +135,9 @@ def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_
             bundle = load("attn.indexer.wq_b.weight")
             a["index_wq_b"], a["index_wq_b_scale"] = bundle.weight, bundle.scale
             a["index_weights_proj"] = load("attn.indexer.weights_proj.weight").weight
+        attention.append(a)
+        if not include_moe:
+            continue
         for target, source in {
             "hc_ffn_fn": "hc_ffn_fn", "hc_ffn_scale": "hc_ffn_scale", "hc_ffn_base": "hc_ffn_base",
             "norm_weight": "ffn_norm.weight", "gate_weight": "ffn.gate.weight",
@@ -140,7 +154,6 @@ def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_
             m["routed_" + name + "_scale"] = merge_expert_scales([b.scale for b in bundles])
             del bundles
         m["mxfp4_pair_lut"] = mxfp4_pair_lut()
-        attention.append(a)
         moe.append(m)
     return ({name: stack_bytes([r[name] for r in attention]) for name in attention[0]},
-            {name: stack_bytes([r[name] for r in moe]) for name in moe[0]})
+            {name: stack_bytes([r[name] for r in moe]) for name in moe[0]} if moe else {})
