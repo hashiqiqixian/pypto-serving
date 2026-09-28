@@ -23,6 +23,46 @@ class SwaWindowMetadata:
     group_counts: tuple[int, ...]
 
 
+def gather_swa_rope_rows(
+    metadata: SwaWindowMetadata,
+    tables: tuple[torch.Tensor, torch.Tensor],
+    *,
+    max_prepare_bytes: int = 16 << 20,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather lib-built FP32 SWA tables in the same order as cache metadata.
+
+    Like V4, the executor builds tables with the selected lib's host helper.
+    This boundary only selects rows; it does not implement model-side RoPE.
+    Padding receives identity rotation and does not index the table.
+    """
+    if not isinstance(metadata, SwaWindowMetadata) or len(tables) != 2:
+        raise ValueError("SWA RoPE requires metadata and a cosine/sine table pair")
+    positions, slots = metadata.positions, metadata.window_slots
+    if (positions.device.type != "cpu" or positions.dtype != torch.int64 or positions.ndim != 2
+            or slots.device.type != "cpu" or slots.dtype != torch.int64 or slots.shape != positions.shape):
+        raise ValueError("SWA positions and slots must be matching CPU INT64 matrices")
+    cos, sin = tables
+    if any(not isinstance(t, torch.Tensor) or t.device.type != "cpu" or t.dtype != torch.float32
+           or t.layout != torch.strided or t.ndim != 2 for t in tables):
+        raise ValueError("SWA RoPE tables must be CPU FP32 matrices")
+    if cos.shape != sin.shape or min(cos.shape) <= 0:
+        raise ValueError("SWA cosine/sine tables must have matching nonempty shapes")
+    estimate = positions.numel() * (cos.shape[1] * 4 * 4 + 32)
+    if type(max_prepare_bytes) is not int or max_prepare_bytes <= 0 or estimate > max_prepare_bytes:
+        raise ValueError("SWA RoPE preparation exceeds its allocation budget")
+    active = slots >= 0
+    selected = positions[active]
+    if bool(((selected < 0) | (selected >= cos.shape[0])).any()):
+        raise ValueError("active SWA position is outside the RoPE table")
+    selected_cos, selected_sin = cos[selected], sin[selected]
+    if not bool(torch.isfinite(selected_cos).all() and torch.isfinite(selected_sin).all()):
+        raise ValueError("selected SWA RoPE rows must be finite")
+    shape = (*positions.shape, cos.shape[1])
+    rows_cos, rows_sin = torch.ones(shape, dtype=torch.float32), torch.zeros(shape, dtype=torch.float32)
+    rows_cos[active], rows_sin[active] = selected_cos, selected_sin
+    return rows_cos, rows_sin
+
+
 def prepare_swa_window_metadata(
     step: ForwardStep,
     topology: SegmentTopology,

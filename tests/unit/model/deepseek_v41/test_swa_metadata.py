@@ -12,7 +12,7 @@ import torch
 
 from pypto_serving.model.deepseek_v41.request_state import ForwardStep, RequestSlice
 from pypto_serving.model.deepseek_v41.segment_inputs import prepare_segment_inputs
-from pypto_serving.model.deepseek_v41.swa_metadata import prepare_swa_window_metadata
+from pypto_serving.model.deepseek_v41.swa_metadata import gather_swa_rope_rows, prepare_swa_window_metadata
 from pypto_serving.model.deepseek_v41.swa_segment import SegmentTopology
 
 
@@ -73,3 +73,30 @@ def test_small_budget_is_rejected():
     with pytest.raises(ValueError, match="budget"):
         prepare_swa_window_metadata(ForwardStep("prefill", (request(),), 1), TOPOLOGY,
                                     cache_pages=8, max_prepare_bytes=1)
+
+
+def test_rope_rows_use_absolute_positions_and_identity_padding():
+    step = ForwardStep("prefill", (request("b", 1, 126, 2), request("a", 0, 3, 1, (2,))), 1)
+    metadata = prepare_swa_window_metadata(step, TOPOLOGY, cache_pages=8)
+    angles = torch.arange(130, dtype=torch.float32)[:, None] * torch.tensor([[1., .1]])
+    cos, sin = gather_swa_rope_rows(metadata, (angles.cos(), angles.sin()))
+    for rank, positions in enumerate(([3], [3], [126, 127], [126, 127])):
+        torch.testing.assert_close(cos[rank, :len(positions)], angles[positions].cos(), rtol=0, atol=0)
+        torch.testing.assert_close(sin[rank, :len(positions)], angles[positions].sin(), rtol=0, atol=0)
+        assert (cos[rank, len(positions):] == 1).all()
+        assert (sin[rank, len(positions):] == 0).all()
+
+
+@pytest.mark.parametrize("case,match", [("short", "outside"), ("nan", "finite"),
+                                       ("dtype", "FP32"), ("budget", "budget")])
+def test_rope_rejects_invalid_active_rows(case, match):
+    metadata = prepare_swa_window_metadata(ForwardStep("prefill", (request(),), 1), TOPOLOGY, cache_pages=8)
+    cos, sin = torch.ones(130, 2), torch.zeros(130, 2)
+    if case == "short":
+        cos, sin = cos[:129], sin[:129]
+    if case == "nan":
+        sin[129, 0] = float("nan")
+    if case == "dtype":
+        cos = cos.bfloat16()
+    with pytest.raises(ValueError, match=match):
+        gather_swa_rope_rows(metadata, (cos, sin), max_prepare_bytes=1 if case == "budget" else 16 << 20)

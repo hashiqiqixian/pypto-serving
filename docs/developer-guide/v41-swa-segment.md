@@ -185,3 +185,13 @@ interleaved requests, padding and empty partitions. It does not allocate or clea
 the cache or choose a RoPE profile. Its positions must select the corresponding
 checkpoint RoPE rows before dispatch. Integration into a complete model adapter
 and device validation of that lifecycle remain pending.
+
+`gather_swa_rope_rows` selects FP32 rows from the lib-built SWA tables using
+those absolute positions, with identity rotation for padding. Like V4's
+executor, model-specific table generation stays in the selected lib helper.
+The diagnostic's optional `--request-metadata` requires embedding inputs and
+a checkpoint. It uses fresh private request pages, empty caches and checkpoint
+RoPE instead of fixture history/angles, saving all request inputs for exact
+CPU replay. It currently exercises one full first chunk per DP group; it is
+not a continuation, generation or complete backend acceptance test. Keep the
+historical fixture failures separate from results on this changed workload.

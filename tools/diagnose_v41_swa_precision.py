@@ -150,6 +150,8 @@ def main():
     if "initial_state" in saved:
         a["x_hc"] = saved["initial_state"]["residual"].clone()
         a["incoming_pre_mix"] = saved["initial_state"]["pre_mix"].clone()
+    if saved.get("request_inputs") is not None:
+        a.update({name: value.clone() for name, value in saved["request_inputs"].items()})
     if args.trace_attention:
         full = torch.load(args.output, map_location="cpu", weights_only=True)
         layer = args.trace_layer

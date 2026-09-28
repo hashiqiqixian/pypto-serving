@@ -18,6 +18,35 @@ import sys
 
 ATTENTION_OUTPUTS = ("output", "next_pre_mix", "hidden", "attn_out", "window_cache", "window_cache_scale")
 MOE_OUTPUTS = ("x_next", "next_pre_mix", "x_mixed")
+REQUEST_INPUTS = ("rope_cos", "rope_sin", "window_slots", "window_indices", "window_cache", "window_cache_scale")
+
+
+def prepare_checkpoint_metadata(tensors, model_dir, topology, token_ids):
+    """First-chunk request metadata with checkpoint RoPE and private empty pages."""
+    import json
+    import torch
+    from models.deepseek_v4_1_flash.rope_tables import precompute_rope_tables
+    from pypto_serving.model.deepseek_v41.request_state import ForwardStep, RequestSlice
+    from pypto_serving.model.deepseek_v41.swa_metadata import gather_swa_rope_rows, prepare_swa_window_metadata
+
+    text = json.loads((Path(model_dir) / "config.json").read_text())["text_config"]
+    pages = (topology.capacity + 127) // 128
+    step = ForwardStep("prefill", tuple(
+        RequestSlice(str(group), group, 0, 0, tuple(row.tolist()), topology.capacity,
+                     {"window": tuple(range(pages))})
+        for group, row in enumerate(token_ids)
+    ), 1)
+    # Keep fixture allocation shapes to isolate addressing/positions from compilation.
+    metadata = prepare_swa_window_metadata(step, topology, cache_pages=tensors["window_cache"].shape[1])
+    rope_config = SimpleNamespace(qk_rope_head_dim=int(text["qk_rope_head_dim"]),
+                                  rope_theta=float(text["rope_theta"]))
+    tables = precompute_rope_tables(topology.capacity, False, config=rope_config)
+    tensors["rope_cos"], tensors["rope_sin"] = gather_swa_rope_rows(metadata, tables)
+    tensors["window_slots"], tensors["window_indices"] = metadata.window_slots, metadata.window_indices
+    tensors["window_cache"].view(torch.uint8).zero_()
+    # UE8M0 code 127 represents scale 1 for unpublished zero cache payloads.
+    tensors["window_cache_scale"].view(torch.uint8).fill_(127)
+    return {name: tensors[name].clone() for name in REQUEST_INPUTS}
 
 
 def prepare_checkpoint_inputs(tensors, model_dir, topology, token_ids=None):
@@ -145,6 +174,8 @@ def main():
     parser.add_argument("--input-source", choices=("stress", "embeddings"), default="stress",
                         help="Keep the random stress input, or load real embedding rows and broadcast HC streams")
     parser.add_argument("--token-ids", help="JSON array [DP, capacity] of embedding control IDs; no padding")
+    parser.add_argument("--request-metadata", action="store_true",
+                        help="Use fresh private request pages and checkpoint RoPE with embedding inputs")
     parser.add_argument("--model-dir", help="Use actual checkpoint weights for layers 0 and 1")
     parser.add_argument("--reference", action="store_true", help="Compare against composed Torch references")
     parser.add_argument("--stage-reference", action="store_true",
@@ -158,6 +189,8 @@ def main():
     parser.add_argument("--ring-heap-mib", type=int, default=1024,
                         help="Per-ring temporary heap; lib MoE validation uses 1024 MiB")
     args = parser.parse_args()
+    if args.request_metadata and (args.input_source != "embeddings" or not args.model_dir):
+        parser.error("--request-metadata requires --input-source embeddings and --model-dir")
     if args.input_source == "embeddings" and not args.model_dir:
         parser.error("--input-source embeddings requires --model-dir")
     if args.token_ids and args.input_source != "embeddings":
@@ -208,6 +241,8 @@ def main():
 
         supplied_ids = json.loads(Path(args.token_ids).read_text(encoding="utf-8")) if args.token_ids else None
         token_ids = prepare_checkpoint_inputs(a, args.model_dir, topology, supplied_ids)
+    request_inputs = prepare_checkpoint_metadata(a, args.model_dir, topology, token_ids) if (
+        args.request_metadata) else None
     initial_state = {"residual": a["x_hc"].clone(), "pre_mix": a["incoming_pre_mix"].clone()}
     print(f"Attention fixture ready: input_source={args.input_source}", flush=True)
     if args.model_dir:
@@ -308,6 +343,7 @@ def main():
         artifact = Path(args.artifact_dir)
         artifact.mkdir(parents=True, exist_ok=True)
         data = {"input_source": args.input_source, "token_ids": token_ids, "initial_state": initial_state,
+                "request_inputs": request_inputs,
                 "actual_residual": readback, "expected_residual": residual,
                 "actual_pre_mix": mix_readback, "expected_pre_mix": mix}
         torch.save(data, artifact / "comparison.pt")
