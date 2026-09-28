@@ -104,6 +104,8 @@ def main():
                         help="Use the saved full-reference replay to bisect layer-1 rank-0 attention")
     parser.add_argument("--reference-fp64-attention", action="store_true",
                         help="Diagnostic reference sensitivity only; keep the original gate result")
+    parser.add_argument("--reference-fp64-linear", action="store_true",
+                        help="Accumulate quantized attention projections in FP64 for diagnosis only")
     parser.add_argument("--trace-layer", type=int, choices=(0, 1), default=1)
     parser.add_argument("--residual-profile", choices=("dsv4-layer", "v41-local"), default="dsv4-layer")
     parser.add_argument("--cut-after", type=int, choices=(0, 1, 2),
@@ -124,6 +126,18 @@ def main():
         original_reference = decode_attn_swa.official_reference
         decode_attn_swa.official_reference = lambda tensors: original_reference(
             tensors, attention_dtype=torch.float64)
+    if args.reference_fp64_linear:
+        from models.deepseek_v4_1_flash import decode_attn_swa
+
+        def wide_linear(x, weight, packed_scale, fp32=False):
+            payload, codes = decode_attn_swa.official_quantize(x)
+            scale_a = decode_attn_swa.decode_e8m0(codes).double().repeat_interleave(32, -1)
+            scale_b = decode_attn_swa.decode_e8m0(
+                decode_attn_swa.unpack_mx_b_scale(packed_scale)).double().repeat_interleave(32, 0)
+            result = ((payload.double() * scale_a) @ (weight.double() * scale_b)).float()
+            return result if fp32 else result.bfloat16()
+
+        decode_attn_swa.official_linear = wide_linear
     saved = torch.load(args.saved, map_location="cpu", weights_only=True)
     fixture = SimpleNamespace(tokens=32, requests=1, dp=2, seed=11, case="normal",
                               fixture="checkpoint", dp_tokens=None, epochs=1, bench=False)
@@ -180,12 +194,14 @@ def main():
         torch.save(result, str(args.output) + f".cut-{args.cut_after}.pt")
         compare_saved(result, moe, topology, args.residual_profile)
         return
-    if args.reference_fp64_attention:
+    if args.reference_fp64_attention or args.reference_fp64_linear:
         from validate_v41_swa_segment import compare_saved
 
         result = {"actual_residual": saved["actual_residual"], "expected_residual": residual,
                   "actual_pre_mix": saved["actual_pre_mix"], "expected_pre_mix": mix}
-        torch.save(result, str(args.output) + ".fp64-attention.pt")
+        suffix = ".fp64-linear" if args.reference_fp64_linear else ""
+        suffix += ".fp64-attention" if args.reference_fp64_attention else ""
+        torch.save(result, str(args.output) + suffix + ".pt")
         compare_saved(result, moe, topology, args.residual_profile)
         return
     print("Replay matches saved reference:", torch.equal(residual, saved["expected_residual"]),
