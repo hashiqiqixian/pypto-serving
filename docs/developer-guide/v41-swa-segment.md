@@ -231,3 +231,14 @@ argument names and compiled modes are checked before the first dispatch.
 The caller still owns allocation, step metadata, reset and buffer lifetime.
 Unit tests cover the checkpoint's 40-layer producer plan; this is not evidence
 of 40-layer device execution or numerical acceptance.
+
+`tools/validate_v41_c2a_chain.py` continues a saved fresh-request embedding
+diagnostic through checkpoint layers 2/3 (C2A Full, packed-FP4 MoE, C2A Reuse,
+packed-FP4 MoE). It uses the request metadata helpers, empty layer-owned caches,
+checkpoint-compatible lib RoPE tables and resident producer bindings.
+`--prepare-only` checks real-weight host preparation without allocating devices.
+The device path retains each stage's outputs and applies the existing lib
+same-input stage comparators after worker shutdown. A native-stage pass does
+not resolve the incoming SWA accumulated error or establish a new accumulated
+four-layer acceptance standard. Source state and numerical artifacts must be
+reported with that limitation.
