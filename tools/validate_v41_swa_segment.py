@@ -6,10 +6,10 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Synthetic A5 smoke of serving SWA -> MoE -> next-layer SWA/MoE.
+"""A5 two-layer SWA/MoE diagnostic with optional checkpoint weights/reference.
 
-This is not real-checkpoint validation or numerical acceptance. Lib fixture
-builders are used only here, never by the serving segment implementation.
+Activations and request metadata are controlled fixtures, including when real
+checkpoint weights are selected. This is not text-generation acceptance.
 """
 import argparse
 from pathlib import Path
@@ -24,6 +24,9 @@ def main():
     parser.add_argument("--tp", type=int, default=2)
     parser.add_argument("--build-dir", default="build_output/v41-swa-segment")
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--model-dir", help="Use actual checkpoint weights for layers 0 and 1")
+    parser.add_argument("--reference", action="store_true", help="Compare against composed Torch references")
+    parser.add_argument("--artifact-dir", default=".validation-artifacts/swa-segment")
     args = parser.parse_args()
     sys.path.insert(0, str(Path(args.lib_root).resolve()))
     import torch
@@ -57,51 +60,92 @@ def main():
         return {s.name: s.create_tensor().contiguous() for s in specs if isinstance(s, TensorSpec)}
 
     a = materialize(swa.build_hc_specs(fixture))
-    print("Attention fixture ready; preparing packed-FP4 expert weights", flush=True)
-    m = materialize(moe.build_tensor_specs([16] * topology.world))
-    print("MoE fixture ready", flush=True)
+    print("Attention fixture ready", flush=True)
+    if args.model_dir:
+        from pypto_serving.model.deepseek_v41.swa_weights import load_swa_layer_weights
+
+        layers = []
+        for layer_id in (0, 1):
+            print(f"Loading real checkpoint layer {layer_id}", flush=True)
+            aw, mw = load_swa_layer_weights(args.model_dir, layer_id, topology)
+            layer_a = dict(a, **aw)
+            layer_m = dict(mw, next_pre_mix=torch.zeros_like(a["next_pre_mix"]),
+                           x_mixed=torch.zeros_like(a["attn_out"]), x_next=torch.zeros_like(a["output"]),
+                           num_tokens=torch.full((topology.world,), 16, dtype=torch.int32))
+            layers.append((layer_a, layer_m))
+    else:
+        print("Preparing synthetic packed-FP4 experts", flush=True)
+        m = materialize(moe.build_tensor_specs([16] * topology.world))
+        layers = [(a, m), (dict(a), dict(m))]
+    # Independent output/scratch/cache per layer, even with tied fixture weights.
+    for index, (la, lm) in enumerate(layers):
+        if index:
+            for name in ("window_cache", "window_cache_scale", "output", "next_pre_mix", "hidden", "attn_out"):
+                la[name] = la[name].clone()
+            for name in ("next_pre_mix", "x_mixed", "x_next"):
+                lm[name] = lm[name].clone()
     ac = torch.zeros(topology.world, 1, dtype=torch.int32).share_memory_()
     mc = torch.zeros(topology.world, dtype=torch.int32).share_memory_()
-    readback = torch.empty_like(m["x_next"]).share_memory_()
-    mix_readback = torch.empty_like(m["next_pre_mix"]).share_memory_()
-    sources = [*a.values(), *m.values()]
+    readback = torch.empty_like(layers[-1][1]["x_next"]).share_memory_()
+    mix_readback = torch.empty_like(layers[-1][1]["next_pre_mix"]).share_memory_()
+    sources = [v for pair in layers for mapping in pair for v in mapping.values()]
+    print("Weights ready; executing two-layer device segment", flush=True)
     with make_segment_worker(programs, config, sources) as worker:
-        allocations = []
+        allocations, uploaded = [], {}
 
         def upload(values):
             result = {}
             for name, value in values.items():
                 if name == "num_tokens":
                     continue
-                device = worker.alloc_stacked_tensor(value)
-                allocations.append(device)
-                result[name] = device
+                if id(value) not in uploaded:
+                    device = worker.alloc_stacked_tensor(value)
+                    allocations.append(device)
+                    uploaded[id(value)] = device
+                result[name] = uploaded[id(value)]
             return result
 
-        da, dm = upload(a), upload(m)
-        state = LayerState(da.pop("x_hc"), da.pop("incoming_pre_mix"), "tp_local_token")
-        dm.pop("x_hc")
-        dm.pop("pre_mix")
-        # Diagnostic uses tied synthetic weights but independent layer caches.
-        second_a = dict(da)
-        for name in ("window_cache", "window_cache_scale"):
-            second_a[name] = worker.alloc_stacked_tensor(a[name])
-            allocations.append(second_a[name])
+        device_layers = [(upload(la), upload(lm)) for la, lm in layers]
+        da = device_layers[0][0]
+        state = LayerState(da["x_hc"], da["incoming_pre_mix"], "tp_local_token")
         runner = SwaSegment(worker, programs, topology, ac, mc, config)
-        first = runner.run_layer(state, da, dm, group_counts=[topology.capacity] * topology.dp)
-        second_m = dict(dm, x_next=state.residual, next_pre_mix=state.pre_mix)
-        final = runner.run_layer(first, second_a, second_m,
-                                 group_counts=[topology.capacity] * topology.dp)
-        # Read back only after the full chain; no intermediate host round trip.
-        worker.copy_stacked_from(final.residual, readback)
-        worker.copy_stacked_from(final.pre_mix, mix_readback)
+        for layer_id, (da, dm) in enumerate(device_layers):
+            state = runner.run_layer(state, da, dm, group_counts=[topology.capacity] * topology.dp)
+            print(f"Device layer {layer_id} complete", flush=True)
+        worker.copy_stacked_from(state.residual, readback)
+        worker.copy_stacked_from(state.pre_mix, mix_readback)
         assert torch.isfinite(readback).all() and torch.isfinite(mix_readback).all()
         assert readback.abs().max() > 0 and mix_readback.abs().max() > 0
         assert not torch.equal(readback, a["x_hc"]), "residual was not updated"
         assert not torch.equal(mix_readback, a["incoming_pre_mix"]), "pre_mix was not updated"
-        print("DEVICE TWO-LAYER SMOKE PASS (finite/nonzero only; not numerical acceptance)", flush=True)
         for value in reversed(allocations):
             worker.free_stacked_tensor(value)
+    print("DEVICE TWO-LAYER SMOKE PASS", flush=True)
+    if args.reference:
+        # References run after worker shutdown and never feed device execution.
+        # All weight buffers are read-only; clone only mutable state/scratch.
+        residual, mix = a["x_hc"], a["incoming_pre_mix"]
+        for layer_id, (la, lm) in enumerate(layers):
+            ra = dict(la, x_hc=residual, incoming_pre_mix=mix)
+            for name in ("window_cache", "window_cache_scale", "output", "next_pre_mix", "hidden", "attn_out"):
+                ra[name] = la[name].clone()
+            swa.golden_prefill_swa_case(ra)
+            rm = dict(lm, x_hc=ra["output"], pre_mix=ra["next_pre_mix"])
+            for name in ("next_pre_mix", "x_mixed", "x_next"):
+                rm[name] = lm[name].clone()
+            moe.golden_moe(rm)
+            residual, mix = rm["x_next"], rm["next_pre_mix"]
+            print(f"Torch reference layer {layer_id} complete", flush=True)
+        artifact = Path(args.artifact_dir)
+        artifact.mkdir(parents=True, exist_ok=True)
+        torch.save({"actual_residual": readback, "expected_residual": residual,
+                    "actual_pre_mix": mix_readback, "expected_pre_mix": mix}, artifact / "comparison.pt")
+        compare = moe._local_mhc_compare([16] * topology.world)
+        ok, message = compare(readback, residual)
+        print("Final residual reference check:", ok, message, flush=True)
+        assert ok, message
+        torch.testing.assert_close(mix_readback, mix, rtol=1e-2, atol=1e-4)
+        print("TWO-LAYER TORCH REFERENCE PASS", flush=True)
 
 
 if __name__ == "__main__":
