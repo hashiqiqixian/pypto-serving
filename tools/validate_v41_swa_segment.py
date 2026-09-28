@@ -204,7 +204,7 @@ def main():
                 import shutil
 
                 destination = Path(args.artifact_dir) / f"layer-{layer_id}-dumps"
-                for manifest in Path(args.build_dir).rglob("args_dump.json"):
+                for manifest in list(Path(args.build_dir).rglob("args_dump.json")):
                     relative = manifest.parent.relative_to(Path(args.build_dir))
                     target = destination / relative
                     target.parent.mkdir(parents=True, exist_ok=True)
