@@ -18,6 +18,25 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
+def select_active_state(saved, topology, group_counts):
+    """Select causal prefixes for a ragged diagnostic, preserving the source artifact."""
+    import torch
+
+    topology.counts(group_counts)
+    residual, mix = saved["actual_residual"], saved["actual_pre_mix"]
+    if residual.shape != (topology.world, topology.local_capacity, 4, 5120) or mix.shape != residual.shape[:-1]:
+        raise ValueError("saved SWA state has incompatible topology or shape")
+    if residual.dtype != torch.float32 or mix.dtype != torch.float32:
+        raise ValueError("saved SWA state must preserve its FP32 storage")
+    if not torch.isfinite(residual).all() or not torch.isfinite(mix).all():
+        raise ValueError("saved SWA state must be finite")
+    residual, mix = residual.clone(), mix.clone()
+    for rank, count in enumerate(topology.counts(group_counts)[1]):
+        residual[rank, count:] = 0
+        mix[rank, count:] = 0
+    return residual, mix
+
+
 def prepare(args, topology, module):
     import torch
     from golden.spec import TensorSpec
@@ -35,13 +54,9 @@ def prepare(args, topology, module):
     ids = saved["token_ids"]
     if ids is None or tuple(ids.shape) != (topology.dp, topology.capacity):
         raise ValueError("saved SWA diagnostic must contain exactly the same packed token capacity")
-    residual, mix = saved["actual_residual"], saved["actual_pre_mix"]
-    if residual.shape != (topology.world, topology.local_capacity, 4, 5120) or mix.shape != residual.shape[:-1]:
-        raise ValueError("saved SWA state has incompatible topology or shape")
-    if residual.dtype != torch.float32 or mix.dtype != torch.float32:
-        raise ValueError("saved SWA state must preserve its FP32 storage")
-    if not torch.isfinite(residual).all() or not torch.isfinite(mix).all():
-        raise ValueError("saved SWA state must be finite")
+    group_counts = args.group_counts
+    global_counts, local_counts = topology.counts(group_counts)
+    residual, mix = select_active_state(saved, topology, group_counts)
     raw = json.loads((Path(args.model_dir) / "config.json").read_text())
     plans = plan_layers(raw)[2:4]
     if tuple(p.mode for p in plans) != ("c2a_full", "c2a_reuse"):
@@ -57,9 +72,9 @@ def prepare(args, topology, module):
             raise ValueError(f"lib/checkpoint compressed RoPE mismatch: {source}")
     # Fresh first-chunk history at layer 2, private pages per DP group.
     pages = (topology.capacity + 127) // 128
-    step = ForwardStep("prefill", tuple(RequestSlice(str(g), g, 0, 0, tuple(row.tolist()),
+    step = ForwardStep("prefill", tuple(RequestSlice(str(g), g, 0, 0, tuple(row[:group_counts[g]].tolist()),
                        topology.capacity, {"window": tuple(range(pages)), "cmp": tuple(range(pages))})
-                       for g, row in enumerate(ids)), 1)
+                       for g, row in enumerate(ids) if group_counts[g]), 1)
     tables = precompute_rope_tables(topology.capacity, False)
     compressed_tables = precompute_rope_tables(topology.capacity, True)
     fixture = SimpleNamespace(tokens=topology.capacity, requests=1, dp=topology.dp,
@@ -72,6 +87,7 @@ def prepare(args, topology, module):
         print(f"Loading real checkpoint layer {plan.layer_id}", flush=True)
         aw, mw = load_prefill_layer_weights(args.model_dir, plan.layer_id, topology)
         values.update(aw, x_hc=residual, pre_mix=mix)
+        values["num_tokens"] = torch.tensor(global_counts, dtype=torch.int32).reshape(-1, 1)
         window = prepare_swa_window_metadata(step, topology, cache_pages=values["window_cache"].shape[1])
         values.update(window_slots=window.window_slots, window_indices=window.window_indices)
         values["window_cache"].view(torch.uint8).zero_()
@@ -99,8 +115,7 @@ def prepare(args, topology, module):
         attention[plan.layer_id] = values
         moe[plan.layer_id] = dict(mw, next_pre_mix=torch.zeros_like(mix),
             x_mixed=torch.zeros(topology.world, topology.local_capacity, 5120, dtype=torch.bfloat16),
-            x_next=torch.zeros_like(residual), num_tokens=torch.full((topology.world,),
-            topology.local_capacity, dtype=torch.int32))
+            x_next=torch.zeros_like(residual), num_tokens=torch.tensor(local_counts, dtype=torch.int32))
     return plans, attention, moe, residual, mix
 
 
@@ -111,6 +126,7 @@ def main():
     parser.add_argument("--input-state", required=True)
     parser.add_argument("--devices", default="0,1,2,3")
     parser.add_argument("--tp", type=int, default=2)
+    parser.add_argument("--group-counts", help="Comma-separated causal prefix lengths per DP group")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--build-dir", default="build_output/v41-c2a-chain")
     parser.add_argument("--artifact-dir", default=".validation-artifacts/c2a-chain")
@@ -125,6 +141,9 @@ def main():
     if args.tp <= 0 or len(set(devices)) != len(devices) or len(devices) % args.tp:
         raise ValueError("unique devices must form complete TP groups")
     topology = SegmentTopology(tp=args.tp, dp=len(devices) // args.tp)
+    args.group_counts = ([topology.capacity] * topology.dp if args.group_counts is None
+                         else [int(n) for n in args.group_counts.split(",")])
+    topology.counts(args.group_counts)
     torch.set_num_threads(4)
     _, moe_module = load_segment_modules(args.lib_root, topology)
     from models.deepseek_v4_1_flash import prefill_c2a_full as c2a
@@ -179,7 +198,7 @@ def main():
         dm = {layer: upload(values) for layer, values in moe.items()}
         runner = PrefillSegment(worker, programs, ffn, topology, ac, mc, config)
         runner.run_chain(LayerState(da[2]["x_hc"], da[2]["pre_mix"], "tp_local_token"),
-                         plans, da, dm, group_counts=[topology.capacity] * topology.dp)
+                         plans, da, dm, group_counts=args.group_counts)
         for layer, (ca, cm) in captured.items():
             for device, host in ((da[layer], ca), (dm[layer], cm)):
                 for name, destination in host.items():
@@ -209,7 +228,7 @@ def main():
         mc_check = {
             "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             "x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            "x_next": moe_module._local_mhc_compare([topology.local_capacity] * topology.world),
+            "x_next": moe_module._local_mhc_compare(list(topology.counts(args.group_counts)[1])),
         }
         for label, actual, expected, checks in (("attention", actual_a, expected_a,
                 c2a.make_compare(mode, 1, initial_cache)), ("moe", actual_m, expected_m, mc_check)):
@@ -223,7 +242,7 @@ def main():
             records.append(dict(layer=layer, stage=label, results=results, actual=actual,
                                 expected={n: expected[n] for n in actual}))
         residual, mix = actual_m["x_next"], actual_m["next_pre_mix"]
-    torch.save({"input_state": str(args.input_state), "stages": records,
+    torch.save({"input_state": str(args.input_state), "group_counts": args.group_counts, "stages": records,
                 "actual_residual": residual, "actual_pre_mix": mix}, artifact / "comparison.pt")
     if not passed:
         raise AssertionError("C2A chain native stage check failed; see comparison.pt")
