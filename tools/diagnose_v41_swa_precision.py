@@ -82,6 +82,8 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--trace-attention", action="store_true",
                         help="Use the saved full-reference replay to bisect layer-1 rank-0 attention")
+    parser.add_argument("--reference-fp64-attention", action="store_true",
+                        help="Diagnostic reference sensitivity only; keep the original gate result")
     parser.add_argument("--trace-layer", type=int, choices=(0, 1), default=1)
     parser.add_argument("--cut-after", type=int, choices=(0, 1, 2),
                         help="Restart the CPU reference from a saved device boundary; diagnostic only")
@@ -95,6 +97,12 @@ def main():
     torch.set_num_threads(4)
     topology = SegmentTopology(tp=2, dp=2)
     swa, moe = load_segment_modules(args.lib_root, topology)
+    if args.reference_fp64_attention:
+        from models.deepseek_v4_1_flash import decode_attn_swa
+
+        original_reference = decode_attn_swa.official_reference
+        decode_attn_swa.official_reference = lambda tensors: original_reference(
+            tensors, attention_dtype=torch.float64)
     saved = torch.load(args.saved, map_location="cpu", weights_only=True)
     fixture = SimpleNamespace(tokens=32, requests=1, dp=2, seed=11, case="normal",
                               fixture="checkpoint", dp_tokens=None, epochs=1, bench=False)
@@ -146,6 +154,14 @@ def main():
         result = {"actual_residual": saved["actual_residual"], "expected_residual": residual,
                   "actual_pre_mix": saved["actual_pre_mix"], "expected_pre_mix": mix}
         torch.save(result, str(args.output) + f".cut-{args.cut_after}.pt")
+        compare_saved(result, moe, topology)
+        return
+    if args.reference_fp64_attention:
+        from validate_v41_swa_segment import compare_saved
+
+        result = {"actual_residual": saved["actual_residual"], "expected_residual": residual,
+                  "actual_pre_mix": saved["actual_pre_mix"], "expected_pre_mix": mix}
+        torch.save(result, str(args.output) + ".fp64-attention.pt")
         compare_saved(result, moe, topology)
         return
     print("Replay matches saved reference:", torch.equal(residual, saved["expected_residual"]),
