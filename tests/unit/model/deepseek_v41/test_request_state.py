@@ -17,10 +17,10 @@ def item(key="a", partition=0, start=0, tokens=(4, 5), length=4, pages=(3,)):
 
 def test_slots_survive_pause_and_batch_reorder():
     ledger = RequestLedger(max_requests=2, max_seq_len=128)
-    first = ledger.begin_prefill([item("a"), item("b")])
+    first = ledger.begin_prefill([item("a"), item("b", pages=(4,))])
     slots = {r.request_id: r.state_slot for r in first.requests}
     ledger.commit(first)
-    second = ledger.begin_prefill([item("b", start=2)])
+    second = ledger.begin_prefill([item("b", start=2, pages=(4,))])
     assert second.requests[0].state_slot == slots["b"]
     assert ledger.owners["a"].slot == slots["a"]
     assert second.positions == (2, 3)
@@ -93,3 +93,45 @@ def test_decode_rejects_partial_prefill_and_unknown_requests():
     for key in ("a", "unknown"):
         with pytest.raises(ValueError, match="completed prefill"):
             ledger.begin_decode([(key, 0, 2, 7, {"window": (3,)})])
+
+
+def test_paused_request_keeps_pages_until_successful_release():
+    ledger = RequestLedger(max_requests=2, max_seq_len=128)
+    ledger.commit(ledger.begin_prefill([item("a")]))
+    free = [list(slots) for slots in ledger.free]
+    with pytest.raises(ValueError, match="another live request"):
+        ledger.begin_prefill([item("b")])
+    assert ledger.pending is None and ledger.free == free
+    assert set(ledger.owners) == {"a"}
+    ledger.release(["a"], lambda *_: None)
+    ledger.commit(ledger.begin_prefill([item("b")]))
+    assert ledger.owners["b"].pages["window"] == (3,)
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+@pytest.mark.parametrize("pages", [(9,), (), (9, 3)])
+def test_continuation_cannot_relocate_or_drop_committed_pages(phase, pages):
+    ledger = RequestLedger(max_requests=2, max_seq_len=128)
+    ledger.commit(ledger.begin_prefill([item(length=4 if phase == "prefill" else 2)]))
+    with pytest.raises(ValueError, match="preserve committed"):
+        if phase == "prefill":
+            ledger.begin_prefill([item(start=2, pages=pages)])
+        else:
+            ledger.begin_decode([("a", 0, 2, 7, {"window": pages})])
+    assert ledger.pending is None and ledger.owners["a"].length == 2
+    assert ledger.owners["a"].pages["window"] == (3,)
+
+
+def test_decode_growth_cannot_steal_an_omitted_requests_page():
+    ledger = RequestLedger(max_requests=2, max_seq_len=128)
+    ledger.commit(ledger.begin_prefill([item("a", length=2), item("b", length=2, pages=(9,))]))
+    with pytest.raises(ValueError, match="another live request"):
+        ledger.begin_decode([("a", 0, 2, 7, {"window": (3, 9)})])
+    assert ledger.pending is None and ledger.owners["a"].length == 2
+    ledger.commit(ledger.begin_decode([("a", 0, 2, 7, {"window": (3, 10)})]))
+
+
+def test_same_page_numbers_are_independent_across_dp_partitions():
+    ledger = RequestLedger(max_requests=1, max_seq_len=128)
+    ledger.commit(ledger.begin_prefill([item("a"), item("b", partition=1)]))
+    assert set(ledger.owners) == {"a", "b"}

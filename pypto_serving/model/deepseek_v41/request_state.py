@@ -76,6 +76,35 @@ class RequestLedger:
         self.epoch = 1
         self.poisoned = False
 
+    def _validate_page_ownership(self, slices):
+        """Retain full-history pages even when their owner is absent this step.
+
+        There is no cache relocation/copy contract in this adapter. Continuations
+        may append pages, but cannot replace or drop their committed prefix.
+        Validate before reserving slots or exposing an in-flight transaction.
+        """
+        occupied = {}
+        for key, owner in self.owners.items():
+            for group, pages in owner.pages.items():
+                for page in pages:
+                    occupied[owner.partition, group, page] = key
+        for request in slices:
+            owner = self.owners.get(request.request_id)
+            if owner is not None:
+                for group, previous in owner.pages.items():
+                    current = request.pages.get(group, ())
+                    if tuple(current[:len(previous)]) != tuple(previous):
+                        raise ValueError("continuation must preserve committed full-history pages")
+            for group, pages in request.pages.items():
+                if len(set(pages)) != len(pages):
+                    raise ValueError("request must not alias its own cache pages")
+                for page in pages:
+                    address = (request.partition, group, page)
+                    key = occupied.get(address)
+                    if key is not None and key != request.request_id:
+                        raise ValueError("cache page belongs to another live request")
+                    occupied[address] = request.request_id
+
     def begin_prefill(self, requests):
         """Validate the complete batch before taking ownership of any new slot.
 
@@ -114,6 +143,7 @@ class RequestLedger:
             immutable_pages = MappingProxyType({name: tuple(ids) for name, ids in pages.items()})
             slices.append(RequestSlice(key, partition, owner.slot, start, tuple(tokens),
                                        prompt_length, immutable_pages))
+        self._validate_page_ownership(slices)
         self.free = available
         self.owners.update(additions)
         self.pending = ForwardStep("prefill", tuple(slices), self.epoch)
@@ -137,6 +167,7 @@ class RequestLedger:
                 raise ValueError("decode exceeds sequence capacity")
             slices.append(RequestSlice(key, partition, owner.slot, start, (token,), owner.prompt_length,
                                        MappingProxyType({name: tuple(ids) for name, ids in pages.items()})))
+        self._validate_page_ownership(slices)
         self.pending = ForwardStep("decode", tuple(slices), self.epoch)
         return self.pending
 
