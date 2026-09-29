@@ -55,8 +55,9 @@ def bind_prefill_producers(plans, arguments):
 
     C1A's common ABI retains unused Full weights in Reindex/Reuse. Bind those
     slots to their real producer weights; never allocate placeholder weights.
-    Full/Reindex do not read compressed_indices; their own Top-K allocation is
-    a valid shape-compatible binding for that unused slot (lib fbe92bfc).
+    Keep unused index slots in separate allocations. The common C1A ABI marks
+    them writable even when a selected mode does not use them; aliasing those
+    arguments makes the runtime reject overlapping write ranges (lib fbe92bfc).
     """
     plans = tuple(plans)
     if not plans or any(not isinstance(p, LayerPlan) for p in plans):
@@ -102,9 +103,11 @@ def bind_prefill_producers(plans, arguments):
                     current[name] = kv[name]
                 current["candidate_mask"] = candidate["candidate_mask"]
                 if mode == "reuse":
-                    for name in ("index_wq_b", "index_wq_b_scale", "index_weights_proj", "topk_indices"):
+                    for name in ("index_wq_b", "index_wq_b_scale", "index_weights_proj"):
                         current[name] = index[name]
-                current["compressed_indices"] = index["topk_indices"]
+                    current["compressed_indices"] = index["topk_indices"]
+                if current["compressed_indices"] is current["topk_indices"]:
+                    raise ValueError("C1A index ABI arguments require separate allocations")
             elif mode == "reuse":
                 current["compressed_indices"] = index["topk_indices"]
         elif any(source is not None for source in (plan.kv_source, plan.index_source, plan.candidate_source)):

@@ -322,8 +322,6 @@ def main():
                     inputs["candidate_mask"] = captured[plan.candidate_source][0]["candidate_mask"]
                 if mode == "reuse":
                     inputs["compressed_indices"] = captured[plan.index_source][0]["topk_indices"]
-                    if args.family == "c1a":
-                        inputs["topk_indices"] = inputs["compressed_indices"]
             initial_cache = {n: inputs[n].clone() for n in state_names(module, mode)}
             expected_a = dict(inputs)
             for name in actual_a:

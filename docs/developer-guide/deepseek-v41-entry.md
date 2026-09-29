@@ -180,13 +180,20 @@ contract and is explicitly rejected for now. Cache payloads must not use a
 generic dense K/V substitute. The adapter must bound physical page IDs against
 actual allocated pools when a group leaves `num_blocks` unspecified.
 
-At inspected upstream lib revision `1b8caa4`, packed-FP4 MoE and token-local
-decode Attention progress do not yet provide a compatible complete-layer
-adapter. Decode `stage="block"` remains disabled; the prefill fixture still
-uses the older routed-weight/call contract. Initial residual/pre-mix, complete
-prefill/decode, cache allocation/reset and final HC/norm/head remain explicit
-integration work. These facts do not block testing the serving state machine,
-but they do block real-model generation and M0 numerical acceptance.
+At inspected upstream lib revision `fbe92bfc`, serving dispatches the existing
+sequence-parallel Attention and packed-FP4 MoE composites through
+`SwaSegment`/`PrefillSegment`. This does not depend on the older full-layer
+prefill fixture. Initial residual/pre-mix, private request metadata and
+producer-owned compressed caches have bounded integration evidence; see
+[the segment validation record](v41-swa-segment.md) for tested modes and
+precision limits.
+
+The default complete-model adapter is still unavailable. Decode `stage="block"`
+remains disabled in this lib revision, and the final existing-state HC+Norm
+composition is missing: `boundary_embed_to_norm` repacks embeddings and skips
+the backbone, so it cannot consume the final layer's state. All-mode device
+validation, reset/recovery and complete generation remain integration work.
+Bounded half-layer dispatch does not establish full-model or M0 acceptance.
 
 ## Request state and serving lifecycle
 

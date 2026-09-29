@@ -47,6 +47,10 @@ def test_actual_40_layer_plan_shares_producers_without_copying_or_mutating_input
         if p.mode.endswith("reuse"):
             assert current["compressed_indices"] is original[p.index_source]["topk_indices"]
         if p.mode.startswith("c1a"):
+            assert current["topk_indices"] is original[p.layer_id]["topk_indices"]
+            assert current["topk_indices"] is not current["compressed_indices"]
+            if not p.mode.endswith("reuse"):
+                assert current["compressed_indices"] is original[p.layer_id]["compressed_indices"]
             assert current["candidate_mask"] is original[20]["candidate_mask"]
             assert current["index_cache"] is original[20]["index_cache"]
             assert current["compressor_wkv"] is original[20]["compressor_wkv"]
@@ -54,6 +58,21 @@ def test_actual_40_layer_plan_shares_producers_without_copying_or_mutating_input
     assert bound[25]["compressed_indices"] is original[24]["topk_indices"]
     assert "compressor_wkv" not in original[24]
     assert original[21]["compressed_indices"] is not bound[21]["compressed_indices"]
+
+
+@pytest.mark.parametrize("layer", [20, 24])
+def test_unused_c1a_input_cannot_alias_topk_write_argument(layer):
+    plans, buffers = plans_and_buffers()
+    buffers[layer]["compressed_indices"] = buffers[layer]["topk_indices"]
+    with pytest.raises(ValueError, match="separate allocations"):
+        bind_prefill_producers(plans, buffers)
+
+
+def test_unused_reuse_output_cannot_alias_its_producer_selection():
+    plans, buffers = plans_and_buffers()
+    buffers[25]["topk_indices"] = buffers[24]["topk_indices"]
+    with pytest.raises(ValueError, match="separate allocations"):
+        bind_prefill_producers(plans, buffers)
 
 
 @pytest.mark.parametrize("plans", [
