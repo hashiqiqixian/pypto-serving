@@ -372,3 +372,22 @@ Evidence: `c1a-chain-disjoint/comparison.pt`, `c1a-chain-disjoint.log`, task
 `task_20260929_113608_405763621400` (exit 1, all four cards released).
 Reindex and continuation validation remain pending. This is not accumulated
 full-model or M0 acceptance.
+
+The tag-only C1A capture (`b4fa1c91`, serving `14e6a5a`) leaves every saved
+actual and expected stage tensor bitwise unchanged. Same-input QNorm, query
+RoPE and inverse RoPE are exact; both DP groups' captured TP sums also match
+exactly. Q-A, Q-B and O-A relative L2 errors are on the order of 1e-5, and O-B
+is about 2e-7. Attention-core relative L2 is 0.00151-0.00165. A CPU replay
+of the kernel's BF16 probability narrowing reproduces over 99.998% of the
+captured core elements. Propagating the captured core through the independent
+output projection reduces output relative L2 to 0.00012 / 0.000047, whereas
+using FP32 probabilities on the same query/cache inputs differs from the
+device output by about 1%. These cuts are diagnostic, not acceptance results.
+
+The C1A candidate `abfa7197` preserves probability rounding residuals with
+two BF16 Cube products, without changing inputs, reference or native gates.
+It is awaiting device validation and is not a production dependency. Do not
+apply the same change blindly to SWA: its existing `official_reference`
+explicitly includes BF16 probabilities, unlike the C1A sparse reference.
+Evidence: `c1a-chain-trace/boundary-audit.json`, `boundary-audit.pt`,
+`cpu-boundary-cuts.pt` and `c1a-cpu-boundary-cuts.log`.
