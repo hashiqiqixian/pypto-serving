@@ -127,7 +127,7 @@ def test_repeated_diagnostic_crosses_pages_without_slicing_past_source(family, r
 
 @pytest.mark.parametrize("repeat,counts,continuation", [
     (0, [32, 32], False), (17, [32, 32], False), (True, [32, 32], False),
-    (5, [31, 32], False), (5, [32, 32], True),
+    (5, [31, 32], False), (5, [32, 32], True), (5, [0, 0], False),
 ])
 def test_repeat_diagnostic_rejects_unbounded_or_ambiguous_inputs(repeat, counts, continuation):
     from tools.validate_v41_c2a_chain import diagnostic_chunks
@@ -154,3 +154,20 @@ def test_cache_extension_preserves_payload_layout_and_independent_index_allocati
     assert values["candidate_mask"].shape == (4, 32, 256)
     assert values["topk_indices"] is topk
     assert all(t.dtype == torch.uint8 for n, t in values.items() if n != "topk_indices")
+
+
+def test_repeated_single_request_does_not_activate_empty_dp_group():
+    from tools.validate_v41_c2a_chain import diagnostic_chunks, diagnostic_step
+    from pypto_serving.model.deepseek_v41.compressed_metadata import prepare_compressed_metadata
+
+    topology = SegmentTopology(tp=2, dp=2)
+    counts, starts, source = diagnostic_chunks(topology, [32, 0], repeat_chunks=5)[-1]
+    assert starts == [128, 0]
+    step = diagnostic_step(torch.arange(64).reshape(2, 32), topology, counts, starts, source, 160, "c1a")
+    assert len(step.requests) == 1 and step.requests[0].start == 128
+    cm = prepare_compressed_metadata(step, topology, ratio=1, compressed_group="cmp",
+        cache_pages=2, max_requests=1, state_blocks=1)
+    assert cm.group_counts == (32, 0)
+    assert cm.compressed_slots[2:].eq(-1).all()
+    assert cm.index_block_table[2:].eq(-1).all()
+    assert cm.compressed_lens[2:].eq(0).all()

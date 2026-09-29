@@ -82,9 +82,9 @@ def diagnostic_chunks(topology, counts, continue_to_capacity=False, repeat_chunk
     if type(repeat_chunks) is not int or not 1 <= repeat_chunks <= 16:
         raise ValueError("repeat chunks must be between 1 and 16")
     if repeat_chunks > 1:
-        if continue_to_capacity or any(n != topology.capacity for n in counts):
+        if continue_to_capacity or not any(counts) or any(n not in (0, topology.capacity) for n in counts):
             raise ValueError("repeated input requires full chunks without partial continuation")
-        return [(list(counts), [i * topology.capacity] * topology.dp, [0] * topology.dp)
+        return [(list(counts), [i * count for count in counts], [0] * topology.dp)
                 for i in range(repeat_chunks)]
     chunks = [(list(counts), [0] * topology.dp, [0] * topology.dp)]
     if continue_to_capacity:

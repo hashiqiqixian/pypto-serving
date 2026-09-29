@@ -483,7 +483,8 @@ remain. Neither mode replaces an accumulated acceptance test.
 boundary input at advancing absolute positions, retaining device caches and
 communication windows. It accepts 2-16 full chunks, separately recording the
 source offsets and request positions. It cannot combine repetition with ragged
-counts or `--continue-to-capacity`. The source is not output from a complete
+nonempty counts or `--continue-to-capacity`; empty DP groups remain inactive.
+The source is not output from a complete
 preceding model segment at those positions; this is a state/ABI diagnostic.
 
 At TP2, five 32-token chunks cross a C1A 128-row compressed-cache page;
