@@ -477,6 +477,16 @@ expected values and all native checks to pass. Default replay exit zero
 means only equivalence to the original run, whose numerical failure may
 remain. Neither mode replaces an accumulated acceptance test.
 
+An additional control (`5b875e2a`, Full-only prefill Q-A change) restores
+Reuse22's official original Q-A implementation on the same frozen input.
+It still fails row 31 with exactly the compensated candidate's error RMS
+0.011790978 and limit 0.0093322441. Every saved actual and expected tensor
+is bitwise equal to the compensated candidate. Thus reverting Reuse Q-A
+does not remove this native gate failure. Task
+`task_20260929_140153_32103113893` exited 1 and released cards 0-3;
+evidence is `c1a-reuse22-original-qa/comparison.pt` and
+`c1a-reuse22-original-kahan-equivalence.log`. No candidate is promoted.
+
 ### Bounded cross-page continuation diagnostic
 
 `validate_v41_c2a_chain.py --repeat-input-chunks N` repeats the saved injected
