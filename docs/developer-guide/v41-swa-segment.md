@@ -370,7 +370,7 @@ unused index slots disjoint and shares only the actual producer selection with
 its consumer. The runtime rejection is resolved; the numerical failures remain.
 Evidence: `c1a-chain-disjoint/comparison.pt`, `c1a-chain-disjoint.log`, task
 `task_20260929_113608_405763621400` (exit 1, all four cards released).
-Reindex and continuation validation remain pending. This is not accumulated
+Later Reindex and continuation results appear below. This is not accumulated
 full-model or M0 acceptance.
 
 The tag-only C1A capture (`b4fa1c91`, serving `14e6a5a`) leaves every saved
@@ -422,3 +422,27 @@ device HC implementation. The original gate remains failed; neither weakening
 it nor changing the reference is part of this diagnostic. Evidence:
 `c1a-chain-qa32/comparison.pt`, `query-cache-cuts.pt`, `c1a-chain-qa32.log`,
 `c1a-query-cache-cuts.log` and `c1a-input-rounding-details.log`.
+
+The six-layer C1A chain (20-25, MoE after every Attention) completes with
+**88/90 native checks passing** on the same Q-A candidate and compiler fix.
+Full20 HC remains failed. Reuse22 additionally fails Attention at DP0 row 2:
+error RMS 0.013177692 versus limit 0.010058112, and peak 0.056640625 versus
+limit 0.050295558. Reindex24, Reuse25, all cache/selection integrity checks
+and all MoE stages pass. Task `task_20260929_124358_401077729544` exits 1
+and releases all four cards; evidence is `c1a-through-reindex/comparison.pt`.
+
+C1A Full20/Reuse21 also completes **31+1 continuation with an empty DP
+group**, using the same resident cache and communication allocations.
+All **60/60 native stage/state checks pass**. Task
+`task_20260929_125339_40626412299` exits 0 and releases cards 0-3; evidence
+is `c1a-chain-continuation/comparison.pt` and its adjacent task log.
+Both cases use serving `14e6a5a`, lib candidate `b80bb8b3` and compiler
+`b792bde6`. This remains bounded four-card evidence, not accumulated or M0
+acceptance.
+
+`tools/replay_v41_c1a_attention.py` isolates a Reuse Attention composite from
+a saved single-chunk chain. It loads Attention weights without routed experts,
+restores the preceding MoE output and actual producer caches/selections, and
+checks bitwise agreement with the original actual and expected stage tensors.
+Only after equivalence passes should optional tagged captures be interpreted.
+The replay is diagnostic and does not replace independent accumulated gates.
