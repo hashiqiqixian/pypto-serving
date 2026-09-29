@@ -294,3 +294,29 @@ dropping history is rejected because no device cache-copy contract is integrated
 Page IDs remain independent across DP partitions and cache groups. These host
 ownership checks complement per-batch metadata validation; device reset/reuse
 still requires its own validation.
+
+### TP communication precision isolation
+
+At serving `0355d40`, diagnostic lib `be5609d5` captures the O-B partial,
+publication input, actual peer reads and pre-cast reduction. The producer and
+publication inputs are bitwise equal. Four peer-read values across two layers
+differ near the last row's final columns. Addition and BF16 conversion match
+the captured reads, but do not always match the values published by the peers.
+For layer 0, DP group 1, row 31, column 5115, the published FP32 partials sum to
+1.0050979852676392 (BF16 1.0078125); the device returns 1.0. Instrumented final
+outputs are bitwise identical to the uninstrumented Q-B group-32 diagnostic.
+
+The fixed-partial, reduction-only replay (`ea9e9a7c`) passes exactly. Adding
+the input AllGather and its communication windows (`9061b7e0`) reproduces that
+output mismatch while the AllGather output remains bitwise exact. This replay
+loads captured partials, not checkpoint weights. Disabling the output
+publication pipeline in the full workload (`0e524332`) does not change the
+failure. Evidence includes `tp-gather-replay-layer0.log`,
+`tp-gather-replay-layer0.pt` and `swa-realweights-tp-read-trace/` in the
+validation artifact directory. All completed tasks released cards 0-3.
+
+Window layout versus communication execution is still being isolated; no
+compiler/runtime attribution or production workaround is established. The
+last-row discrepancy does not directly explain earlier causal rows that fail
+the accumulated pre-mix gate. Resolving this replay alone will therefore not
+establish model precision or M0 acceptance.
