@@ -32,6 +32,8 @@ def main():
     parser.add_argument("--build-dir", required=True)
     parser.add_argument("--artifact-dir", required=True)
     parser.add_argument("--dump-tagged", action="store_true")
+    parser.add_argument("--candidate", action="store_true",
+                        help="Gate a changed kernel against the unchanged original reference")
     args = parser.parse_args()
 
     import torch
@@ -118,9 +120,16 @@ def main():
     torch.save(dict(actual=captured, expected={n: expected[n] for n in captured},
         equivalent=equivalent, expected_equal=expected_equal, results=results,
         comparison=args.comparison, layer=args.layer), artifact / "comparison.pt")
-    if not all(equivalent.values()) or not all(expected_equal.values()):
+    if not all(expected_equal.values()):
+        raise AssertionError("canonical expected values changed; candidate comparison is invalid")
+    if args.candidate:
+        if not all(ok for ok, _ in results.values()):
+            raise AssertionError("candidate fails original native precision checks")
+        print("CANDIDATE NATIVE REPLAY PASS; not accumulated or M0 acceptance", flush=True)
+    elif not all(equivalent.values()):
         raise AssertionError("isolated replay differs from original; do not interpret cuts yet")
-    print("ISOLATED REPLAY EQUIVALENCE PASS; native accuracy results remain separate", flush=True)
+    else:
+        print("ISOLATED REPLAY EQUIVALENCE PASS; native accuracy results remain separate", flush=True)
 
 
 if __name__ == "__main__":
