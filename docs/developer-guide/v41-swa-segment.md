@@ -446,3 +446,24 @@ restores the preceding MoE output and actual producer caches/selections, and
 checks bitwise agreement with the original actual and expected stage tensors.
 Only after equivalence passes should optional tagged captures be interpreted.
 The replay is diagnostic and does not replace independent accumulated gates.
+
+Reuse22 isolated replay (`9ad837e` / tag-only lib `da929c70`) reproduces all
+actual and expected stage tensors bitwise. The native row-2 failure remains.
+Its native-reference Q-A boundary cut reduces that row's relative L2 from
+0.01310287 to 4.24e-7. Independent FP64 confirms a Q-A accumulation rounding
+error at DP0 row 2, column 308: device -0.0252685546875 versus
+reference/FP64-rounded -0.025390625.
+
+A compensated Q-A accumulation candidate (`e537ef47`) corrects this row,
+but still fails the original native Attention gate at DP0 row 31 (RMS
+0.011790978 versus limit 0.0093322441). All other 11 checks pass and every
+original expected tensor remains bitwise unchanged. This candidate is not
+accepted. CPU FP64 analysis finds a separate reference-rounding difference
+at row 31, column 722; a device capture is needed before attributing the
+new failure. Evidence: `c1a-reuse22-kahan/comparison.pt` and the
+`c1a-reuse22-qa-reference-fp64.log` diagnostic.
+
+Candidate replay uses explicit `--candidate`: it requires unchanged original
+expected values and all native checks to pass. Default replay exit zero
+means only equivalence to the original run, whose numerical failure may
+remain. Neither mode replaces an accumulated acceptance test.
