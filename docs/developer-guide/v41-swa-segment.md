@@ -476,3 +476,22 @@ Candidate replay uses explicit `--candidate`: it requires unchanged original
 expected values and all native checks to pass. Default replay exit zero
 means only equivalence to the original run, whose numerical failure may
 remain. Neither mode replaces an accumulated acceptance test.
+
+### Bounded cross-page continuation diagnostic
+
+`validate_v41_c2a_chain.py --repeat-input-chunks N` repeats the saved injected
+boundary input at advancing absolute positions, retaining device caches and
+communication windows. It accepts 2-16 full chunks, separately recording the
+source offsets and request positions. It cannot combine repetition with ragged
+counts or `--continue-to-capacity`. The source is not output from a complete
+preceding model segment at those positions; this is a state/ABI diagnostic.
+
+At TP2, five 32-token chunks cross a C1A 128-row compressed-cache page;
+nine chunks cross a ratio-2 C2A compressed page. The window cache, KV/index
+pools, candidate mask and RoPE extent cover the full diagnostic context.
+Native comparisons use the previous chunk's captured cache state and the
+current chunk's producer outputs. There is no intermediate host feedback
+into the device chain. Host tests cover disjoint successive write slots,
+causal cross-page reads, compressed lengths and physical page extents.
+Device cross-page results remain pending; this option does not establish
+8K prefill, reset/reuse, full-model numerical accuracy or M0 acceptance.

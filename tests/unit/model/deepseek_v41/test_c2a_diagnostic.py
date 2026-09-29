@@ -94,3 +94,63 @@ def test_continuation_repacks_the_next_token_across_tp_slabs():
 def test_continuation_cannot_exceed_saved_source(starts):
     with pytest.raises(ValueError, match="saved causal source"):
         select_active_state({}, SegmentTopology(tp=2, dp=2), [1, 0], starts)
+
+
+@pytest.mark.parametrize("family,repeats,ratio", [("c1a", 5, 1), ("c2a", 9, 2)])
+def test_repeated_diagnostic_crosses_pages_without_slicing_past_source(family, repeats, ratio):
+    from tools.validate_v41_c2a_chain import diagnostic_chunks, diagnostic_step
+    from pypto_serving.model.deepseek_v41.compressed_metadata import prepare_compressed_metadata
+    from pypto_serving.model.deepseek_v41.swa_metadata import prepare_swa_window_metadata
+
+    topology = SegmentTopology(tp=2, dp=2)
+    ids = torch.arange(64).reshape(2, 32)
+    chunks = diagnostic_chunks(topology, [32, 32], repeat_chunks=repeats)
+    context = repeats * 32
+    prior_writes = set()
+    for counts, starts, source in chunks:
+        step = diagnostic_step(ids, topology, counts, starts, source, context, family)
+        assert step.requests[0].token_ids == tuple(range(32))
+        assert step.requests[1].token_ids == tuple(range(32, 64))
+        window = prepare_swa_window_metadata(step, topology, cache_pages=(context + 127) // 128)
+        writes = set(window.window_slots[0].tolist())
+        assert not prior_writes.intersection(writes)
+        prior_writes.update(writes)
+        cm = prepare_compressed_metadata(step, topology, ratio=ratio, compressed_group="cmp",
+            cache_pages=(context // ratio + 127) // 128, max_requests=1, state_blocks=1)
+    assert prior_writes == set(range(context))
+    assert int(cm.compressed_slots.max()) == context // ratio - 1
+    assert int(cm.compressed_slots.max()) >= 128
+    assert int(cm.compressed_lens[0, -1]) == context // ratio
+    assert window.window_indices[0, -1].tolist() == list(range(context - 128, context))
+    assert torch.equal(cm.index_block_table[0], cm.index_block_table[1])
+
+
+@pytest.mark.parametrize("repeat,counts,continuation", [
+    (0, [32, 32], False), (17, [32, 32], False), (True, [32, 32], False),
+    (5, [31, 32], False), (5, [32, 32], True),
+])
+def test_repeat_diagnostic_rejects_unbounded_or_ambiguous_inputs(repeat, counts, continuation):
+    from tools.validate_v41_c2a_chain import diagnostic_chunks
+
+    with pytest.raises(ValueError):
+        diagnostic_chunks(SegmentTopology(tp=2, dp=2), counts, continuation, repeat)
+
+
+def test_cache_extension_preserves_payload_layout_and_independent_index_allocation():
+    from tools.validate_v41_c2a_chain import size_diagnostic_caches
+
+    values = {
+        "window_cache": torch.empty(4, 1, 128, 1, 512, dtype=torch.uint8),
+        "compressed_cache": torch.empty(4, 1, 128, 1, 256, dtype=torch.uint8),
+        "index_cache": torch.empty(4, 1, 128, 1, 64, dtype=torch.uint8),
+        "candidate_mask": torch.empty(4, 32, 128, dtype=torch.uint8),
+        "topk_indices": torch.full((4, 32, 512), -1, dtype=torch.int32),
+    }
+    topk = values["topk_indices"]
+    size_diagnostic_caches(values, 160, "c1a")
+    assert values["window_cache"].shape == (4, 2, 128, 1, 512)
+    assert values["compressed_cache"].shape == (4, 2, 128, 1, 256)
+    assert values["index_cache"].shape == (4, 2, 128, 1, 64)
+    assert values["candidate_mask"].shape == (4, 32, 256)
+    assert values["topk_indices"] is topk
+    assert all(t.dtype == torch.uint8 for n, t in values.items() if n != "topk_indices")

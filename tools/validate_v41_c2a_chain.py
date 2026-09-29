@@ -76,13 +76,66 @@ def select_active_state(saved, topology, group_counts, starts=None):
     return selected, selected_mix
 
 
+def diagnostic_chunks(topology, counts, continue_to_capacity=False, repeat_chunks=1):
+    """Separate absolute positions from offsets into the bounded injected source."""
+    topology.counts(counts)
+    if type(repeat_chunks) is not int or not 1 <= repeat_chunks <= 16:
+        raise ValueError("repeat chunks must be between 1 and 16")
+    if repeat_chunks > 1:
+        if continue_to_capacity or any(n != topology.capacity for n in counts):
+            raise ValueError("repeated input requires full chunks without partial continuation")
+        return [(list(counts), [i * topology.capacity] * topology.dp, [0] * topology.dp)
+                for i in range(repeat_chunks)]
+    chunks = [(list(counts), [0] * topology.dp, [0] * topology.dp)]
+    if continue_to_capacity:
+        remaining = [topology.capacity - n if n else 0 for n in counts]
+        if not any(remaining):
+            raise ValueError("continuation requires an unfinished nonempty request")
+        chunks.append((remaining, list(counts), list(counts)))
+    return chunks
+
+
+def diagnostic_step(ids, topology, counts, starts, source_starts, context_tokens, family):
+    """Build private full-history pages; repeated IDs remain diagnostic input only."""
+    from pypto_serving.model.deepseek_v41.request_state import ForwardStep, RequestSlice
+
+    ratio = 1 if family == "c1a" else 2
+    pages = {"window": tuple(range((context_tokens + 127) // 128)),
+             "cmp": tuple(range((context_tokens // ratio + 127) // 128))}
+    return ForwardStep("prefill", tuple(
+        RequestSlice(str(g), g, 0, starts[g],
+                     tuple(row[source_starts[g]:source_starts[g] + counts[g]].tolist()),
+                     context_tokens, pages)
+        for g, row in enumerate(ids) if counts[g]), 1)
+
+
+def size_diagnostic_caches(values, context_tokens, family):
+    """Extend only dynamic context axes, preserving lib payload layouts and dtypes."""
+    import torch
+
+    window_pages = (context_tokens + 127) // 128
+    compressed_pages = (context_tokens // (1 if family == "c1a" else 2) + 127) // 128
+    for name in ("window_cache", "window_cache_scale", "compressed_cache",
+                 "compressed_cache_scale", "index_cache", "index_cache_scale"):
+        if name not in values:
+            continue
+        old = values[name]
+        pages = window_pages if name.startswith("window") else compressed_pages
+        if pages > old.shape[1]:
+            values[name] = torch.empty((old.shape[0], pages, *old.shape[2:]), dtype=old.dtype)
+    if family == "c1a":
+        old = values["candidate_mask"]
+        columns = compressed_pages * 128
+        if columns > old.shape[-1]:
+            values["candidate_mask"] = torch.empty((*old.shape[:-1], columns), dtype=old.dtype)
+
+
 def prepare(args, topology, module, weight_bundles=None):
     import torch
     from golden.spec import TensorSpec
     from models.deepseek_v4_1_flash.config import FLASH
     from models.deepseek_v4_1_flash.rope_tables import precompute_rope_tables
     from pypto_serving.model.deepseek_v41.compressed_metadata import prepare_compressed_metadata
-    from pypto_serving.model.deepseek_v41.request_state import ForwardStep, RequestSlice
     from pypto_serving.model.deepseek_v41.swa_metadata import gather_swa_rope_rows, prepare_swa_window_metadata
     from pypto_serving.model.deepseek_v41.swa_weights import load_prefill_layer_weights
 
@@ -94,9 +147,11 @@ def prepare(args, topology, module, weight_bundles=None):
         raise ValueError("saved SWA diagnostic must contain exactly the same packed token capacity")
     group_counts = args.group_counts
     starts = getattr(args, "starts", [0] * topology.dp)
+    source_starts = getattr(args, "source_starts", starts)
+    context_tokens = getattr(args, "context_tokens", topology.capacity)
     weight_bundles = {} if weight_bundles is None else weight_bundles
     global_counts, local_counts = topology.counts(group_counts)
-    residual, mix = select_active_state(saved, topology, group_counts, starts)
+    residual, mix = select_active_state(saved, topology, group_counts, source_starts)
     raw = json.loads((Path(args.model_dir) / "config.json").read_text())
     family = getattr(args, "family", "c2a")
     plans = select_plans(raw, family, getattr(args, "last_layer", None))
@@ -110,13 +165,9 @@ def prepare(args, topology, module, weight_bundles=None):
         if text["rope_scaling"][source] != getattr(FLASH, target):
             raise ValueError(f"lib/checkpoint compressed RoPE mismatch: {source}")
     # Private physical pages per DP group, shared only through declared producers.
-    pages = (topology.capacity + 127) // 128
-    step = ForwardStep("prefill", tuple(RequestSlice(str(g), g, 0, starts[g],
-                       tuple(row[starts[g]:starts[g] + group_counts[g]].tolist()),
-                       topology.capacity, {"window": tuple(range(pages)), "cmp": tuple(range(pages))})
-                       for g, row in enumerate(ids) if group_counts[g]), 1)
-    tables = precompute_rope_tables(topology.capacity, False)
-    compressed_tables = precompute_rope_tables(topology.capacity, True)
+    step = diagnostic_step(ids, topology, group_counts, starts, source_starts, context_tokens, family)
+    tables = precompute_rope_tables(context_tokens, False)
+    compressed_tables = precompute_rope_tables(context_tokens, True)
     fixture = SimpleNamespace(tokens=topology.capacity, requests=1, dp=topology.dp,
                               seed=11, case="mixed", dp_tokens=None, epochs=1, bench=False)
     attention, moe = {}, {}
@@ -129,6 +180,7 @@ def prepare(args, topology, module, weight_bundles=None):
             specs = module.build_specs(fixture, mode, {})
         values = {s.name: s.create_tensor().contiguous() for s in specs
                   if isinstance(s, TensorSpec)}
+        size_diagnostic_caches(values, context_tokens, family)
         if plan.layer_id not in weight_bundles:
             print(f"Loading real checkpoint layer {plan.layer_id}", flush=True)
             weight_bundles[plan.layer_id] = load_prefill_layer_weights(args.model_dir, plan.layer_id, topology)
@@ -193,6 +245,8 @@ def main():
     parser.add_argument("--group-counts", help="Comma-separated causal prefix lengths per DP group")
     parser.add_argument("--continue-to-capacity", action="store_true",
                         help="Run a second chunk of each nonempty request using its resident caches")
+    parser.add_argument("--repeat-input-chunks", type=int, default=1,
+                        help="Diagnostic only: repeat the saved full input 2-16 times at advancing positions")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--dump-tagged", action="store_true",
                         help="Preserve lib-tagged kernel arguments after each diagnostic layer")
@@ -221,15 +275,14 @@ def main():
         from models.deepseek_v4_1_flash import prefill_c1a_sp as module
     else:
         module = common
-    chunks = [(args.group_counts, [0] * topology.dp)]
-    if args.continue_to_capacity:
-        remaining = [topology.capacity - n if n else 0 for n in args.group_counts]
-        if not any(remaining):
-            raise ValueError("continuation requires an unfinished nonempty request")
-        chunks.append((remaining, list(args.group_counts)))
+    chunk_plan = diagnostic_chunks(topology, args.group_counts, args.continue_to_capacity,
+                                   args.repeat_input_chunks)
+    chunks = [(counts, starts) for counts, starts, _ in chunk_plan]
+    context_tokens = topology.capacity * args.repeat_input_chunks
     prepared, weights = [], {}
-    for counts, starts in chunks:
-        options = SimpleNamespace(**{**vars(args), "group_counts": counts, "starts": starts})
+    for counts, starts, source_starts in chunk_plan:
+        options = SimpleNamespace(**{**vars(args), "group_counts": counts, "starts": starts,
+                                     "source_starts": source_starts, "context_tokens": context_tokens})
         plans, attention, moe, residual, mix = prepare(options, topology, module, weights)
         if prepared:
             for plan in plans:
@@ -373,6 +426,8 @@ def main():
     torch.save({"input_state": str(args.input_state), "family": args.family,
                 "layer_ids": [p.layer_id for p in plans], "injected_boundary_input": True,
                 "group_counts": args.group_counts, "chunks": chunks, "stages": records,
+                "repeat_input_chunks": args.repeat_input_chunks, "context_tokens": context_tokens,
+                "source_starts": [source for _, _, source in chunk_plan],
                 "actual_residual": residual, "actual_pre_mix": mix}, artifact / "comparison.pt")
     if not passed:
         raise AssertionError(f"{family_label} chain native stage check failed; see comparison.pt")
