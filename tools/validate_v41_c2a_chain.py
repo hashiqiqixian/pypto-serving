@@ -194,6 +194,8 @@ def main():
     parser.add_argument("--continue-to-capacity", action="store_true",
                         help="Run a second chunk of each nonempty request using its resident caches")
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--dump-tagged", action="store_true",
+                        help="Preserve lib-tagged kernel arguments after each diagnostic layer")
     parser.add_argument("--build-dir")
     parser.add_argument("--artifact-dir")
     parser.add_argument("--ring-heap-mib", type=int, default=4096)
@@ -257,7 +259,8 @@ def main():
     if (artifact / "comparison.pt").exists():
         raise FileExistsError("refusing to overwrite a previous comparison")
     config = RunConfig(platform="a5", distributed_config=DistributedConfig(device_ids=list(devices)),
-                       ring_heap=args.ring_heap_mib << 20, ring_task_window=131072, ring_dep_pool=131072)
+                       ring_heap=args.ring_heap_mib << 20, ring_task_window=131072, ring_dep_pool=131072,
+                       enable_dump_args=1 if args.dump_tagged else 0)
     compiler = KernelCompiler(run_config=config, cache_dir=args.build_dir)
     programs, ffn = compile_prefill_segments(compiler, args.lib_root, topology, [p.mode for p in plans])
     ac = torch.zeros(topology.world, 1, dtype=torch.int32).share_memory_()
@@ -292,8 +295,24 @@ def main():
         runner = PrefillSegment(worker, programs, ffn, topology, ac, mc, config)
         for step_id, ((da, dm), captured) in enumerate(zip(device_steps, captures)):
             first = plans[0].layer_id
-            runner.run_chain(LayerState(da[first]["x_hc"], da[first]["pre_mix"], "tp_local_token"),
-                             plans, da, dm, group_counts=prepared[step_id][4])
+            state = LayerState(da[first]["x_hc"], da[first]["pre_mix"], "tp_local_token")
+            if args.dump_tagged:
+                import shutil
+
+                # Same composite calls and epochs; only completed diagnostic files
+                # are moved before a repeated program can reuse the dump path.
+                for plan in plans:
+                    state = runner.run_layer(state, da[plan.layer_id], dm[plan.layer_id],
+                                             group_counts=prepared[step_id][4], mode=plan.mode)
+                    destination = artifact / f"chunk-{step_id}-layer-{plan.layer_id}-dumps"
+                    for manifest in list(Path(args.build_dir).rglob("args_dump.json")):
+                        target = destination / manifest.parent.relative_to(Path(args.build_dir))
+                        if target.exists():
+                            raise FileExistsError(f"Refusing to overwrite diagnostic dumps: {target}")
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(manifest.parent), str(target))
+            else:
+                runner.run_chain(state, plans, da, dm, group_counts=prepared[step_id][4])
             for layer, (ca, cm) in captured.items():
                 for device, host in ((da[layer], ca), (dm[layer], cm)):
                     for name, destination in host.items():
