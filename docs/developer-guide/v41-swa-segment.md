@@ -504,8 +504,8 @@ Native comparisons use the previous chunk's captured cache state and the
 current chunk's producer outputs. There is no intermediate host feedback
 into the device chain. Host tests cover disjoint successive write slots,
 causal cross-page reads, compressed lengths and physical page extents.
-C1A cross-page device results remain pending; this option does not establish
-8K prefill, reset/reuse, full-model numerical accuracy or M0 acceptance.
+This option does not establish 8K prefill, reset/reuse, full-model numerical
+accuracy or M0 acceptance.
 
 The A5 C2A single-request control at serving `4b39b38`, official lib
 `fbe92bfc` and PyPTO `b792bde6` completed nine 32-token chunks. Its
@@ -518,3 +518,15 @@ Evidence is `c2a-crosspage-single-request/comparison.pt`, its adjacent
 task log and `c2a-crosspage-audit.log`. The input was repeated from the
 saved boundary state, so this is a physical-page continuation and native
 state check, not an independent accumulated model run.
+
+The A5 C1A Full20/Reuse21 control at serving `52cb5f9`, diagnostic
+Full-only Q-A lib `5b875e2a` and the same PyPTO revision completed five
+32-token chunks. All **150/150 native checks** passed across 20 stages;
+the last chunk covered positions 128-159. Its second window, compressed
+KV and index pages contain published payload, while the inactive DP group's
+caches remain untouched. Task `task_20260929_144014_160907026376` exited
+zero and released devices 0-3. Evidence is
+`c1a-crosspage-single-request/comparison.pt`, its task log and
+`c1a-crosspage-audit.log`. This one-active-DP diagnostic does not supersede
+the prior two-active-DP Full20 HC and Reuse22 failures, nor prove that
+layers 0-19 supplied the injected boundary input.
