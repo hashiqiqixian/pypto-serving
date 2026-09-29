@@ -40,6 +40,16 @@ class SegmentTopology:
     dp: int = 2
     local_capacity: int = 16
 
+    @classmethod
+    def for_decode(cls, *, tp: int = 4, dp: int = 2):
+        """Match lib's padded local MoE extent for a full decode batch."""
+        if type(tp) is not int or tp not in (1, 2, 4, 8):
+            raise ValueError("unsupported decode TP size")
+        decode_tokens = 32 * (5 + 1)
+        row_tile = 16
+        local_rows = (decode_tokens + tp - 1) // tp
+        return cls(tp=tp, dp=dp, local_capacity=(local_rows + row_tile - 1) // row_tile * row_tile)
+
     def __post_init__(self):
         if self.tp not in (1, 2, 4, 8) or type(self.tp) is not int:
             raise ValueError("unsupported TP size")

@@ -188,12 +188,19 @@ producer-owned compressed caches have bounded integration evidence; see
 [the segment validation record](v41-swa-segment.md) for tested modes and
 precision limits.
 
-The default complete-model adapter is still unavailable. Decode `stage="block"`
-remains disabled in this lib revision, and the final existing-state HC+Norm
-composition is missing: `boundary_embed_to_norm` repacks embeddings and skips
-the backbone, so it cannot consume the final layer's state. All-mode device
-validation, reset/recovery and complete generation remain integration work.
-Bounded half-layer dispatch does not establish full-model or M0 acceptance.
+The default complete-model adapter is still unavailable. At lib `f1d35101`,
+`decode_layer` composes all six attention modes with MoE, and `decode_fwd`
+expands the 40-layer backbone. Serving's `decode_backbone.py` binds that
+forward directly; `final_output.py` composes the existing HC-head, RMSNorm and
+LM-head operators on the final residual/pre-mix instead of repacking embeddings.
+Both serving entries passed A5 code generation with PTOAS 0.65, but neither has
+a device run or real-checkpoint full-model validation. The lib decode-forward
+fixture itself is compile-only, and #1385's A5 MoE precision job failed.
+Production weight/cache allocation, request reset and the concrete
+`CompositeBindings` registration remain unfinished. The bounded two-layer SWA
+reference also still fails the provisional accumulated pre-mix gate in 3/256
+elements (`rtol=0.01`, `atol=0.001`); the reference and gate are unchanged.
+This is a tracked precision issue, not evidence that output generation works.
 
 ## Request state and serving lifecycle
 

@@ -68,11 +68,13 @@ class CompositeBindings:
     cache_groups: tuple = ()
     input_layout: str = "tp_replicated"
     output_layout: str = "tp_replicated"
+    decode_backbone: Callable | None = None
 
     def require(self, layers: tuple[LayerPlan, ...], placement: RankPlacement) -> None:
         if not self.revision:
             raise ValueError("composite bindings must identify the validated lib revision")
-        missing = sorted({f"{phase}/{layer.mode}" for phase in ("prefill", "decode")
+        phases = ("prefill",) if callable(self.decode_backbone) else ("prefill", "decode")
+        missing = sorted({f"{phase}/{layer.mode}" for phase in phases
                           for layer in layers if not callable(self.entries.get((phase, layer.mode)))})
         if missing:
             raise MissingCompositeInterface("missing complete layer composites: " + ", ".join(missing))
