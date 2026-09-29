@@ -504,7 +504,7 @@ Native comparisons use the previous chunk's captured cache state and the
 current chunk's producer outputs. There is no intermediate host feedback
 into the device chain. Host tests cover disjoint successive write slots,
 causal cross-page reads, compressed lengths and physical page extents.
-Device cross-page results remain pending; this option does not establish
+C1A cross-page device results remain pending; this option does not establish
 8K prefill, reset/reuse, full-model numerical accuracy or M0 acceptance.
 
 The A5 C2A single-request control at serving `4b39b38`, official lib
