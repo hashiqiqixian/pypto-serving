@@ -14,6 +14,51 @@ from pypto_serving.model.deepseek_v41.swa_segment import SegmentTopology
 from tools.validate_v41_c2a_chain import select_active_state
 
 
+def checkpoint_config():
+    import json
+    from pathlib import Path
+
+    return json.loads((Path(__file__).resolve().parents[4] /
+                       "tests/fixtures/deepseek_v41/config.json").read_text())
+
+
+def test_c1a_chain_includes_full_before_reindex_and_reuse():
+    from tools.validate_v41_c2a_chain import select_plans
+
+    plans = select_plans(checkpoint_config(), "c1a", 25)
+    assert [p.layer_id for p in plans] == list(range(20, 26))
+    assert [p.mode for p in plans] == ["c1a_full", *["c1a_reuse"] * 3,
+                                     "c1a_reindex", "c1a_reuse"]
+    assert all(p.kv_source == 20 and p.candidate_source == 20 for p in plans)
+    assert plans[-1].index_source == 24
+
+
+def test_default_c2a_diagnostic_preserves_original_two_layers():
+    from tools.validate_v41_c2a_chain import select_plans
+
+    plans = select_plans(checkpoint_config(), "c2a")
+    assert [(p.layer_id, p.mode) for p in plans] == [(2, "c2a_full"), (3, "c2a_reuse")]
+
+
+@pytest.mark.parametrize("family,last", [("c1a", 19), ("c1a", 40), ("c2a", 20),
+                                         ("c2a", True), ("swa", None)])
+def test_diagnostic_cannot_skip_its_full_producer_or_cross_families(family, last):
+    from tools.validate_v41_c2a_chain import select_plans
+
+    with pytest.raises(ValueError):
+        select_plans(checkpoint_config(), family, last)
+
+
+def test_c1a_reuse_captures_readonly_producer_state_for_integrity_checks():
+    from types import SimpleNamespace
+    from tools.validate_v41_c2a_chain import state_names
+
+    module = SimpleNamespace(STATE_NAMES={"reuse": ("window_cache", "window_cache_scale")})
+    assert set(state_names(module, "reuse")) == {
+        "window_cache", "window_cache_scale", "compressed_cache", "compressed_cache_scale",
+        "index_cache", "index_cache_scale", "topk_indices", "candidate_mask"}
+
+
 def test_select_ragged_prefix_without_mutating_saved_state():
     topology = SegmentTopology(tp=2, dp=2)
     residual = torch.arange(4 * 16 * 4 * 5120, dtype=torch.float32).reshape(4, 16, 4, 5120)

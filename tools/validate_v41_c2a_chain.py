@@ -6,16 +6,50 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Bounded real-weight C2A Full -> MoE -> Reuse -> MoE device diagnostic.
+"""Bounded real-weight compressed Attention -> MoE device diagnostic.
 
 Start from the saved output of the two SWA layers. This does not claim that
 that input passed its accumulated precision gate, or run a full model. Only
 existing native same-input stage comparators gate this diagnostic.
+With --family c1a the saved state is an explicitly injected diagnostic input,
+not a claim that layers 2 through 19 have executed.
 """
 import argparse
 import json
 from pathlib import Path
 from types import SimpleNamespace
+
+
+def select_plans(raw, family, last_layer=None):
+    """Select a consecutive chain beginning with the family's real Full producer."""
+    from pypto_serving.model.deepseek_v41.execution_plan import plan_layers
+
+    if family not in ("c1a", "c2a"):
+        raise ValueError("diagnostic family must be c1a or c2a")
+    layers = plan_layers(raw)
+    first = next(p.layer_id for p in layers if p.mode == family + "_full")
+    last = first + 1 if last_layer is None else last_layer
+    if type(last) is not int or not first <= last < len(layers):
+        raise ValueError("last layer must belong to the selected compressed family")
+    selected = layers[first:last + 1]
+    if any(not p.mode.startswith(family + "_") for p in selected):
+        raise ValueError("diagnostic cannot cross compressed families")
+    seen = set()
+    for plan in selected:
+        seen.add(plan.layer_id)
+        if any(source is not None and source not in seen
+               for source in (plan.kv_source, plan.index_source, plan.candidate_source)):
+            raise ValueError("diagnostic is missing a preceding state producer")
+    return selected
+
+
+def state_names(module, mode):
+    """Capture both mutable and read-only state checked by the native contract."""
+    if hasattr(module, "STATE_NAMES"):
+        return tuple(dict.fromkeys((*module.STATE_NAMES[mode],
+            "compressed_cache", "compressed_cache_scale", "index_cache", "index_cache_scale",
+            "topk_indices", "candidate_mask")))
+    return module.ATTENTION_STATE[mode]
 
 
 def select_active_state(saved, topology, group_counts, starts=None):
@@ -48,7 +82,6 @@ def prepare(args, topology, module, weight_bundles=None):
     from models.deepseek_v4_1_flash.config import FLASH
     from models.deepseek_v4_1_flash.rope_tables import precompute_rope_tables
     from pypto_serving.model.deepseek_v41.compressed_metadata import prepare_compressed_metadata
-    from pypto_serving.model.deepseek_v41.execution_plan import plan_layers
     from pypto_serving.model.deepseek_v41.request_state import ForwardStep, RequestSlice
     from pypto_serving.model.deepseek_v41.swa_metadata import gather_swa_rope_rows, prepare_swa_window_metadata
     from pypto_serving.model.deepseek_v41.swa_weights import load_prefill_layer_weights
@@ -65,9 +98,8 @@ def prepare(args, topology, module, weight_bundles=None):
     global_counts, local_counts = topology.counts(group_counts)
     residual, mix = select_active_state(saved, topology, group_counts, starts)
     raw = json.loads((Path(args.model_dir) / "config.json").read_text())
-    plans = plan_layers(raw)[2:4]
-    if tuple(p.mode for p in plans) != ("c2a_full", "c2a_reuse"):
-        raise ValueError("checkpoint layers 2/3 are not the required Full/Reuse pair")
+    family = getattr(args, "family", "c2a")
+    plans = select_plans(raw, family, getattr(args, "last_layer", None))
     text = raw["text_config"]
     for key in ("qk_rope_head_dim", "rope_theta", "compress_rope_theta"):
         if text[key] != getattr(FLASH, key):
@@ -77,7 +109,7 @@ def prepare(args, topology, module, weight_bundles=None):
                                                       "original_max_position_embeddings")):
         if text["rope_scaling"][source] != getattr(FLASH, target):
             raise ValueError(f"lib/checkpoint compressed RoPE mismatch: {source}")
-    # Fresh first-chunk history at layer 2, private pages per DP group.
+    # Private physical pages per DP group, shared only through declared producers.
     pages = (topology.capacity + 127) // 128
     step = ForwardStep("prefill", tuple(RequestSlice(str(g), g, 0, starts[g],
                        tuple(row[starts[g]:starts[g] + group_counts[g]].tolist()),
@@ -89,8 +121,13 @@ def prepare(args, topology, module, weight_bundles=None):
                               seed=11, case="mixed", dp_tokens=None, epochs=1, bench=False)
     attention, moe = {}, {}
     for plan in plans:
-        mode = plan.mode.removeprefix("c2a_")
-        values = {s.name: s.create_tensor().contiguous() for s in module.build_specs(fixture, mode, {})
+        mode = plan.mode.split("_")[1]
+        if family == "c1a":
+            fixture.case, fixture.dp_tokens = "causal", list(group_counts)
+            specs = module.build_specs(fixture, {})
+        else:
+            specs = module.build_specs(fixture, mode, {})
+        values = {s.name: s.create_tensor().contiguous() for s in specs
                   if isinstance(s, TensorSpec)}
         if plan.layer_id not in weight_bundles:
             print(f"Loading real checkpoint layer {plan.layer_id}", flush=True)
@@ -102,7 +139,22 @@ def prepare(args, topology, module, weight_bundles=None):
         values.update(window_slots=window.window_slots, window_indices=window.window_indices)
         values["window_cache"].view(torch.uint8).zero_()
         values["window_cache_scale"].view(torch.uint8).fill_(127)
-        if mode == "full":
+        if family == "c1a":
+            cm = prepare_compressed_metadata(step, topology, ratio=1, compressed_group="cmp",
+                cache_pages=values["compressed_cache"].shape[1], max_requests=1, state_blocks=1)
+            values.update(request_ids=cm.request_ids, compressed_lens=cm.compressed_lens,
+                          compressed_slots=cm.compressed_slots, index_block_table=cm.index_block_table)
+            values["rope_cos"], values["rope_sin"] = gather_swa_rope_rows(window, tables)
+            values["compressed_rope_cos"], values["compressed_rope_sin"] = gather_swa_rope_rows(
+                window, compressed_tables)
+            for name in ("compressed_cache", "index_cache"):
+                values[name].view(torch.uint8).zero_()
+            values["compressed_cache_scale"].view(torch.uint8).fill_(0x38)
+            values["index_cache_scale"].view(torch.uint8).fill_(127)
+            values["topk_indices"].fill_(-1)
+            values["compressed_indices"].fill_(-1)
+            values["candidate_mask"].zero_()
+        elif mode == "full":
             cm = prepare_compressed_metadata(step, topology, ratio=2, compressed_group="cmp",
                 cache_pages=values["compressed_cache"].shape[1], max_requests=1,
                 state_blocks=values["state_cache"].shape[1])
@@ -136,14 +188,18 @@ def main():
     parser.add_argument("--input-state", required=True)
     parser.add_argument("--devices", default="0,1,2,3")
     parser.add_argument("--tp", type=int, default=2)
+    parser.add_argument("--family", choices=("c2a", "c1a"), default="c2a")
+    parser.add_argument("--last-layer", type=int, help="Inclusive last layer; starts at the real Full producer")
     parser.add_argument("--group-counts", help="Comma-separated causal prefix lengths per DP group")
     parser.add_argument("--continue-to-capacity", action="store_true",
                         help="Run a second chunk of each nonempty request using its resident caches")
     parser.add_argument("--prepare-only", action="store_true")
-    parser.add_argument("--build-dir", default="build_output/v41-c2a-chain")
-    parser.add_argument("--artifact-dir", default=".validation-artifacts/c2a-chain")
+    parser.add_argument("--build-dir")
+    parser.add_argument("--artifact-dir")
     parser.add_argument("--ring-heap-mib", type=int, default=4096)
     args = parser.parse_args()
+    args.build_dir = args.build_dir or f"build_output/v41-{args.family}-chain"
+    args.artifact_dir = args.artifact_dir or f".validation-artifacts/{args.family}-chain"
     import torch
     from pypto_serving.model.deepseek_v41.swa_segment import SegmentTopology, load_segment_modules
     from pypto_serving.model.deepseek_v41.prefill_segment import (
@@ -158,7 +214,11 @@ def main():
     topology.counts(args.group_counts)
     torch.set_num_threads(4)
     _, moe_module = load_segment_modules(args.lib_root, topology)
-    from models.deepseek_v4_1_flash import prefill_c2a_full as c2a
+    from models.deepseek_v4_1_flash import prefill_c2a_full as common
+    if args.family == "c1a":
+        from models.deepseek_v4_1_flash import prefill_c1a_sp as module
+    else:
+        module = common
     chunks = [(args.group_counts, [0] * topology.dp)]
     if args.continue_to_capacity:
         remaining = [topology.capacity - n if n else 0 for n in args.group_counts]
@@ -168,10 +228,10 @@ def main():
     prepared, weights = [], {}
     for counts, starts in chunks:
         options = SimpleNamespace(**{**vars(args), "group_counts": counts, "starts": starts})
-        plans, attention, moe, residual, mix = prepare(options, topology, c2a, weights)
+        plans, attention, moe, residual, mix = prepare(options, topology, module, weights)
         if prepared:
             for plan in plans:
-                for name in c2a.ATTENTION_STATE[plan.mode.removeprefix("c2a_")]:
+                for name in state_names(module, plan.mode.split("_")[1]):
                     if "cache" in name:
                         attention[plan.layer_id][name] = prepared[0][0][plan.layer_id][name]
         prepared.append((bind_prefill_producers(plans, attention), moe, residual, mix, counts))
@@ -182,7 +242,8 @@ def main():
             for name in PREFILL_ARGUMENTS[plan.mode]:
                 if name not in dynamic:
                     assert isinstance(bound[plan.layer_id][name], torch.Tensor), name
-    print("REAL CHECKPOINT C2A PREPARATION PASS", flush=True)
+    family_label = args.family.upper()
+    print(f"REAL CHECKPOINT {family_label} PREPARATION PASS; layers {[p.layer_id for p in plans]}", flush=True)
     if args.prepare_only:
         return
     from pypto.ir import DistributedConfig
@@ -206,8 +267,8 @@ def main():
         captured = {}
         for plan in plans:
             layer = plan.layer_id
-            names = ("attn_input", "attn_output", "next_pre_mix", "x_hc_out") + c2a.ATTENTION_STATE[
-                plan.mode.removeprefix("c2a_")]
+            names = ("attn_input", "attn_output", "next_pre_mix", "x_hc_out") + state_names(
+                module, plan.mode.split("_")[1])
             captured[layer] = ({n: torch.empty_like(bound[layer][n]).share_memory_() for n in names},
                               {n: torch.empty_like(moe[layer][n]).share_memory_()
                                for n in ("x_next", "next_pre_mix", "x_mixed")})
@@ -230,13 +291,14 @@ def main():
                         for bound, moe, *_ in prepared]
         runner = PrefillSegment(worker, programs, ffn, topology, ac, mc, config)
         for step_id, ((da, dm), captured) in enumerate(zip(device_steps, captures)):
-            runner.run_chain(LayerState(da[2]["x_hc"], da[2]["pre_mix"], "tp_local_token"),
+            first = plans[0].layer_id
+            runner.run_chain(LayerState(da[first]["x_hc"], da[first]["pre_mix"], "tp_local_token"),
                              plans, da, dm, group_counts=prepared[step_id][4])
             for layer, (ca, cm) in captured.items():
                 for device, host in ((da[layer], ca), (dm[layer], cm)):
                     for name, destination in host.items():
                         worker.copy_stacked_from(device[name], destination)
-            print(f"C2A DEVICE CHUNK {step_id} COMPLETE", flush=True)
+            print(f"{family_label} DEVICE CHUNK {step_id} COMPLETE", flush=True)
         for handle in reversed(list(uploaded.values())):
             worker.free_stacked_tensor(handle)
     # CPU same-input references run only after worker shutdown. Device state
@@ -244,22 +306,32 @@ def main():
     records, passed = [], True
     for step_id, ((bound, moe, residual, mix, counts), captured) in enumerate(zip(prepared, captures)):
         for plan in plans:
-            layer, mode = plan.layer_id, plan.mode.removeprefix("c2a_")
+            layer, mode = plan.layer_id, plan.mode.split("_")[1]
             actual_a, actual_m = captured[layer]
             inputs = dict(bound[layer], x_hc=residual, pre_mix=mix)
             if step_id:
                 for name, value in captures[step_id - 1][layer][0].items():
                     if "cache" in name:
                         inputs[name] = value
-            if mode == "reuse":
+            if mode != "full":
                 for name in ("compressed_cache", "compressed_cache_scale"):
-                    inputs[name] = captured[2][0][name]
-                inputs["compressed_indices"] = captured[2][0]["topk_indices"]
-            initial_cache = {n: inputs[n].clone() for n in c2a.MODES[mode][1]}
+                    inputs[name] = captured[plan.kv_source][0][name]
+                if args.family == "c1a":
+                    for name in ("index_cache", "index_cache_scale"):
+                        inputs[name] = captured[plan.kv_source][0][name]
+                    inputs["candidate_mask"] = captured[plan.candidate_source][0]["candidate_mask"]
+                if mode == "reuse":
+                    inputs["compressed_indices"] = captured[plan.index_source][0]["topk_indices"]
+                    if args.family == "c1a":
+                        inputs["topk_indices"] = inputs["compressed_indices"]
+            initial_cache = {n: inputs[n].clone() for n in state_names(module, mode)}
             expected_a = dict(inputs)
             for name in actual_a:
                 expected_a[name] = inputs[name].clone()
-            c2a.make_golden(mode, 1)(expected_a)
+            golden = (common.make_golden(mode, 1, attention_reference=module.reference_attention,
+                       state_names=module.STATE_NAMES[mode]) if args.family == "c1a"
+                      else common.make_golden(mode, 1))
+            golden(expected_a)
             expected_m = dict(moe[layer], x_hc=actual_a["x_hc_out"], pre_mix=actual_a["next_pre_mix"])
             for name in actual_m:
                 expected_m[name] = moe[layer][name].clone()
@@ -270,7 +342,7 @@ def main():
                 "x_next": moe_module._local_mhc_compare(list(topology.counts(counts)[1])),
             }
             for label, actual, expected, checks in (("attention", actual_a, expected_a,
-                    c2a.make_compare(mode, 1, initial_cache)), ("moe", actual_m, expected_m, mc_check)):
+                    module.make_compare(mode, 1, initial_cache)), ("moe", actual_m, expected_m, mc_check)):
                 results = {}
                 for name, check in checks.items():
                     ok, detail = check(actual[name], expected[name], inputs=expected,
@@ -281,11 +353,13 @@ def main():
                 records.append(dict(chunk=step_id, layer=layer, stage=label, results=results, actual=actual,
                                     expected={n: expected[n] for n in actual}))
             residual, mix = actual_m["x_next"], actual_m["next_pre_mix"]
-    torch.save({"input_state": str(args.input_state), "group_counts": args.group_counts, "chunks": chunks, "stages": records,
+    torch.save({"input_state": str(args.input_state), "family": args.family,
+                "layer_ids": [p.layer_id for p in plans], "injected_boundary_input": True,
+                "group_counts": args.group_counts, "chunks": chunks, "stages": records,
                 "actual_residual": residual, "actual_pre_mix": mix}, artifact / "comparison.pt")
     if not passed:
-        raise AssertionError("C2A chain native stage check failed; see comparison.pt")
-    print("C2A CHAIN NATIVE STAGES PASS; accumulated full-model acceptance remains pending", flush=True)
+        raise AssertionError(f"{family_label} chain native stage check failed; see comparison.pt")
+    print(f"{family_label} CHAIN NATIVE STAGES PASS; accumulated full-model acceptance remains pending", flush=True)
 
 
 if __name__ == "__main__":

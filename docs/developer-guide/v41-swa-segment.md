@@ -339,3 +339,21 @@ Artifacts: `tp-codegen64-replay-layer0.log`, `swa-precision-codegen64-trace.log`
 and `swa-realweights-codegen64-trace/tp-boundary-audit.json`.
 The compiler fix and Q-B group-32 arithmetic remain diagnostic dependencies;
 these results do not establish full-model precision or M0 acceptance.
+
+### C1A diagnostic preparation
+
+The compressed-chain diagnostic also accepts `--family c1a`. It resolves the
+checkpoint's first C1A Full producer and executes consecutive layers through
+`--last-layer` (inclusive). The default covers layers 20/21. Using
+`--last-layer 25` retains producer 20 through Reuse layers 21-23, then executes
+Reindex 24 and its Reuse consumer 25. KV/index caches, candidates and Top-K
+buffers are bound to their declared producers, including read-only integrity
+checks. Weight loading uses the same selective loader as the C2A path.
+
+For example, add `--family c1a --prepare-only` to the compressed-chain command
+to check real weights and metadata before device execution. This mode uses
+the saved SWA state as an explicitly injected diagnostic input; it does not
+claim to have executed layers 2-19. Artifacts record the chosen family, layer
+IDs and this limitation. The existing native C1A comparators are preserved.
+Host plan/metadata tests pass; C1A real-weight preparation and device validation
+remain pending. This is not accumulated full-model or M0 acceptance.
