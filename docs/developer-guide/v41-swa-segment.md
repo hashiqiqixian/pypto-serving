@@ -458,10 +458,19 @@ A compensated Q-A accumulation candidate (`e537ef47`) corrects this row,
 but still fails the original native Attention gate at DP0 row 31 (RMS
 0.011790978 versus limit 0.0093322441). All other 11 checks pass and every
 original expected tensor remains bitwise unchanged. This candidate is not
-accepted. CPU FP64 analysis finds a separate reference-rounding difference
-at row 31, column 722; a device capture is needed before attributing the
-new failure. Evidence: `c1a-reuse22-kahan/comparison.pt` and the
-`c1a-reuse22-qa-reference-fp64.log` diagnostic.
+accepted. A subsequent Q-A-only device capture (`e7d72872`) leaves every
+actual and expected tensor bitwise unchanged from the untagged candidate.
+Captured Q-A relative L2 against independent FP64 is 2.18e-8 in DP0 and
+zero in DP1, versus about 2.23e-5 / 2.27e-5 for the native FP32 reference.
+At DP0 row 31, column 722, the FP64 sum is 0.09545897599309683; device and
+FP64 round to BF16 0.09521484375, while the reference rounds to 0.095703125.
+Continuing from captured Q-A reduces that row's output relative L2 from
+0.0126360 to 0.00122239. This isolates amplification of a reference/device
+accumulation-rounding difference; it does not make the original acceptance
+pass. Neither the independent reference nor its gate was replaced.
+Evidence: `c1a-reuse22-kahan/comparison.pt`,
+`c1a-reuse22-kahan-trace/qa-captures.pt`, `qa-propagation-cuts.pt`,
+`c1a-reuse22-kahan-device-fp64.log` and `c1a-kahan-qa-propagation.log`.
 
 Candidate replay uses explicit `--candidate`: it requires unchanged original
 expected values and all native checks to pass. Default replay exit zero
