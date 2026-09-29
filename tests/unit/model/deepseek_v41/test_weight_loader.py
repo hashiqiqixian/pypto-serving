@@ -148,6 +148,27 @@ def test_c2a_full_bundle_preserves_composite_dtypes_and_index_heads(checkpoint):
                        attention["index_wq_b"][1].view(torch.uint8))
 
 
+def test_converted_c2a_bundle_maps_to_decode_weight_slots(checkpoint):
+    from pypto_serving.model.deepseek_v41.decode_weights import bind_decode_layer_weights
+    from pypto_serving.model.deepseek_v41.execution_plan import plan_layers
+    from pypto_serving.model.deepseek_v41.swa_segment import SegmentTopology
+    from pypto_serving.model.deepseek_v41.swa_weights import load_prefill_layer_weights
+
+    path, raw, _ = checkpoint
+    attention, moe = load_prefill_layer_weights(path, 0, SegmentTopology(tp=2, dp=1))
+    slices = bind_decode_layer_weights(plan_layers(raw)[0], attention, moe,
+                                       kv_sources=(0,), index_sources=(0,), c2a_sources=(0,))
+    bound = {part.name: part for part in slices}
+    assert set(bound) >= {"wq_a", "wq_a_scale", "routed_w1", "routed_w1_scale",
+                          "c2a_compressor_wkv", "c2a_compressor_wgate", "index_wq_b"}
+    assert all(part.slot == 0 for part in slices)
+    assert bound["wq_a"].value.dtype == torch.float8_e4m3fn
+    assert bound["wq_a_scale"].value.dtype == torch.float8_e8m0fnu
+    assert bound["routed_w1"].value.dtype == torch.uint8
+    assert bound["routed_w1_scale"].value.dtype == torch.float8_e8m0fnu
+    assert bound["c2a_compressor_wkv"].value.dtype == torch.float32
+
+
 def test_wo_a_group_dequantization(checkpoint):
     path, _, tensors = checkpoint
     result = V41WeightLoader(path, tp_size=2, tp_rank=1).load("layers.0.attn.wo_a.weight")
