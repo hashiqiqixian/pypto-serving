@@ -506,3 +506,15 @@ into the device chain. Host tests cover disjoint successive write slots,
 causal cross-page reads, compressed lengths and physical page extents.
 Device cross-page results remain pending; this option does not establish
 8K prefill, reset/reuse, full-model numerical accuracy or M0 acceptance.
+
+The A5 C2A single-request control at serving `4b39b38`, official lib
+`fbe92bfc` and PyPTO `b792bde6` completed nine 32-token chunks. Its
+36 Attention/MoE stages passed **216/216 native checks**; the last chunk
+covered positions 256-287. Saved-state audit confirmed that the second
+compressed page contains published payload, the other DP group's cache
+is untouched, and all earlier chunk caches remained resident. Task
+`task_20260929_143008_89019724616` exited zero and released devices 0-3.
+Evidence is `c2a-crosspage-single-request/comparison.pt`, its adjacent
+task log and `c2a-crosspage-audit.log`. The input was repeated from the
+saved boundary state, so this is a physical-page continuation and native
+state check, not an independent accumulated model run.
