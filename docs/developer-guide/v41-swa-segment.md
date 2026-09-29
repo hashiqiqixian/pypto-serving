@@ -355,5 +355,20 @@ to check real weights and metadata before device execution. This mode uses
 the saved SWA state as an explicitly injected diagnostic input; it does not
 claim to have executed layers 2-19. Artifacts record the chosen family, layer
 IDs and this limitation. The existing native C1A comparators are preserved.
-Host plan/metadata tests pass; C1A real-weight preparation and device validation
-remain pending. This is not accumulated full-model or M0 acceptance.
+Host plan/metadata tests and real-checkpoint preparation pass. On A5 four-card
+TP2/DP2/EP4, serving `a11532c`, official lib `fbe92bfc` and the previously
+validated PyPTO communication fix `b792bde6` execute both layers and pass 28/30
+native checks. Full layer 20 fails `attn_output` and `x_hc_out`: DP group 1,
+row 18 has attention error RMS 0.0090870445 against limit 0.0083356445.
+Same-input HC post replay is within its local budget, but end-to-end residual
+relative L2 exceeds the native 1% limit on ranks 2/3. No comparator changed.
+
+Full-layer cache, candidate and Top-K checks, all Reuse-layer checks (including
+read-only producer state), and both MoE stages pass. The earlier task rejected
+aliased index ABI arguments before executing Attention; serving now keeps
+unused index slots disjoint and shares only the actual producer selection with
+its consumer. The runtime rejection is resolved; the numerical failures remain.
+Evidence: `c1a-chain-disjoint/comparison.pt`, `c1a-chain-disjoint.log`, task
+`task_20260929_113608_405763621400` (exit 1, all four cards released).
+Reindex and continuation validation remain pending. This is not accumulated
+full-model or M0 acceptance.
