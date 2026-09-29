@@ -29,15 +29,28 @@ def expected_geometry(text, topology):
     mix = (2 + text["hc_mult"]) * text["hc_mult"]
     return {
         "hc_attn_fn": ((world, mix, text["hc_mult"] * d), torch.float32),
+        "hc_attn_scale": ((world, 3), torch.float32),
+        "hc_attn_base": ((world, mix), torch.float32),
+        "attn_norm_weight": ((world, d), torch.bfloat16),
         "wq_a": ((world, d, q), torch.float8_e4m3fn),
         "wq_a_scale": ((world, d // 32, q), torch.float8_e8m0fnu),
+        "q_norm_weight": ((world, q), torch.bfloat16),
         "wq_b": ((world, q, local_heads * head), torch.float8_e4m3fn),
         "wq_b_scale": ((world, q // 32, local_heads * head), torch.float8_e8m0fnu),
         "wkv": ((world, d, head), torch.float8_e4m3fn),
+        "wkv_scale": ((world, d // 32, head), torch.float8_e8m0fnu),
+        "kv_norm_weight": ((world, head), torch.bfloat16),
+        "attn_sink": ((world, local_heads), torch.float32),
         "wo_a": ((world, local_groups, text["o_lora_rank"],
                   heads * head // groups), torch.bfloat16),
         "wo_b": ((world, local_o, d), torch.float8_e4m3fn),
+        "wo_b_scale": ((world, local_o // 32, d), torch.float8_e8m0fnu),
+        "hc_ffn_fn": ((world, mix, text["hc_mult"] * d), torch.float32),
+        "hc_ffn_scale": ((world, 3), torch.float32),
+        "hc_ffn_base": ((world, mix), torch.float32),
+        "ffn_norm_weight": ((world, d), torch.bfloat16),
         "gate_weight": ((world, text["n_routed_experts"], d), torch.float32),
+        "correction_bias": ((world, text["n_routed_experts"]), torch.float32),
         "routed_w1": ((world, local_experts, inter * d // 256, 128), torch.uint8),
         "routed_w2": ((world, local_experts, inter * d // 256, 128), torch.uint8),
         "routed_w3": ((world, local_experts, inter * d // 256, 128), torch.uint8),
@@ -45,6 +58,11 @@ def expected_geometry(text, topology):
         "routed_w2_scale": ((world, local_experts * inter // 32, d), torch.float8_e8m0fnu),
         "routed_w3_scale": ((world, local_experts * d // 32, inter), torch.float8_e8m0fnu),
         "shared_w1": ((world, d, inter), torch.float8_e4m3fn),
+        "shared_w1_scale": ((world, d // 32, inter), torch.float8_e8m0fnu),
+        "shared_w2": ((world, inter, d), torch.float8_e4m3fn),
+        "shared_w2_scale": ((world, inter // 32, d), torch.float8_e8m0fnu),
+        "shared_w3": ((world, d, inter), torch.float8_e4m3fn),
+        "shared_w3_scale": ((world, d // 32, inter), torch.float8_e8m0fnu),
         "mxfp4_pair_lut": ((world, 2, 256), torch.int16),
         "c2a_compressor_wkv": ((world, d, head), torch.float32),
         "c2a_compressor_wgate": ((world, d, head), torch.float32),
@@ -81,11 +99,10 @@ def main():
             tensor = part.value
             if not tensor.is_contiguous() or tensor.shape[0] != topology.world:
                 raise ValueError(f"layer {layer_id} {part.name}: invalid EP placement")
-            if part.name in geometry:
-                shape, dtype = geometry[part.name]
-                if tuple(tensor.shape) != shape or tensor.dtype != dtype:
-                    raise ValueError(f"layer {layer_id} {part.name}: got {tensor.shape}/{tensor.dtype}; "
-                                     f"expected {shape}/{dtype}")
+            shape, dtype = geometry[part.name]
+            if tuple(tensor.shape) != shape or tensor.dtype != dtype:
+                raise ValueError(f"layer {layer_id} {part.name}: got {tensor.shape}/{tensor.dtype}; "
+                                 f"expected {shape}/{dtype}")
         print(f"layer={layer_id} mode={layer.mode} checked_slices={len(bound)}")
         del attention, moe, bound
         gc.collect()

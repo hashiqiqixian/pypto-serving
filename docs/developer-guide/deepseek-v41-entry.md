@@ -113,6 +113,16 @@ Validation uses synthetic checkpoint tensors stored in actual safetensors files,
 independent packing-address checks, and shared-store regression tests. These
 checks are not real-checkpoint numerical inference or NPU acceptance.
 
+For lib `f1d3510`, `decode_weights.iter_decode_weight_slices` maps the 40-layer
+checkpoint to decode-forward layer and producer slots one layer at a time.
+Routed experts remain packed FP4; the four index-key/norm slots reserved by the
+ABI but absent from the checkpoint are explicitly zeroed. The A5 original
+checkpoint passed CPU shape/dtype/EP-placement checks for 189 slices across
+SWA layer 0, C2A Full layer 2, C1A Full layer 20, C1A Reindex layer 24, and
+C1A Reuse layer 39. Earlier validation checked all required text headers and
+54 selected real payload conversions. This does not scan every payload in all
+40 layers or establish device residency; that belongs to Executor/Runner work.
+
 ## Executor/Runner preparation
 
 Stage numbers follow serving issue #240. `V41ExecutionPlan` describes the

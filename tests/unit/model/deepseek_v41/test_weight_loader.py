@@ -169,10 +169,11 @@ def test_converted_c2a_bundle_maps_to_decode_weight_slots(checkpoint):
     assert bound["c2a_compressor_wkv"].value.dtype == torch.float32
     from tools.check_v41_decode_weight_contract import expected_geometry
     geometry = expected_geometry(raw["text_config"], SegmentTopology(tp=2, dp=1))
-    for name, (shape, dtype) in geometry.items():
-        if name in bound:
-            assert tuple(bound[name].value.shape) == shape, name
-            assert bound[name].value.dtype == dtype, name
+    assert set(bound) <= set(geometry)
+    for name, part in bound.items():
+        shape, dtype = geometry[name]
+        assert tuple(part.value.shape) == shape, name
+        assert part.value.dtype == dtype, name
 
 
 def test_wo_a_group_dequantization(checkpoint):
