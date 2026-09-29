@@ -315,8 +315,27 @@ failure. Evidence includes `tp-gather-replay-layer0.log`,
 `tp-gather-replay-layer0.pt` and `swa-realweights-tp-read-trace/` in the
 validation artifact directory. All completed tasks released cards 0-3.
 
-Window layout versus communication execution is still being isolated; no
-compiler/runtime attribution or production workaround is established. The
-last-row discrepancy does not directly explain earlier causal rows that fail
-the accumulated pre-mix gate. Resolving this replay alone will therefore not
-establish model precision or M0 acceptance.
+The four-window replay still fails when AllGather execution is omitted.
+Reserving 64 bytes for each signal makes it pass without changing arithmetic.
+The original 32-byte allocation padding places an output payload tail and its
+signal on one 64-byte scalar cache line; signal cache maintenance can affect
+the neighboring payload. Existing tracking: `hw-native-sys/pypto#2800` and
+`hw-native-sys/simpler#2273`.
+
+PyPTO diagnostic fix `b792bde6`, based on `e8191e3c`, rounds both each physical
+buffer size and their summed window capacity to 64 bytes. Logical views and the
+runtime allocation ABI stay unchanged. The original 8-byte logical signal
+replay now passes with zero mismatches (`task_20260929_101804_154960424725`).
+The full real-weight trace (`task_20260929_102020_17364556272`, lib `d0478d78`,
+serving `0355d40`) also has zero publication/peer-read, sum or cast mismatches
+across both layers and all four ranks. Both tasks released cards 0-3.
+
+This fixes the captured communication corruption, but accumulated pre_mix
+still fails in 3/256 elements: relative L2 0.0025418127, maximum absolute error
+0.0076903105. Residual passes every rank's V4 gate (relative L2 0.012851512,
+maximum absolute error 0.02734375). Reference outputs remain bitwise equal to
+the earlier Q-B-only run. No arithmetic or acceptance threshold changed.
+Artifacts: `tp-codegen64-replay-layer0.log`, `swa-precision-codegen64-trace.log`
+and `swa-realweights-codegen64-trace/tp-boundary-audit.json`.
+The compiler fix and Q-B group-32 arithmetic remain diagnostic dependencies;
+these results do not establish full-model precision or M0 acceptance.
