@@ -167,6 +167,12 @@ def test_converted_c2a_bundle_maps_to_decode_weight_slots(checkpoint):
     assert bound["routed_w1"].value.dtype == torch.uint8
     assert bound["routed_w1_scale"].value.dtype == torch.float8_e8m0fnu
     assert bound["c2a_compressor_wkv"].value.dtype == torch.float32
+    from tools.check_v41_decode_weight_contract import expected_geometry
+    geometry = expected_geometry(raw["text_config"], SegmentTopology(tp=2, dp=1))
+    for name, (shape, dtype) in geometry.items():
+        if name in bound:
+            assert tuple(bound[name].value.shape) == shape, name
+            assert bound[name].value.dtype == dtype, name
 
 
 def test_wo_a_group_dequantization(checkpoint):
