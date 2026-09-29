@@ -395,3 +395,30 @@ Further bisection must follow the specialized reference, not replace it with
 generic sparse attention. The same caveat applies to SWA's BF16-P reference.
 Evidence: `c1a-chain-trace/boundary-audit.json`, `boundary-audit.pt`,
 `cpu-boundary-cuts.pt` and `c1a-cpu-boundary-cuts.log`.
+
+With the specialized reference, the original DP1 token 18 attention error
+is 1.0903%; continuing from captured Q-A reduces it to 0.1855%. Independent
+FP64 evaluation confirms a Q-A BF16 rounding error at that token. Candidate
+`b80bb8b3` routes all three C1A modes through the existing scale-corrected
+group-32 prefill Q-A implementation. On the same Full20/Reuse21 case, it
+passes **29/30 native checks**, including the previously failing Attention
+output. Only Full20 end-to-end `x_hc_out` fails: ranks 2/3 relative L2 are
+0.0161307 / 0.0119976. All first-layer expected tensors remain bitwise equal
+to baseline. No probability arithmetic or acceptance check changed.
+
+Query/cache boundary cuts isolate this remaining error: using captured caches
+with the canonical query reduces HC relative L2 to 0.003437 / 0.002168;
+changing only the query does not improve it. The canonical CPU replay matches
+the saved expected Attention output exactly. This is diagnostic evidence,
+not a replacement reference or a passing full-layer result.
+
+The original normalized input differs in only six BF16 elements. At all six
+coordinates, device values match the independent FP64 collapse/normalization
+rounded to BF16. For example, DP1 token 0, feature 4237 has an exact FP64
+collapse sum of 0.252929660224396; the FP32 reference lands on the BF16 midpoint
+0.2529296875 and rounds to the other neighbor. Subsequent quantization changes
+cache values and amplifies the difference. This does not establish an incorrect
+device HC implementation. The original gate remains failed; neither weakening
+it nor changing the reference is part of this diagnostic. Evidence:
+`c1a-chain-qa32/comparison.pt`, `query-cache-cuts.pt`, `c1a-chain-qa32.log`,
+`c1a-query-cache-cuts.log` and `c1a-input-rounding-details.log`.
