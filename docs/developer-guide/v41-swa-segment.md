@@ -377,17 +377,21 @@ The tag-only C1A capture (`b4fa1c91`, serving `14e6a5a`) leaves every saved
 actual and expected stage tensor bitwise unchanged. Same-input QNorm, query
 RoPE and inverse RoPE are exact; both DP groups' captured TP sums also match
 exactly. Q-A, Q-B and O-A relative L2 errors are on the order of 1e-5, and O-B
-is about 2e-7. Attention-core relative L2 is 0.00151-0.00165. A CPU replay
-of the kernel's BF16 probability narrowing reproduces over 99.998% of the
-captured core elements. Propagating the captured core through the independent
-output projection reduces output relative L2 to 0.00012 / 0.000047, whereas
-using FP32 probabilities on the same query/cache inputs differs from the
-device output by about 1%. These cuts are diagnostic, not acceptance results.
+is about 2e-7. A CPU replay of the kernel's BF16 probability narrowing
+reproduces over 99.998% of the captured core elements. Propagating the captured
+core through the independent output projection reduces output relative L2 to
+0.00012 / 0.000047. These cuts are diagnostic, not acceptance results.
 
-The C1A candidate `abfa7197` preserves probability rounding residuals with
-two BF16 Cube products, without changing inputs, reference or native gates.
-It is awaiting device validation and is not a production dependency. Do not
-apply the same change blindly to SWA: its existing `official_reference`
-explicitly includes BF16 probabilities, unlike the C1A sparse reference.
+The initial attention-core audit mistakenly used the generic FP32-probability
+reference: its 0.00151-0.00165 relative L2 is not the native C1A contract.
+All three modes inject `golden_prefill_c1a_attention`, which includes BF16 PV
+and the first-vector FP32 patch. The probability-residual candidate `1d186943`
+is rejected: it passes only 27/30 native checks and introduces a Reuse output
+failure. First-layer expected tensors are bitwise unchanged from baseline;
+the candidate never changed the acceptance reference or gates. The initial
+`abfa7197` attempt stopped at accumulator dtype checking; the retry explicitly
+declares FP32 and completed device execution before failing precision.
+Further bisection must follow the specialized reference, not replace it with
+generic sparse attention. The same caveat applies to SWA's BF16-P reference.
 Evidence: `c1a-chain-trace/boundary-audit.json`, `boundary-audit.pt`,
 `cpu-boundary-cuts.pt` and `c1a-cpu-boundary-cuts.log`.
