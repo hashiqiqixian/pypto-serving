@@ -190,6 +190,17 @@ contract and is explicitly rejected for now. Cache payloads must not use a
 generic dense K/V substitute. The adapter must bound physical page IDs against
 actual allocated pools when a group leaves `num_blocks` unspecified.
 
+For the complete 40-layer model, the runner checks three distinct full-history
+scheduler groups before calling `allocate`: a 128-source-token window group
+covering every layer, a ratio-2 C2A group for KV producers 2/8/14 with 256
+source tokens per 128-row physical page, and a ratio-1 C1A group for producer
+20 with 128 source tokens per physical page. Each group uses two private DP
+partitions and must cover `max_seq_len` in both its per-request limit and any
+declared physical `num_blocks`. Group names are resolved from producer layer
+IDs rather than hardcoded. Physical allocation, index-key alignment and
+reset/completion remain adapter responsibilities; this host check does not
+prove device cache reuse.
+
 At inspected upstream lib revision `fbe92bfc`, serving dispatches the existing
 sequence-parallel Attention and packed-FP4 MoE composites through
 `SwaSegment`/`PrefillSegment`. This does not depend on the older full-layer

@@ -43,8 +43,10 @@ def test_public_runner_chunked_8k_128_decode_release_and_reuse():
     groups = (
         KVCacheGroupSpec("window", tuple(range(40)), KVCacheSpec(128, 16),
                          65, num_blocks=65, num_partitions=2),
-        KVCacheGroupSpec("compressed", (2, 8, 14, 20), KVCacheSpec(256, 16, 2),
+        KVCacheGroupSpec("c2a", (2, 8, 14), KVCacheSpec(256, 16, 2),
                          33, num_blocks=33, num_partitions=2),
+        KVCacheGroupSpec("c1a", (20,), KVCacheSpec(128, 16),
+                         65, num_blocks=65, num_partitions=2),
     )
     runtime = RuntimeConfig(max_batch_size=2, max_seq_len=8320, max_num_batched_tokens=2048,
                             max_prefill_tokens_per_request=1024, kv_cache_groups=groups)
@@ -124,6 +126,8 @@ def test_public_runner_chunked_8k_128_decode_release_and_reuse():
     plan = SimpleNamespace(placement=RankPlacement(0), layers=layers, weights=SimpleNamespace(config=config))
     plan.for_rank = lambda rank: SimpleNamespace(placement=RankPlacement(rank))
     runner = V41ModelRunner(plan, bindings, device_ids=(7, 2, 5, 0, 6, 1, 4, 3), runtime=runtime)
+    assert (runner.cache_groups.window, runner.cache_groups.c2a, runner.cache_groups.c1a) == (
+        "window", "c2a", "c1a")
     model = SimpleNamespace(config=config)
     partitions, lengths = {"A": 1, "B": 0, "C": 1}, {"A": 0, "B": 0}
     prompts = {"A": [(i + 3) % 16 for i in range(8192)],

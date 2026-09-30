@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """V4-style runner lifecycle for explicit V4.1 composite bindings."""
 from .composite import BuildOptions, CompositeBindings, LayerState
+from .cache_contract import validate_cache_groups
 from .input_preparation import lookup_token_embeddings
 import torch
 from pypto_serving.config.types import PrefillResult, DecodeResult
@@ -32,6 +33,11 @@ class V41ModelRunner:
         if any(type(i) is not int or i < 0 for i in self.device_ids):
             raise ValueError("device IDs must be nonnegative integers")
         bindings.require(plan.layers, plan.placement)
+        if len(plan.layers) == 40:
+            self.cache_groups = validate_cache_groups(
+                plan.layers, bindings.cache_groups, runtime.max_seq_len)
+        else:
+            self.cache_groups = None
         self.runtime = runtime
         self.build_options = build_options
         self.resources = None
