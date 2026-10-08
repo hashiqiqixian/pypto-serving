@@ -21,6 +21,23 @@ import torch
 from pypto_serving.config.types import KVCacheGroupSpec
 from .composite import MissingCompositeInterface
 
+_MAX_REQUESTS_PER_DP = 32
+_MAX_PREFILL_TOKENS_PER_DP = 4096
+
+
+def _validate_dp_capacity(partitions, token_counts, *, phase):
+    requests = [0, 0]
+    tokens = [0, 0]
+    for partition, count in zip(partitions, token_counts):
+        if type(partition) is not int or not 0 <= partition < 2:
+            raise ValueError("requests require an explicit DP cache partition in [0, 2)")
+        requests[partition] += 1
+        tokens[partition] += count
+    if any(count > _MAX_REQUESTS_PER_DP for count in requests):
+        raise ValueError("V4.1 lib supports at most 32 requests per DP partition")
+    if phase == "prefill" and any(count > _MAX_PREFILL_TOKENS_PER_DP for count in tokens):
+        raise ValueError("V4.1 lib supports at most 4096 prefill tokens per DP partition")
+
 
 def validate_page_tables(rows, partitions, ends, groups):
     """Copy private full-history page tables and reject active request aliases.
@@ -119,6 +136,7 @@ def prefill_requests(batch, config, runtime, groups):
         cursor += size
     if cursor != len(token_ids):
         raise ValueError("prefill chunk spans leave unclaimed packed tokens")
+    _validate_dp_capacity(batch.cache_partitions, batch.chunk_lens, phase="prefill")
     pages = validate_page_tables(
         batch.block_ids_by_group, batch.cache_partitions, batch.seq_lens, groups,
     )
@@ -152,6 +170,7 @@ def decode_requests(batch, config, runtime, groups):
         raise ValueError("decode sequence length exceeds model capacity")
     if len(batch.cache_partitions) != count or len(batch.block_ids_by_group) != count:
         raise ValueError("decode requires one partition and grouped page table per request")
+    _validate_dp_capacity(batch.cache_partitions, (1 for _ in range(count)), phase="decode")
     pages = validate_page_tables(batch.block_ids_by_group, batch.cache_partitions, ends, groups)
     return [(key, partition, end - 1, token, table)
             for key, partition, end, token, table in zip(

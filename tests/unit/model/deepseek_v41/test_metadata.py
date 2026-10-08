@@ -16,7 +16,7 @@ import torch
 
 from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec, RuntimeConfig
 from pypto_serving.model.deepseek_v41.composite import MissingCompositeInterface
-from pypto_serving.model.deepseek_v41.metadata import prefill_requests
+from pypto_serving.model.deepseek_v41.metadata import _validate_dp_capacity, prefill_requests
 from pypto_serving.model.deepseek_v41.request_state import RequestLedger
 from pypto_serving.serving.utils.prefill import pack_prefill_batch
 
@@ -144,6 +144,27 @@ def test_dispatch_and_per_request_token_limits(inputs):
         prefill_requests(batch, config, replace(runtime, max_num_batched_tokens=4), groups)
     with pytest.raises(ValueError, match="per-request capacity"):
         prefill_requests(batch, config, replace(runtime, max_prefill_tokens_per_request=2), groups)
+
+
+def test_lib_capacity_is_checked_per_dp_partition():
+    _validate_dp_capacity([0] * 32 + [1] * 32, [128] * 64, phase="prefill")
+    with pytest.raises(ValueError, match="32 requests per DP"):
+        _validate_dp_capacity([0] * 33, [1] * 33, phase="decode")
+    with pytest.raises(ValueError, match="4096 prefill tokens per DP"):
+        _validate_dp_capacity([0, 0], [4096, 1], phase="prefill")
+    _validate_dp_capacity([0, 1], [4096, 4096], phase="prefill")
+
+
+def test_prefill_rejects_chunk_exceeding_lib_dp_capacity():
+    batch = pack_prefill_batch(
+        request_ids=["A"], token_chunks=[[4] * 4097], seq_lens=[4097],
+        chunk_starts=[0], prompt_lens=[4097], device="cpu", cache_partitions=[0],
+        block_ids_by_group=[{}],
+    )
+    config = SimpleNamespace(vocab_size=32, max_position_embeddings=8192)
+    runtime = RuntimeConfig(max_batch_size=1, max_seq_len=8192, max_num_batched_tokens=8192)
+    with pytest.raises(ValueError, match="4096 prefill tokens per DP"):
+        prefill_requests(batch, config, runtime, ())
 
 
 def test_decode_worker_column_tokens_preserve_request_order(inputs):
