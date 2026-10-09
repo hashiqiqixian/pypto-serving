@@ -6,91 +6,68 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Final-state output composition using existing V4.1 lib operators."""
+"""Dispatch the lib-owned final-state output composite."""
 
 import ctypes
 import importlib
-import sys
+from dataclasses import dataclass
+
+import torch
 
 from .composite import LayerState
+from .segment_inputs import SegmentInputs
 from .swa_segment import load_segment_modules
 
 
+@dataclass(frozen=True)
+class FinalOutputRows:
+    indices: torch.Tensor
+    locations: tuple[tuple[int, int], ...]
+
+
+def prepare_final_output_rows(inputs: SegmentInputs, *, world: int, local_capacity: int,
+                              max_logit_rows: int = 16) -> FinalOutputRows:
+    """Select each request's final token once, preserving original request order."""
+    if not isinstance(inputs, SegmentInputs) or any(
+        type(value) is not int or value <= 0 for value in (world, local_capacity, max_logit_rows)
+    ):
+        raise ValueError("final output requires valid packed inputs and rank capacities")
+    if tuple(inputs.row_indices.shape) != (world, local_capacity):
+        raise ValueError("final output row map differs from the layer-state layout")
+    indices = torch.full((world, max_logit_rows), -1, dtype=torch.int32).share_memory_()
+    counts = [0] * world
+    locations = []
+    for rank, row in inputs.request_last_rows:
+        if (type(rank) is not int or not 0 <= rank < world or type(row) is not int
+                or not 0 <= row < local_capacity or inputs.row_indices[rank, row] < 0):
+            raise ValueError("request final row is absent from the packed layer state")
+        slot = counts[rank]
+        if slot >= max_logit_rows:
+            raise ValueError("request final rows exceed the lib LM-head capacity on one rank")
+        indices[rank, slot] = row
+        counts[rank] += 1
+        locations.append((rank, slot))
+    return FinalOutputRows(indices, tuple(locations))
+
+
+def collect_final_logits(logits: torch.Tensor, rows: FinalOutputRows) -> torch.Tensor:
+    """Return owned CPU logits in request order after output completion."""
+    if (not isinstance(logits, torch.Tensor) or logits.device.type != "cpu"
+            or logits.ndim != 3 or logits.shape[:2] != rows.indices.shape
+            or logits.dtype != torch.float32):
+        raise ValueError("lib output must be CPU FP32 [rank, logit_row, vocabulary]")
+    if not rows.locations:
+        raise ValueError("final output requires at least one request")
+    result = torch.stack([logits[rank, slot] for rank, slot in rows.locations]).clone()
+    if not bool(torch.isfinite(result).all()):
+        raise ValueError("lib output contains non-finite request logits")
+    return result
+
+
 def make_final_output_program(lib_root, topology):
-    """Collapse the last delayed HC state, normalize, project and sample."""
-    import pypto.language as pl
-    import pypto.language.distributed as pld
-
     load_segment_modules(lib_root, topology)
-    package = "models.deepseek_v4_1_flash"
-    config = importlib.import_module(package + ".config")
-    hc_head = importlib.import_module(package + ".hc_head").hc_head
-    rms_norm = importlib.import_module(package + ".rmsnorm").rms_norm
-
-    # The LM-head module parses DP separately from the backbone's EP axis.
-    old_argv = sys.argv[:]
-    try:
-        sys.argv = [old_argv[0], "--tp", str(topology.tp), "--dp", str(topology.dp)]
-        lm = importlib.import_module(package + ".lm_head")
-    finally:
-        sys.argv = old_argv
-    if (lm.TP_SIZE, lm.DP_SIZE, lm.WORLD_SIZE) != (topology.tp, topology.dp, topology.world):
-        raise ValueError("LM head was imported for a different TP/DP topology")
-
-    world = topology.world
-    local = config.LOCAL_T_DYN
-    hc = config.HC_MULT
-    d = config.D
-    rows = lm.MAX_LOGIT_ROWS
-    vocab = lm.VOCAB
-    vocab_per_tp = lm.VOCAB_PER_TP
-    sampled_pad = lm.SAMPLED_IDS_PAD
-    tp = topology.tp
-    group_logit_rows = lm.GROUP_LOGIT_ROWS
-    head_entry = lm.lm_head_with_sampling_test
-
-    @pl.jit
-    def final_norm_rank(
-        x_hc: pl.Tensor[[local, hc, d], pl.FP32],
-        pre_mix: pl.Tensor[[local, hc], pl.FP32],
-        norm_weight: pl.Tensor[[d], pl.BF16],
-        normed: pl.Tensor[[local, d], pl.BF16],
-    ):
-        hidden = pl.create_tensor([pl.tensor.dim(x_hc, 0), d], dtype=pl.BF16)
-        hc_head(x_hc, pre_mix, hidden)
-        rms_norm(hidden, norm_weight, normed)
-
-    @pl.jit.host
-    def l3_final_output(
-        x_hc: pl.Tensor[[world, local, hc, d], pl.FP32],
-        pre_mix: pl.Tensor[[world, local, hc], pl.FP32],
-        norm_weight: pl.Tensor[[world, d], pl.BF16],
-        head_weight: pl.Tensor[[world, vocab_per_tp, d], pl.BF16],
-        logit_row_indices: pl.Tensor[[world, rows], pl.INT32],
-        normed: pl.Out[pl.Tensor[[world, local, d], pl.BF16]],
-        logits: pl.Out[pl.Tensor[[world, rows, vocab], pl.FP32]],
-        sampled_ids: pl.Out[pl.Tensor[[world, rows, sampled_pad], pl.INT32]],
-        done_epoch: pl.Scalar[pl.INT32],
-    ):
-        hidden_window_buf = pld.alloc_window_buffer(group_logit_rows * d * 2)
-        logits_window_buf = pld.alloc_window_buffer(rows * vocab * 4)
-        hidden_done_buf = pld.alloc_window_buffer(tp * 4)
-        logits_done_buf = pld.alloc_window_buffer(tp * 4)
-        for rank in pl.range(pld.world_size()):
-            final_norm_rank(x_hc[rank], pre_mix[rank], norm_weight[rank], normed[rank], device=rank)
-        for rank in pl.range(pld.world_size()):
-            hidden_window = pld.window(hidden_window_buf, [group_logit_rows, d], dtype=pl.BF16)
-            hidden_done = pld.window(hidden_done_buf, [tp, 1], dtype=pl.INT32)
-            logits_window = pld.window(logits_window_buf, [rows, vocab], dtype=pl.FP32)
-            logits_done = pld.window(logits_done_buf, [tp, 1], dtype=pl.INT32)
-            head_entry(
-                normed[rank], head_weight[rank], logit_row_indices[rank], logits[rank], sampled_ids[rank],
-                hidden_window, hidden_done, logits_window, logits_done,
-                rank // tp * tp, rank % tp, done_epoch,
-                device=rank,
-            )
-
-    return l3_final_output
+    module = importlib.import_module("models.deepseek_v4_1_flash.final_output")
+    return module.make_final_output_program(topology.tp, topology.dp)
 
 
 def compile_final_output(compiler, lib_root, topology):
@@ -113,7 +90,7 @@ class FinalOutput:
         required = {"x_hc", "pre_mix", "norm_weight", "head_weight", "logit_row_indices",
                     "normed", "logits", "sampled_ids", "done_epoch"}
         if set(self.param_names) != required or len(self.param_names) != len(required):
-            raise ValueError("final output ABI differs from the serving composition")
+            raise ValueError("final output ABI differs from the lib composite")
 
     def run(self, state: LayerState, arguments):
         if self.failed:
