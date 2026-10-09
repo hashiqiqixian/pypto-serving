@@ -25,28 +25,36 @@ class FinalOutputRows:
     locations: tuple[tuple[int, int], ...]
 
 
-def prepare_final_output_rows(inputs: SegmentInputs, *, world: int, local_capacity: int,
-                              max_logit_rows: int = 16) -> FinalOutputRows:
-    """Select each request's final token once, preserving original request order."""
-    if not isinstance(inputs, SegmentInputs) or any(
-        type(value) is not int or value <= 0 for value in (world, local_capacity, max_logit_rows)
-    ):
+def prepare_final_output_rows(inputs: SegmentInputs, indices: torch.Tensor, *,
+                              local_capacity: int) -> FinalOutputRows:
+    """Stage final-token rows into a pre-fork shared buffer in request order."""
+    if not isinstance(inputs, SegmentInputs) or type(local_capacity) is not int or local_capacity <= 0:
         raise ValueError("final output requires valid packed inputs and rank capacities")
+    if (not isinstance(indices, torch.Tensor) or indices.device.type != "cpu"
+            or indices.dtype != torch.int32 or indices.ndim != 2
+            or min(indices.shape) <= 0 or not indices.is_contiguous() or not indices.is_shared()):
+        raise ValueError("LM-head row indices must be a pre-fork shared CPU INT32 matrix")
+    world, max_logit_rows = indices.shape
     if tuple(inputs.row_indices.shape) != (world, local_capacity):
         raise ValueError("final output row map differs from the layer-state layout")
-    indices = torch.full((world, max_logit_rows), -1, dtype=torch.int32).share_memory_()
     counts = [0] * world
     locations = []
+    selected = set()
     for rank, row in inputs.request_last_rows:
         if (type(rank) is not int or not 0 <= rank < world or type(row) is not int
                 or not 0 <= row < local_capacity or inputs.row_indices[rank, row] < 0):
             raise ValueError("request final row is absent from the packed layer state")
+        if (rank, row) in selected:
+            raise ValueError("two requests cannot select the same final token row")
+        selected.add((rank, row))
         slot = counts[rank]
         if slot >= max_logit_rows:
             raise ValueError("request final rows exceed the lib LM-head capacity on one rank")
-        indices[rank, slot] = row
         counts[rank] += 1
         locations.append((rank, slot))
+    indices.fill_(-1)
+    for (rank, row), (_, slot) in zip(inputs.request_last_rows, locations):
+        indices[rank, slot] = row
     return FinalOutputRows(indices, tuple(locations))
 
 

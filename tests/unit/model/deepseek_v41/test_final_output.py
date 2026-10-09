@@ -55,9 +55,10 @@ def test_output_rejects_missing_weights_before_launch():
 def test_final_rows_preserve_request_order_across_ranks():
     source_rows = torch.tensor([[0, 1, -1], [2, -1, -1]], dtype=torch.int64)
     inputs = SegmentInputs(None, None, source_rows, ((1, 0), (0, 1)), (2,))
-    rows = prepare_final_output_rows(inputs, world=2, local_capacity=3, max_logit_rows=2)
+    shared = torch.empty(2, 2, dtype=torch.int32).share_memory_()
+    rows = prepare_final_output_rows(inputs, shared, local_capacity=3)
     assert rows.indices.tolist() == [[1, -1], [0, -1]]
-    assert rows.indices.is_shared()
+    assert rows.indices is shared
 
     logits = torch.zeros(2, 2, 4, dtype=torch.float32)
     logits[1, 0] = torch.tensor([1, 2, 3, 4], dtype=torch.float32)
@@ -71,5 +72,7 @@ def test_final_rows_preserve_request_order_across_ranks():
 def test_final_rows_reject_per_rank_lm_head_overflow():
     source_rows = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int64)
     inputs = SegmentInputs(None, None, source_rows, ((0, 0), (0, 1)), (2,))
+    shared = torch.full((2, 1), 7, dtype=torch.int32).share_memory_()
     with pytest.raises(ValueError, match="capacity"):
-        prepare_final_output_rows(inputs, world=2, local_capacity=2, max_logit_rows=1)
+        prepare_final_output_rows(inputs, shared, local_capacity=2)
+    assert shared.tolist() == [[7], [7]]
