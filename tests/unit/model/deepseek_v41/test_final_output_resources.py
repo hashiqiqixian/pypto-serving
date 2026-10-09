@@ -116,3 +116,23 @@ def test_final_runtime_dispatches_owned_request_logits():
     runtime.close()
     runtime.close()
     assert len(worker.freed) == 3
+
+
+def test_final_runtime_rejects_unshared_output_buffer():
+    world, rows, vocab, hidden = 8, 16, 16, 4
+    host = final_output_resources.FinalOutputHostResources(
+        torch.ones(world, hidden, dtype=torch.bfloat16).share_memory_(),
+        torch.ones(world, vocab // 4, hidden, dtype=torch.bfloat16).share_memory_(),
+        torch.full((world, rows), -1, dtype=torch.int32).share_memory_(),
+        torch.zeros(world, rows, vocab, dtype=torch.float32),
+        torch.zeros(world, rows, 8, dtype=torch.int32).share_memory_(),
+    )
+    worker = RecordingWorker()
+    with pytest.raises(ValueError, match="must be shared"):
+        final_output_resources.FinalOutputRuntime(
+            worker, SimpleNamespace(compiled="output"),
+            ("x_hc", "pre_mix", "norm_weight", "head_weight", "logit_row_indices",
+             "normed", "logits", "sampled_ids", "done_epoch"),
+            None, SegmentTopology.for_decode(), host,
+        )
+    assert worker.next_ptr == 1

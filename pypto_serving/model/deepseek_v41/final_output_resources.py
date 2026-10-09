@@ -29,6 +29,10 @@ class FinalOutputHostResources:
 
     @property
     def inherited_host_tensors(self):
+        return self.norm_weight, self.head_weight
+
+    @property
+    def all_host_tensors(self):
         return (self.norm_weight, self.head_weight, self.logit_row_indices,
                 self.logits, self.sampled_ids)
 
@@ -93,7 +97,7 @@ class FinalOutputRuntime:
         if not isinstance(host, FinalOutputHostResources) or not isinstance(topology, SegmentTopology):
             raise ValueError("final output requires host resources and a segment topology")
         world, local = topology.world, topology.local_capacity
-        if any(not tensor.is_shared() for tensor in host.inherited_host_tensors):
+        if any(not tensor.is_shared() for tensor in host.all_host_tensors):
             raise ValueError("final output host buffers must be shared before worker creation")
         if (host.norm_weight.dtype != torch.bfloat16 or host.norm_weight.shape != (world, host.head_weight.shape[-1])
                 or host.head_weight.dtype != torch.bfloat16 or host.head_weight.shape[0] != world
