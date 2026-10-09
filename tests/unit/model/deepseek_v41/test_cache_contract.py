@@ -14,9 +14,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
+from pypto.runtime import DeviceTensor
 
 from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
 from pypto_serving.model.deepseek_v41.cache_contract import V41CacheGroups, validate_cache_groups
+from pypto_serving.model.deepseek_v41.cache_resources import DecodeCachePools, plan_decode_cache_pools
 from pypto_serving.model.deepseek_v41.composite import CompositeBindings
 from pypto_serving.model.deepseek_v41.execution_plan import RankPlacement, plan_layers
 from pypto_serving.model.deepseek_v41.npu_runner import V41ModelRunner
@@ -87,3 +90,66 @@ def test_runner_rejects_bad_layout_before_device_allocation(contract):
         V41ModelRunner(plan, bindings, device_ids=range(8),
                        runtime=SimpleNamespace(max_seq_len=8320))
     assert calls == []
+
+
+def decode_abi():
+    return SimpleNamespace(
+        N_LAYERS=40, KV_SOURCE_COUNT=4, C2A_SOURCE_COUNT=3,
+        INDEX_SOURCE_COUNT=8, BLOCK_SIZE=128, HEAD_DIM=512, INDEX_DIM=128,
+        EP_SIZE=8, STATE_CAPACITY=4, STATE_WIDTH=1024,
+        WINDOW_CACHE_GROUP=32, COMPRESSED_CACHE_GROUP=16, INDEX_CACHE_GROUP=32,
+    )
+
+
+def test_decode_cache_pools_preserve_layer_and_source_namespaces(contract):
+    layers, groups = contract
+    plan = plan_decode_cache_pools(
+        layers, groups, max_seq_len=8320, primary_num_blocks=65,
+        request_slots=2, abi=decode_abi(),
+    )
+    buffers = {spec.name: spec for spec in plan.buffers}
+    assert plan.group_blocks == {"window": 65, "c2a": 33, "c1a": 65}
+    assert buffers["window_cache_pool"].shape == (8, 40 * 65, 128, 1, 512)
+    assert buffers["compressed_cache_pool"].shape == (8, 4 * 65, 128, 1, 256)
+    assert buffers["index_cache_pool"].shape == (8, 8 * 65, 128, 1, 64)
+    assert buffers["state_cache_pool"].shape == (8, 3 * 2, 4, 1024)
+    assert buffers["window_cache_scale_pool"].dtype == torch.float8_e8m0fnu
+
+
+def test_decode_cache_plan_rejects_scheduler_capacity_mismatch(contract):
+    layers, groups = contract
+    with pytest.raises(ValueError, match="conflicts with the scheduler"):
+        plan_decode_cache_pools(
+            layers, groups, max_seq_len=8320, primary_num_blocks=130,
+            request_slots=2, abi=decode_abi(),
+        )
+
+
+def test_decode_cache_allocation_releases_completed_pools_after_failure(contract):
+    layers, groups = contract
+    plan = plan_decode_cache_pools(
+        layers, groups, max_seq_len=8320, primary_num_blocks=65,
+        request_slots=2, abi=decode_abi(),
+    )
+
+    class Worker:
+        def __init__(self):
+            self.allocated = 0
+            self.freed = []
+
+        def alloc_tensor(self, shape, dtype, *, worker_id):
+            self.allocated += 1
+            if self.allocated == 10:
+                raise RuntimeError("device allocation failed")
+            return DeviceTensor(self.allocated, shape, dtype)
+
+        def free_tensor(self, tensor, *, worker_id):
+            self.freed.append(tensor.data_ptr)
+
+        def free_stacked_tensor(self, tensor):
+            self.freed.extend(shard.data_ptr for shard in tensor.shards)
+
+    worker = Worker()
+    with pytest.raises(RuntimeError, match="device allocation failed"):
+        DecodeCachePools(worker, plan)
+    assert set(worker.freed) == set(range(1, 10))
