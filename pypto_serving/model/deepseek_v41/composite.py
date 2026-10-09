@@ -88,15 +88,12 @@ class CompositeBindings:
 
 
 def load_composite_bindings() -> CompositeBindings:
-    """Fail before resource allocation until a complete adapter is implemented.
-
-    This is an intentional integration placeholder, not a discovery heuristic:
-    importing a lib module or finding a function does not establish its ABI.
-    """
+    """Fail before allocation until the production resource adapter is complete."""
     raise MissingCompositeInterface(
-        "V4.1 serving execution requires verified lib composite bindings: "
-        "all-mode prefill/decode adapters, initial residual/pre_mix, "
-        "cache allocation/reset/completion and final HC/Norm/LM head. "
-        "The bounded SWA Attention/MoE segment is available separately; it is not a complete model backend. "
-        "Track pypto-lib #1205, #1275 and #1287; no Torch fallback is enabled."
+        "V4.1 serving has no production CompositeBindings: resident layer weights, "
+        "window/compressed/index/state cache allocation, request reset, and "
+        "prefill/decode metadata dispatch are not bound to one persistent worker. "
+        "The selected lib validation revision provides the Attention/MoE, decode "
+        "backbone, and final HC/Norm/LM-head entries; their standalone codegen "
+        "does not establish an executable serving backend."
     )
