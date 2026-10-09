@@ -29,6 +29,7 @@ class DecodeCachePlan:
     primary_num_blocks: int
     group_blocks: dict[str, int]
     buffers: tuple[CacheBufferSpec, ...]
+    request_slots: int
 
 
 def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
@@ -95,14 +96,29 @@ def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
         CacheBufferSpec("state_cache_pool", (
             world, c2a_sources * request_slots, abi.STATE_CAPACITY, abi.STATE_WIDTH), torch.float32),
     )
-    return DecodeCachePlan(primary_num_blocks, group_blocks, buffers)
+    return DecodeCachePlan(primary_num_blocks, group_blocks, buffers, request_slots)
+
+
+def make_state_reset_buffer(plan: DecodeCachePlan) -> torch.Tensor:
+    """Create the worker-inherited zero row used when a request slot is freed."""
+    shape = next(spec.shape for spec in plan.buffers if spec.name == "state_cache_pool")
+    return torch.zeros((shape[0], *shape[2:]), dtype=torch.float32).share_memory_()
 
 
 class DecodeCachePools:
     """Own cache handles; the caller must wait for all launches before close."""
 
-    def __init__(self, worker, plan: DecodeCachePlan):
+    def __init__(self, worker, plan: DecodeCachePlan, state_reset: torch.Tensor):
+        state_spec = next(spec for spec in plan.buffers if spec.name == "state_cache_pool")
+        if (not isinstance(state_reset, torch.Tensor) or state_reset.device.type != "cpu"
+                or state_reset.dtype != torch.float32 or not state_reset.is_shared()
+                or not state_reset.is_contiguous()
+                or tuple(state_reset.shape) != (state_spec.shape[0], *state_spec.shape[2:])
+                or not bool((state_reset == 0).all())):
+            raise ValueError("state reset rows must be shared zero FP32 buffers created before worker startup")
         self.worker = worker
+        self.plan = plan
+        self.state_reset = state_reset
         self.tensors = {}
         try:
             for spec in plan.buffers:
@@ -111,6 +127,25 @@ class DecodeCachePools:
         except BaseException:
             self.close()
             raise
+
+    def reset_state_slot(self, partition: int, slot: int):
+        """Clear the three C2A pending-pair rows for one DP request slot."""
+        if type(partition) is not int or not 0 <= partition < 2:
+            raise ValueError("invalid DP partition")
+        if type(slot) is not int or not 0 <= slot < self.plan.request_slots:
+            raise ValueError("invalid compressor state slot")
+        state = self.tensors["state_cache_pool"]
+        row = self.state_reset[0]
+        row_bytes = row.numel() * row.element_size()
+        source_count = state.shape[1] // self.plan.request_slots
+        for rank in range(partition * 4, (partition + 1) * 4):
+            source = self.state_reset[rank]
+            for index in range(source_count):
+                self.worker.copy_to(
+                    state.shards[rank].data_ptr, source.data_ptr(), row_bytes,
+                    dst_offset=(index * self.plan.request_slots + slot) * row_bytes,
+                    worker_id=rank,
+                )
 
     def close(self):
         for tensor in reversed(tuple(self.tensors.values())):

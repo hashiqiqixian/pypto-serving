@@ -19,7 +19,9 @@ from pypto.runtime import DeviceTensor
 
 from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
 from pypto_serving.model.deepseek_v41.cache_contract import V41CacheGroups, validate_cache_groups
-from pypto_serving.model.deepseek_v41.cache_resources import DecodeCachePools, plan_decode_cache_pools
+from pypto_serving.model.deepseek_v41.cache_resources import (
+    DecodeCachePools, make_state_reset_buffer, plan_decode_cache_pools,
+)
 from pypto_serving.model.deepseek_v41.composite import CompositeBindings
 from pypto_serving.model.deepseek_v41.execution_plan import RankPlacement, plan_layers
 from pypto_serving.model.deepseek_v41.npu_runner import V41ModelRunner
@@ -151,5 +153,40 @@ def test_decode_cache_allocation_releases_completed_pools_after_failure(contract
 
     worker = Worker()
     with pytest.raises(RuntimeError, match="device allocation failed"):
-        DecodeCachePools(worker, plan)
+        DecodeCachePools(worker, plan, make_state_reset_buffer(plan))
     assert set(worker.freed) == set(range(1, 10))
+
+
+def test_reset_only_targets_one_dp_request_state_slot(contract):
+    layers, groups = contract
+    plan = plan_decode_cache_pools(
+        layers, groups, max_seq_len=8320, primary_num_blocks=65,
+        request_slots=2, abi=decode_abi(),
+    )
+
+    class Worker:
+        def __init__(self):
+            self.next_ptr = 0
+            self.copies = []
+
+        def alloc_tensor(self, shape, dtype, *, worker_id):
+            self.next_ptr += 1
+            return DeviceTensor(self.next_ptr, shape, dtype)
+
+        def free_stacked_tensor(self, tensor):
+            pass
+
+        def copy_to(self, destination, source, count, *, dst_offset, worker_id):
+            self.copies.append((worker_id, dst_offset, count))
+
+    worker = Worker()
+    pools = DecodeCachePools(worker, plan, make_state_reset_buffer(plan))
+    pools.reset_state_slot(1, 1)
+    row_bytes = 4 * 1024 * 4
+    assert worker.copies == [
+        (rank, (source * 2 + 1) * row_bytes, row_bytes)
+        for rank in range(4, 8) for source in range(3)
+    ]
+    with pytest.raises(ValueError, match="invalid compressor"):
+        pools.reset_state_slot(1, 2)
+    pools.close()
