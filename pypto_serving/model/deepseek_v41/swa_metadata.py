@@ -69,7 +69,7 @@ def prepare_swa_window_metadata(
     *,
     cache_pages: int,
     window_group: str = "window",
-    max_prepare_bytes: int = 16 << 20,
+    max_prepare_bytes: int = 32 << 20,
 ) -> SwaWindowMetadata:
     """Map each active row to a unique cache write and at most 128 causal reads.
 

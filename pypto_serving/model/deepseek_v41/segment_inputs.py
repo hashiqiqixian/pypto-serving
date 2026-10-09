@@ -37,7 +37,7 @@ def prepare_segment_inputs(
     step: ForwardStep,
     topology: SegmentTopology,
     *,
-    max_prepare_bytes: int = 256 << 20,
+    max_prepare_bytes: int = 1 << 30,
 ) -> SegmentInputs:
     """Pack fresh embedding inputs without depending on request batch order.
 
