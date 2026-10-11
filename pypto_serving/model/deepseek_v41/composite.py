@@ -69,11 +69,14 @@ class CompositeBindings:
     input_layout: str = "tp_replicated"
     output_layout: str = "tp_replicated"
     decode_backbone: Callable | None = None
+    prefill_backbone: Callable | None = None
 
     def require(self, layers: tuple[LayerPlan, ...], placement: RankPlacement) -> None:
         if not self.revision:
             raise ValueError("composite bindings must identify the validated lib revision")
-        phases = ("prefill",) if callable(self.decode_backbone) else ("prefill", "decode")
+        phases = tuple(phase for phase, backbone in (
+            ("prefill", self.prefill_backbone), ("decode", self.decode_backbone),
+        ) if not callable(backbone))
         missing = sorted({f"{phase}/{layer.mode}" for phase in phases
                           for layer in layers if not callable(self.entries.get((phase, layer.mode)))})
         if missing:
@@ -87,16 +90,10 @@ class CompositeBindings:
             raise ValueError("V4.1 serving currently targets TP4/DP2/EP8")
 
 
-def load_composite_bindings() -> CompositeBindings:
-    """Fail before resource allocation until a complete adapter is implemented.
+def load_composite_bindings(model_dir=None, max_seq_len=None) -> CompositeBindings:
+    """Resolve the model-specific contract without opening a device."""
+    if model_dir is None or max_seq_len is None:
+        raise ValueError("V4.1 composite bindings require a model directory and context length")
+    from .production_binding import make_production_bindings
 
-    This is an intentional integration placeholder, not a discovery heuristic:
-    importing a lib module or finding a function does not establish its ABI.
-    """
-    raise MissingCompositeInterface(
-        "V4.1 serving execution requires verified lib composite bindings: "
-        "all-mode prefill/decode adapters, initial residual/pre_mix, "
-        "cache allocation/reset/completion and final HC/Norm/LM head. "
-        "The bounded SWA Attention/MoE segment is available separately; it is not a complete model backend. "
-        "Track pypto-lib #1205, #1275 and #1287; no Torch fallback is enabled."
-    )
+    return make_production_bindings(model_dir, max_seq_len)

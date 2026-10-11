@@ -143,8 +143,10 @@ class V41ModelRunner:
         state = self.bindings.initialize(embeddings, step, self.resources)
         self.bindings.wait(self.resources)
         self._check_state(state)
-        if step.phase == "decode" and self.bindings.decode_backbone is not None:
-            state = self.bindings.decode_backbone(state, step, self.resources, plans)
+        backbone = (self.bindings.prefill_backbone if step.phase == "prefill"
+                    else self.bindings.decode_backbone)
+        if backbone is not None:
+            state = backbone(state, step, self.resources, plans)
             self.bindings.wait(self.resources)
             return self._check_state(state)
         for layer in self.plan.layers:

@@ -17,7 +17,8 @@ from pypto_serving.model.deepseek_v41.npu_runner import V41ModelRunner
 from pypto_serving.model.deepseek_v41.request_state import ForwardStep, RequestSlice
 
 
-def make_runner(*, layout="tp_local_token", entry=None, output=None, decode_backbone=None):
+def make_runner(*, layout="tp_local_token", entry=None, output=None,
+                decode_backbone=None, prefill_backbone=None):
     events = []
     layers = tuple(LayerPlan(i, mode, None if i == 0 else 1, None if i == 0 else 1, None)
                    for i, mode in enumerate(("swa", "c2a_full", "c2a_reuse")))
@@ -33,11 +34,11 @@ def make_runner(*, layout="tp_local_token", entry=None, output=None, decode_back
         return layer.layer_id
     bindings = CompositeBindings(revision="recording-test-adapter", input_layout=layout, output_layout=layout,
         entries={(phase, layer.mode): entry or call
-                 for phase in (("prefill",) if decode_backbone else ("prefill", "decode")) for layer in layers},
+                 for phase in ("prefill", "decode") for layer in layers},
         initialize=initialize, output=output or (lambda *a: None), allocate=lambda *a: (object(), 8),
         prepare_weights=prepare, reset_request=lambda *a: events.append(("reset", a[1])),
         wait=lambda *a: events.append(("wait",)), close=lambda *a: events.append(("close",)),
-        decode_backbone=decode_backbone)
+        decode_backbone=decode_backbone, prefill_backbone=prefill_backbone)
     config = SimpleNamespace(hidden_size=4, vocab_size=16, max_position_embeddings=128)
     plan = SimpleNamespace(placement=RankPlacement(0), layers=layers, weights=SimpleNamespace(config=config))
     plan.for_rank = lambda rank: SimpleNamespace(placement=RankPlacement(rank))
@@ -80,6 +81,21 @@ def test_decode_backbone_runs_once_with_rank_plans_and_no_layer_dispatch():
     step = ForwardStep("decode", (RequestSlice("a", 1, 0, 7, (2,), 8, {}),), 4)
     runner._run_layers(step, torch.ones(1, 4, dtype=torch.bfloat16))
     assert called == [("decode", tuple(range(8)))]
+    assert not [event for event in events if event[0] in ("layer", "weights")]
+    assert events[-1] == ("wait",)
+
+
+def test_prefill_backbone_runs_once_with_rank_plans_and_no_layer_dispatch():
+    called = []
+
+    def backbone(state, step, resources, plans):
+        called.append((step.phase, tuple(plan.placement.rank for plan in plans)))
+        return state
+
+    runner, events = make_runner(prefill_backbone=backbone)
+    step = ForwardStep("prefill", (RequestSlice("a", 1, 0, 0, (2, 3), 2, {}),), 4)
+    runner._run_layers(step, torch.ones(2, 4, dtype=torch.bfloat16))
+    assert called == [("prefill", tuple(range(8)))]
     assert not [event for event in events if event[0] in ("layer", "weights")]
     assert events[-1] == ("wait",)
 

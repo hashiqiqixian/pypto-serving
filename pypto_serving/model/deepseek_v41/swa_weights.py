@@ -12,6 +12,8 @@
 Uses the existing selective loader, as V4 separates loading from execution.
 No lib fixtures, device execution or FP4 float expansion belongs here.
 """
+from pathlib import Path
+
 import torch
 
 from .weight_loader import V41WeightLoader
@@ -62,7 +64,8 @@ def load_swa_layer_weights(model_dir, layer_id, topology, *, max_bundle_bytes=32
     return _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, swa_only=True)
 
 
-def load_prefill_layer_weights(model_dir, layer_id, topology, *, max_bundle_bytes=32 << 30):
+def load_prefill_layer_weights(model_dir, layer_id, topology, *, max_bundle_bytes=32 << 30,
+                               loaders=None):
     """Load this layer's real Attention/MoE weights for the prefill SP entries.
 
     Full modes own compressor and index-key weights; Reindex owns only index
@@ -70,7 +73,8 @@ def load_prefill_layer_weights(model_dir, layer_id, topology, *, max_bundle_byte
     C1A ABI buffers must be supplied by the resource adapter, not fabricated by
     the loader. Index heads are replicated, matching lib's global INDEX_H.
     """
-    return _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, swa_only=False)
+    return _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes,
+                               swa_only=False, loaders=loaders)
 
 
 def load_prefill_attention_weights(model_dir, layer_id, topology, *, max_bundle_bytes=4 << 30):
@@ -84,14 +88,25 @@ def load_prefill_attention_weights(model_dir, layer_id, topology, *, max_bundle_
     return attention
 
 
-def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_only, include_moe=True):
+def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_only,
+                        include_moe=True, loaders=None):
     if type(max_bundle_bytes) is not int or max_bundle_bytes <= 0:
         raise ValueError("max_bundle_bytes must be positive")
     attention, moe = [], []
     held_bytes = 0
-    for rank in range(topology.world):
-        loader = V41WeightLoader(model_dir, tp_size=topology.tp, tp_rank=rank % topology.tp,
-                                 ep_size=topology.world, ep_rank=rank, max_load_bytes=512 << 20)
+    if loaders is None:
+        loaders = tuple(V41WeightLoader(
+            model_dir, tp_size=topology.tp, tp_rank=rank % topology.tp,
+            ep_size=topology.world, ep_rank=rank, max_load_bytes=512 << 20,
+        ) for rank in range(topology.world))
+    if len(loaders) != topology.world:
+        raise ValueError("one V4.1 weight loader is required per EP rank")
+    model_path = Path(model_dir).resolve()
+    for rank, loader in enumerate(loaders):
+        if (loader.model_dir != model_path or loader.tp_size != topology.tp
+                or loader.tp_rank != rank % topology.tp or loader.ep_size != topology.world
+                or loader.ep_rank != rank):
+            raise ValueError("V4.1 weight loader placement does not match the layer topology")
         if type(layer_id) is not int or not 0 <= layer_id < loader.config.num_hidden_layers:
             raise ValueError("selected layer must be a backbone layer")
         ratio = loader.text["compress_ratios"][layer_id]

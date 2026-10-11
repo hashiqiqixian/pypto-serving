@@ -14,7 +14,7 @@ entire audited ABI and retain every program's communication windows.
 """
 import importlib
 
-from .swa_segment import ATTENTION_ARGS, SwaSegment, load_segment_modules
+from .swa_segment import ATTENTION_ARGS, MOE_ARGS, SwaSegment, load_segment_modules
 from .execution_plan import LayerPlan
 
 
@@ -138,7 +138,11 @@ def compile_prefill_segments(compiler, lib_root, topology, modes):
         else:
             module = importlib.import_module("models.deepseek_v4_1_flash.prefill_c1a_sp")
             entry = module.make_program(mode.removeprefix("c1a_"), topology.world, epochs=1)
+        if tuple(entry.param_names) != tuple(PREFILL_ARGUMENTS[mode]):
+            raise ValueError(f"{mode} prefill parameter order disagrees with the selected lib")
         attention[mode] = compiler.compile("v41_prefill_" + mode, entry, attention_epoch=pl.RUNTIME)
+    if tuple(moe.l3_moe.param_names) != tuple(MOE_ARGS):
+        raise ValueError("prefill MoE parameter order disagrees with the selected lib")
     ffn = compiler.compile("v41_moe_segment", moe.l3_moe, moe_epoch=pl.RUNTIME)
     return attention, ffn
 

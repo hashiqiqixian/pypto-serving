@@ -41,11 +41,19 @@ def test_decode_weight_slices_follow_layer_and_producer_order(monkeypatch, tmp_p
     raw = json.loads(CONFIG.read_text(encoding="utf-8"))
     (tmp_path / "config.json").write_text(json.dumps(raw), encoding="utf-8")
     calls = []
+    loader_ranks = []
 
-    def load(_model_dir, layer_id, _topology, *, max_bundle_bytes):
+    def make_loader(_model_dir, *, tp_size, tp_rank, ep_size, ep_rank, max_load_bytes):
+        assert (tp_size, tp_rank, ep_size, max_load_bytes) == (4, ep_rank % 4, 8, 512 << 20)
+        loader_ranks.append(ep_rank)
+        return object()
+
+    def load(_model_dir, layer_id, _topology, *, max_bundle_bytes, loaders):
+        assert len(loaders) == 8
         calls.append((layer_id, max_bundle_bytes))
         return _weights(layer_id)
 
+    monkeypatch.setattr(decode_weights, "V41WeightLoader", make_loader)
     monkeypatch.setattr(decode_weights, "load_prefill_layer_weights", load)
     chunks = list(decode_weights.iter_decode_weight_slices(
         tmp_path, SegmentTopology(tp=4, dp=2), max_bundle_bytes=1234,
@@ -53,6 +61,7 @@ def test_decode_weight_slices_follow_layer_and_producer_order(monkeypatch, tmp_p
     by_name = {}
     for chunk in chunks:
         by_name.setdefault(chunk.name, []).append(chunk)
+    assert loader_ranks == list(range(8))
     assert calls == [(layer, 1234) for layer in range(40)]
     assert set(by_name) == set(decode_weights._ATTENTION) | set(decode_weights._MOE) | {
         "mxfp4_pair_lut", "compressor_norm_weight", "c2a_compressor_wkv",

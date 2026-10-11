@@ -364,6 +364,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
     )
     from pypto_serving.model.deepseek_v41.config import V41TextConfig
     from pypto_serving.model.deepseek_v41.execution_plan import RankPlacement, plan_layers
+    from pypto_serving.model.deepseek_v41.swa_segment import SegmentTopology
     from pypto_serving.serving.engine.async_engine import EngineConfig
 
     text = V41TextConfig.from_dict(raw)
@@ -380,6 +381,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         raise ValueError("V4.1 --max-model-len must fit the checkpoint position capacity")
     if args.max_num_seqs <= 0 or args.max_num_batched_tokens <= 0:
         raise ValueError("V4.1 batch and token capacities must be positive")
+    step_tokens = min(args.max_num_batched_tokens, SegmentTopology.for_decode().capacity)
 
     parallel = ParallelConfig(
         data_parallel_size=1, tensor_parallel_size=1, expert_parallel_size=8,
@@ -388,7 +390,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
     )
     # This resolver intentionally raises while the lib adapter is missing.
     # No default generic KV layout may be substituted for the V4.1 pools.
-    bindings = load_composite_bindings()
+    bindings = load_composite_bindings(model_dir, args.max_model_len)
     bindings.require(plan_layers(raw), RankPlacement(0))
     groups = tuple(bindings.cache_groups)
     if not groups or any(not isinstance(group, KVCacheGroupSpec) for group in groups):
@@ -400,6 +402,8 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
     runtime = dataclasses.replace(
         _build_runtime_config(args),
         kv_cache_groups=groups,
+        max_num_batched_tokens=step_tokens,
+        max_prefill_tokens_per_request=step_tokens,
         requires_homogeneous_prefill_decode=True,
     )
     return EngineConfig(
@@ -414,7 +418,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         runtime_config=runtime,
         profile_config=_build_profile_config(args),
         max_num_running_reqs=args.max_num_seqs,
-        max_num_scheduled_tokens=args.max_num_batched_tokens,
+        max_num_scheduled_tokens=step_tokens,
         long_prefill_token_threshold=args.long_prefill_token_threshold,
         # Prefix restore needs both KV pages and matching compressor state.
         # Pipelining needs independently owned mutable snapshots and tickets.

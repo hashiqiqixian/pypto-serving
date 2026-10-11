@@ -9,9 +9,13 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from pypto_serving.model.deepseek_v41.composite import LayerState
-from pypto_serving.model.deepseek_v41.final_output import FinalOutput
+from pypto_serving.model.deepseek_v41.final_output import (
+    FinalOutput, collect_final_logits, prepare_final_output_rows,
+)
+from pypto_serving.model.deepseek_v41.segment_inputs import SegmentInputs
 
 
 PARAMS = ("x_hc", "pre_mix", "norm_weight", "head_weight", "logit_row_indices",
@@ -46,3 +50,29 @@ def test_output_rejects_missing_weights_before_launch():
     with pytest.raises(ValueError, match="head_weight"):
         output.run(state, {"norm_weight": object()}, )
     assert worker.calls == []
+
+
+def test_final_rows_preserve_request_order_across_ranks():
+    source_rows = torch.tensor([[0, 1, -1], [2, -1, -1]], dtype=torch.int64)
+    inputs = SegmentInputs(None, None, source_rows, ((1, 0), (0, 1)), (2,))
+    shared = torch.empty(2, 2, dtype=torch.int32).share_memory_()
+    rows = prepare_final_output_rows(inputs, shared, local_capacity=3)
+    assert rows.indices.tolist() == [[1, -1], [0, -1]]
+    assert rows.indices is shared
+
+    logits = torch.zeros(2, 2, 4, dtype=torch.float32)
+    logits[1, 0] = torch.tensor([1, 2, 3, 4], dtype=torch.float32)
+    logits[0, 0] = torch.tensor([5, 6, 7, 8], dtype=torch.float32)
+    result = collect_final_logits(logits, rows)
+    assert result.tolist() == [[1, 2, 3, 4], [5, 6, 7, 8]]
+    logits.zero_()
+    assert result[0, 0] == 1
+
+
+def test_final_rows_reject_per_rank_lm_head_overflow():
+    source_rows = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int64)
+    inputs = SegmentInputs(None, None, source_rows, ((0, 0), (0, 1)), (2,))
+    shared = torch.full((2, 1), 7, dtype=torch.int32).share_memory_()
+    with pytest.raises(ValueError, match="capacity"):
+        prepare_final_output_rows(inputs, shared, local_capacity=2)
+    assert shared.tolist() == [[7], [7]]

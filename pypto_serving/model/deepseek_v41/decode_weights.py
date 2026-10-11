@@ -21,6 +21,7 @@ import torch
 
 from .execution_plan import plan_layers
 from .swa_weights import load_prefill_layer_weights
+from .weight_loader import V41WeightLoader
 
 
 _ATTENTION = {
@@ -107,9 +108,14 @@ def iter_decode_weight_slices(model_dir, topology, *, max_bundle_bytes=32 << 30)
     c2a_sources = tuple(layer.layer_id for layer in layers if layer.mode == "c2a_full")
     if len(kv_sources) != 4 or len(index_sources) != 8 or len(c2a_sources) != 3:
         raise ValueError("lib decode_fwd source axes disagree with the checkpoint schedule")
+    loaders = tuple(V41WeightLoader(
+        model_dir, tp_size=topology.tp, tp_rank=rank % topology.tp,
+        ep_size=topology.world, ep_rank=rank, max_load_bytes=512 << 20,
+    ) for rank in range(topology.world))
     for layer in layers:
         attention, moe = load_prefill_layer_weights(
             model_dir, layer.layer_id, topology, max_bundle_bytes=max_bundle_bytes,
+            loaders=loaders,
         )
         yield from bind_decode_layer_weights(
             layer, attention, moe, kv_sources=kv_sources, index_sources=index_sources,

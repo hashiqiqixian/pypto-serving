@@ -92,14 +92,15 @@ def test_loading_never_falls_through_to_qwen(model_dir, model_format):
         ModelLoader().load("v41", str(model_dir), model_format=model_format)
 
 
-def test_cli_rejects_execution_before_device_setup(model_dir):
+def test_cli_rejects_missing_output_composite_before_device_setup(model_dir, monkeypatch):
     from pypto_serving.cli.main import build_parser, build_serving_engine_config
 
+    monkeypatch.setenv("PYPTO_LIB_ROOT", str(model_dir))
     args = build_parser().parse_args([
         "--model", str(model_dir), "--platform", "a5", "--tp", "4", "--dp", "2", "--ep", "8",
         "--devices", "0,1,2,3,4,5,6,7",
     ])
-    with pytest.raises(NotImplementedError, match="verified lib composite bindings"):
+    with pytest.raises(NotImplementedError, match="final-output composite is absent"):
         build_serving_engine_config(args)
 
 

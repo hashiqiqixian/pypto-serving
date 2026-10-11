@@ -16,7 +16,7 @@ share one scheduler group with a single block-size declaration.
 
 from dataclasses import dataclass
 
-from pypto_serving.config.types import KVCacheGroupSpec
+from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
 
 from .execution_plan import LayerPlan
 
@@ -26,6 +26,27 @@ class V41CacheGroups:
     window: str
     c2a: str
     c1a: str
+
+
+def build_cache_groups(layers: tuple[LayerPlan, ...], max_seq_len: int) -> tuple[KVCacheGroupSpec, ...]:
+    """Declare the three scheduler page namespaces from checkpoint producers."""
+    if len(layers) != 40 or tuple(layer.layer_id for layer in layers) != tuple(range(40)):
+        raise ValueError("V4.1 cache groups require the complete ordered backbone")
+    if type(max_seq_len) is not int or max_seq_len <= 0:
+        raise ValueError("V4.1 cache groups require a positive context length")
+    producers = {
+        "window": tuple(range(40)),
+        "c2a": tuple(layer.layer_id for layer in layers
+                     if layer.mode == "c2a_full" and layer.kv_source == layer.layer_id),
+        "c1a": tuple(layer.layer_id for layer in layers
+                     if layer.mode == "c1a_full" and layer.kv_source == layer.layer_id),
+    }
+    groups = tuple(KVCacheGroupSpec(
+        name, producers[name], KVCacheSpec(block_size, 16, ratio),
+        (max_seq_len + block_size - 1) // block_size, num_partitions=2,
+    ) for name, block_size, ratio in (("window", 128, 1), ("c2a", 256, 2), ("c1a", 128, 1)))
+    validate_cache_groups(layers, groups, max_seq_len)
+    return groups
 
 
 def validate_cache_groups(

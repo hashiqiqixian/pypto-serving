@@ -64,6 +64,59 @@ def test_metadata_loader_registers_without_weight_payload(metadata_checkpoint, m
     assert len(loaded.layer_specs) == 1
 
 
+def test_full_checkpoint_loader_declares_scheduler_cache_groups(metadata_checkpoint):
+    path, _ = metadata_checkpoint
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    (path / "config.json").write_text(json.dumps(raw), encoding="utf-8")
+    index = {name: "missing-payload.safetensors" for name in backbone_weight_specs(raw)}
+    (path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": index}), encoding="utf-8")
+    runtime = RuntimeConfig(page_size=128, max_seq_len=8320)
+    loaded = ModelLoader().load("text", str(path), runtime, model_format="deepseek_v41")
+    groups = loaded.runtime_model.runtime.kv_cache_groups
+    assert tuple(group.name for group in groups) == ("window", "c2a", "c1a")
+    assert tuple(group.max_blocks_per_seq for group in groups) == (65, 33, 65)
+    assert loaded.runtime_model.runtime.max_num_batched_tokens == 192
+    assert loaded.runtime_model.runtime.max_prefill_tokens_per_request == 192
+    assert len(loaded.layer_specs) == 40
+
+
+def test_full_checkpoint_scheduler_chunks_8192_prompt_with_three_cache_groups(metadata_checkpoint):
+    from pypto_serving.serving.memory.kv_cache import KvCacheManager
+    from pypto_serving.serving.sched.scheduler import Request, Scheduler, SchedulerConfig
+
+    path, _ = metadata_checkpoint
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    (path / "config.json").write_text(json.dumps(raw), encoding="utf-8")
+    index = {name: "missing-payload.safetensors" for name in backbone_weight_specs(raw)}
+    (path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": index}), encoding="utf-8")
+    runtime = ModelLoader().load(
+        "text", str(path), RuntimeConfig(page_size=128, max_seq_len=8320),
+        model_format="deepseek_v41",
+    ).runtime_model.runtime
+    manager = KvCacheManager(enable_prefix_cache=False)
+    manager.initialize(runtime, num_blocks=runtime.kv_cache_groups[0].max_blocks_per_seq)
+    scheduler = Scheduler(SchedulerConfig(
+        max_num_running_reqs=1, max_num_scheduled_tokens=runtime.max_num_batched_tokens,
+        max_prefill_tokens_per_request=runtime.max_prefill_tokens_per_request,
+        max_seq_len=runtime.max_seq_len, enable_prefix_cache=False,
+        enable_chunk_prefill=True, requires_homogeneous_prefill_decode=True,
+    ), manager)
+    scheduler.add_request(Request("prompt", [1] * 8192, max_new_tokens=1))
+    chunks = []
+    while scheduler.has_work():
+        output = scheduler.schedule()
+        assert len(output.scheduled_requests) == 1
+        item = output.scheduled_requests[0]
+        assert item.is_prefill
+        assert set(item.block_ids_by_group) == {"window", "c2a", "c1a"}
+        chunks.append((item.num_computed_tokens, item.num_new_tokens))
+        sampled = {"prompt": [2]} if sum(chunks[-1]) == 8192 else {}
+        scheduler.update_from_output(output, sampled)
+    assert chunks == [(index * 192, 192) for index in range(42)] + [(8064, 128)]
+
+
 def test_loader_keeps_unsupported_quantization_closed(metadata_checkpoint):
     path, raw = metadata_checkpoint
     raw["quantization_config"]["quant_method"] = "compressed-tensors"
@@ -99,7 +152,8 @@ def binding_metadata(metadata_checkpoint, monkeypatch):
         close=unreachable, cache_groups=groups,
     )
     monkeypatch.setattr(
-        "pypto_serving.model.deepseek_v41.composite.load_composite_bindings", lambda: bindings,
+        "pypto_serving.model.deepseek_v41.composite.load_composite_bindings",
+        lambda *args: bindings,
     )
     return bindings
 
@@ -115,6 +169,9 @@ def test_cli_routes_one_ep_worker_with_two_cache_partitions(metadata_checkpoint,
     assert config.parallel_config.expert_parallel_size == 8
     assert config.runtime_config.kv_cache_groups == binding_metadata.cache_groups
     assert config.runtime_config.requires_homogeneous_prefill_decode
+    assert config.runtime_config.max_num_batched_tokens == 192
+    assert config.runtime_config.max_prefill_tokens_per_request == 192
+    assert config.max_num_scheduled_tokens == 192
     assert not config.enable_prefix_cache
     assert not config.resolve_async_scheduling()
 
@@ -143,7 +200,7 @@ def test_cli_cannot_fall_back_to_generic_kv(metadata_checkpoint, binding_metadat
     path, _ = metadata_checkpoint
     monkeypatch.setattr(
         "pypto_serving.model.deepseek_v41.composite.load_composite_bindings",
-        lambda: replace(binding_metadata, cache_groups=()),
+        lambda *args: replace(binding_metadata, cache_groups=()),
     )
     with pytest.raises(MissingCompositeInterface, match="grouped cache"):
         build_serving_engine_config(_args(path))

@@ -12,6 +12,7 @@ The executor owns device readiness. Loading metadata does not assert that the
 selected lib revision has the composite entries needed to execute the model.
 """
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -21,6 +22,9 @@ from pypto_serving.config.types import LoadedModel, ModelConfig, RuntimeConfig, 
 from pypto_serving.model.model_family import is_deepseek_v41_config, read_model_config
 from pypto_serving.model.model_loader import SafetensorsDirectoryLoader, _build_layer_specs
 from pypto_serving.model.tokenizer import load_tokenizer
+from .cache_contract import build_cache_groups, validate_cache_groups
+from .execution_plan import plan_layers
+from .swa_segment import SegmentTopology
 from .weight_loader import V41WeightLoader
 
 
@@ -66,6 +70,22 @@ class DeepSeekV41DirectoryLoader(SafetensorsDirectoryLoader):
             raise ValueError("V4.1 metadata and checkpoint preparation require runtime.device='cpu'")
         if not 0 < runtime.max_seq_len <= text.max_position_embeddings:
             raise ValueError("V4.1 max_seq_len must fit the checkpoint position capacity")
+        if runtime.page_size != 128:
+            raise ValueError("V4.1 cache pages require 128 physical rows")
+        layers = plan_layers(raw)
+        if runtime.kv_cache_groups:
+            validate_cache_groups(layers, runtime.kv_cache_groups, runtime.max_seq_len)
+        elif len(layers) == 40:
+            runtime = replace(runtime, kv_cache_groups=build_cache_groups(layers, runtime.max_seq_len))
+        if len(layers) == 40:
+            capacity = SegmentTopology.for_decode().capacity
+            runtime = replace(
+                runtime,
+                max_num_batched_tokens=min(runtime.max_num_batched_tokens, capacity),
+                max_prefill_tokens_per_request=min(
+                    runtime.max_prefill_tokens_per_request or capacity, capacity),
+                requires_homogeneous_prefill_decode=True,
+            )
         placeholder = torch.empty((0, text.hidden_size), dtype=torch.bfloat16)
         model = RuntimeModel(
             config=config,
