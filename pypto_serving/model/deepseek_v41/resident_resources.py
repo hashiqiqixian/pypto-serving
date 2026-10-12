@@ -45,8 +45,8 @@ class V41ResidentResources:
                      + (state_reset, *page_resets.values()))
         if any(not tensor.is_shared() for tensor in inherited):
             raise ValueError("all inherited V4.1 host buffers must be shared before worker creation")
-        if not weight_bank.prepacked and any(not tensor.is_shared()
-                                            for tensor in weight_bank.tensors.values()):
+        if not getattr(weight_bank, "prepacked", False) and any(
+                not tensor.is_shared() for tensor in weight_bank.tensors.values()):
             raise ValueError("all inherited V4.1 host buffers must be shared before worker creation")
         if final_program not in programs:
             raise ValueError("final composite must be registered on the shared worker")
