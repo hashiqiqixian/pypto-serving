@@ -17,13 +17,20 @@ from pathlib import Path
 import torch
 
 from pypto_serving.config.types import LoadedModel, ModelConfig, RuntimeConfig, RuntimeModel
+from pypto_serving.model.common.executor.executor import ModelExecutor
 from pypto_serving.model.model_family import is_deepseek_v41_config, read_model_config
 from pypto_serving.model.model_loader import SafetensorsDirectoryLoader, _build_layer_specs
 from pypto_serving.model.tokenizer import load_tokenizer
 
-from .npu_runner import SegmentTopology
+from .npu_runner import (
+    BuildOptions,
+    MissingCompositeInterface,
+    SegmentTopology,
+    V41ModelRunner,
+    load_composite_bindings,
+)
 from .task_args import build_cache_groups, validate_cache_groups
-from .weight_loader import V41WeightLoader, plan_layers
+from .weight_loader import RankPlacement, V41ExecutionPlan, V41WeightLoader, plan_layers
 
 
 # model_loader
@@ -104,3 +111,65 @@ class DeepSeekV41DirectoryLoader(SafetensorsDirectoryLoader):
             model_id=request.model_id, model_dir=str(model_path), config=config,
             tokenizer=tokenizer, layer_specs=_build_layer_specs(config), runtime_model=model,
         )
+
+
+# npu_executor
+class DeepSeekV41PyptoExecutor(ModelExecutor):
+    """Shared worker interface with a synchronous, collective V4.1 runner."""
+    def __init__(self, kv_cache_manager=None, *, platform="a5", device_ids=tuple(range(8)),
+                 pypto_build_dir=None, use_compile_cache=False, bindings=None):
+        super().__init__(kv_cache_manager)
+        if platform != "a5":
+            raise ValueError("V4.1 M0 currently requires the A5 platform")
+        self.device_ids = tuple(device_ids)
+        self.bindings = bindings
+        self.runners = {}
+        self._failed_runners = []
+        self.platform = platform
+        self.pypto_build_dir = pypto_build_dir
+        self.use_compile_cache = use_compile_cache
+
+    def register_model(self, model_id, record):
+        if model_id in self.runners:
+            raise ValueError("model already registered")
+        bindings = self.bindings or load_composite_bindings(
+            record.runtime_model.extra["model_dir"], record.runtime.max_seq_len)
+        if not bindings.cache_groups:
+            raise MissingCompositeInterface("V4.1 requires explicit grouped cache layouts and capacities")
+        if record.runtime.kv_cache_groups != bindings.cache_groups:
+            raise ValueError("scheduler and composite cache group contracts differ")
+        plan = V41ExecutionPlan(
+            record.runtime_model.extra["model_dir"],
+            RankPlacement(0, tp_size=1, dp_size=8, ep_size=8),
+        )
+        runner = V41ModelRunner(
+            plan, bindings, device_ids=self.device_ids, runtime=record.runtime,
+            build_options=BuildOptions(self.platform, self.pypto_build_dir, self.use_compile_cache),
+        )
+        try:
+            pages = runner.preflight()
+        except Exception:
+            if not runner.closed:
+                self._failed_runners.append(runner)
+            raise
+        self.runners[model_id] = runner
+        return pages
+
+    def lookup_embeddings(self, model, token_ids):
+        return self.runners[model.config.model_id].lookup_embeddings(token_ids)
+
+    def run_prefill(self, model, batch):
+        return self.runners[model.config.model_id].run_prefill(model, batch)
+
+    def run_decode(self, model, batch):
+        return self.runners[model.config.model_id].run_decode(model, batch)
+
+    def release_finished_requests(self, request_ids):
+        for runner in self.runners.values():
+            runner.release_finished_requests(request_ids)
+
+    def close(self):
+        for runner in (*self.runners.values(), *self._failed_runners):
+            runner.close()
+        self.runners.clear()
+        self._failed_runners.clear()
