@@ -87,6 +87,44 @@ def test_decode_bank_estimate_matches_allocations():
     assert estimate_decode_weight_bytes(layout, geometry) == bank.allocated_bytes
 
 
+def test_resident_upload_views_preserve_every_slot_payload():
+    layout = DecodeWeightLayout(2, 1, 2, 1, world=2)
+    bank = DecodeWeightBank(layout, max_host_bytes=1 << 20)
+    expected = {}
+    for name in sorted(_ALL):
+        for slot in range(layout.slots(name)):
+            bits = (torch.arange(12, dtype=torch.uint8).reshape(2, 2, 3)
+                    + slot * 32 + len(name))
+            value = bits.view(torch.float8_e8m0fnu) if name == "wq_a_scale" else bits
+            bank.append(DecodeWeightSlice(name, slot, value))
+            expected[name, slot] = bits
+
+    class Worker:
+        def __init__(self):
+            self.uploaded = {}
+            self.next_id = 0
+
+        def alloc_stacked_tensor(self, tensor):
+            assert tensor.is_contiguous() and tensor.shape[0] == layout.world
+            self.next_id += 1
+            self.uploaded[self.next_id] = tensor
+            return self.next_id
+
+        def free_stacked_tensor(self, handle):
+            del self.uploaded[handle]
+
+    worker = Worker()
+    resident = ResidentDecodeWeights(worker, bank, _ALL)
+    for name, slot in expected:
+        uploaded = worker.uploaded[resident.view(name, slot)]
+        assert torch.equal(uploaded.view(torch.uint8), expected[name, slot])
+        assert uploaded.data_ptr() == (bank.tensors[name] if name in {"mxfp4_pair_lut",
+                                                                    "c1a_compressor_wkv"}
+                                       else bank.tensors[name][slot]).data_ptr()
+    resident.close()
+    assert not worker.uploaded
+
+
 def test_decode_bank_upload_is_released_on_partial_failure():
     layout = DecodeWeightLayout(2, 1, 2, 1, world=2)
     bank = DecodeWeightBank(layout, max_host_bytes=1 << 20)
