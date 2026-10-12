@@ -12,8 +12,13 @@ from __future__ import annotations
 
 import ctypes
 import importlib
+import json
+import logging
 import math
+import os
+import subprocess
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -26,8 +31,26 @@ import torch
 from pypto_serving.config.types import DecodeResult, KVCacheGroupSpec, PrefillResult
 from pypto_serving.model.common.runner.buffer_set import alloc_device_buffer
 
-from .task_args import ForwardStep, RequestLedger, RequestSlice, V41CacheGroups, validate_cache_groups
-from .weight_loader import LayerPlan, RankPlacement, ResidentDecodeWeights, V41ExecutionPlan, V41WeightLoader
+from .task_args import (
+    ForwardStep,
+    RequestLedger,
+    RequestSlice,
+    V41CacheGroups,
+    build_cache_groups,
+    validate_cache_groups,
+)
+from .weight_loader import (
+    DecodeWeightBank,
+    DecodeWeightLayout,
+    LayerPlan,
+    RankPlacement,
+    ResidentDecodeWeights,
+    V41ExecutionPlan,
+    V41WeightLoader,
+    iter_decode_weight_slices,
+    load_prepacked_bank,
+    plan_layers,
+)
 
 
 # cache_resources
@@ -1872,6 +1895,125 @@ def prepare_swa_window_metadata(
     )
 
 
+# final_output
+@dataclass(frozen=True)
+class FinalOutputRows:
+    indices: torch.Tensor
+    locations: tuple[tuple[int, int], ...]
+
+
+def prepare_final_output_rows(inputs: SegmentInputs, indices: torch.Tensor, *,
+                              local_capacity: int) -> FinalOutputRows:
+    """Stage final-token rows into a pre-fork shared buffer in request order."""
+    if not isinstance(inputs, SegmentInputs) or type(local_capacity) is not int or local_capacity <= 0:
+        raise ValueError("final output requires valid packed inputs and rank capacities")
+    if (not isinstance(indices, torch.Tensor) or indices.device.type != "cpu"
+            or indices.dtype != torch.int32 or indices.ndim != 2
+            or min(indices.shape) <= 0 or not indices.is_contiguous() or not indices.is_shared()):
+        raise ValueError("LM-head row indices must be a pre-fork shared CPU INT32 matrix")
+    world, max_logit_rows = indices.shape
+    if tuple(inputs.row_indices.shape) != (world, local_capacity):
+        raise ValueError("final output row map differs from the layer-state layout")
+    counts = [0] * world
+    locations = []
+    selected = set()
+    for rank, row in inputs.request_last_rows:
+        if (type(rank) is not int or not 0 <= rank < world or type(row) is not int
+                or not 0 <= row < local_capacity or inputs.row_indices[rank, row] < 0):
+            raise ValueError("request final row is absent from the packed layer state")
+        if (rank, row) in selected:
+            raise ValueError("two requests cannot select the same final token row")
+        selected.add((rank, row))
+        slot = counts[rank]
+        if slot >= max_logit_rows:
+            raise ValueError("request final rows exceed the lib LM-head capacity on one rank")
+        counts[rank] += 1
+        locations.append((rank, slot))
+    indices.fill_(-1)
+    for (rank, row), (_, slot) in zip(inputs.request_last_rows, locations):
+        indices[rank, slot] = row
+    return FinalOutputRows(indices, tuple(locations))
+
+
+def collect_final_logits(logits: torch.Tensor, rows: FinalOutputRows) -> torch.Tensor:
+    """Return owned CPU logits in request order after output completion."""
+    if (not isinstance(logits, torch.Tensor) or logits.device.type != "cpu"
+            or logits.ndim != 3 or logits.shape[:2] != rows.indices.shape
+            or logits.dtype != torch.float32):
+        raise ValueError("lib output must be CPU FP32 [rank, logit_row, vocabulary]")
+    if not rows.locations:
+        raise ValueError("final output requires at least one request")
+    result = torch.stack([logits[rank, slot] for rank, slot in rows.locations]).clone()
+    if not bool(torch.isfinite(result).all()):
+        raise ValueError("lib output contains non-finite request logits")
+    return result
+
+
+def make_final_output_program(lib_root, topology):
+    load_segment_modules(lib_root, topology)
+    module = importlib.import_module("models.deepseek_v4_1_flash.final_output")
+    return module.make_final_output_program(topology.tp, topology.dp)
+
+
+def compile_final_output(compiler, lib_root, topology):
+    import pypto.language as pl
+
+    entry = make_final_output_program(lib_root, topology)
+    return compiler.compile("v41_final_output", entry, done_epoch=pl.RUNTIME), tuple(entry.param_names)
+
+
+class FinalOutput:
+    """Dispatch final logits while retaining one completion epoch per worker."""
+
+    def __init__(self, worker, program, param_names, run_config):
+        self.worker = worker
+        self.program = program
+        self.param_names = tuple(param_names)
+        self.run_config = run_config
+        self.epoch = 0
+        self.failed = False
+        required = {"x_hc", "pre_mix", "norm_weight", "head_weight", "logit_row_indices",
+                    "normed", "logits", "sampled_ids", "done_epoch"}
+        if set(self.param_names) != required or len(self.param_names) != len(required):
+            raise ValueError("final output ABI differs from the lib composite")
+
+    def run(self, state: LayerState, arguments):
+        if self.failed:
+            raise RuntimeError("output dispatch failed; close the worker before retrying")
+        if state.layout != "tp_local_token":
+            raise ValueError("final output requires TP-local residual and pre_mix")
+        reserved = {"x_hc", "pre_mix", "done_epoch"}
+        if reserved & arguments.keys():
+            raise ValueError("final state and epoch must come from this dispatch")
+        missing = set(self.param_names) - reserved - arguments.keys()
+        if missing:
+            raise ValueError("missing output ABI arguments: " + ", ".join(sorted(missing)))
+        if self.epoch >= (2**31 - 1) // 16:
+            raise OverflowError("output completion epoch exhausted; recreate worker")
+        reset_windows = self.epoch == 128
+        next_epoch = 1 if reset_windows else self.epoch + 1
+        bound = dict(arguments, x_hc=state.residual, pre_mix=state.pre_mix,
+                     done_epoch=ctypes.c_int32(next_epoch))
+        if reset_windows:
+            if not getattr(self.worker, "_persistent", False) or not hasattr(
+                self.worker, "_reset_persistent_windows"
+            ):
+                raise RuntimeError("final output epoch reset requires a persistent PyPTO worker")
+            previous_reset = self.worker._reset_persistent_windows
+            self.worker._reset_persistent_windows = True
+        try:
+            self.worker.run(self.program.compiled, *(bound[name] for name in self.param_names),
+                            config=self.run_config)
+        except BaseException:
+            self.failed = True
+            raise
+        finally:
+            if reset_windows:
+                self.worker._reset_persistent_windows = previous_reset
+        self.epoch = next_epoch
+        return arguments["logits"], arguments["sampled_ids"]
+
+
 # input_resources
 @dataclass(frozen=True)
 class InputHostResources:
@@ -2168,6 +2310,146 @@ class PrefillMetadataResources:
         return result
 
 
+# final_output_resources
+@dataclass(frozen=True)
+class FinalOutputHostResources:
+    norm_weight: torch.Tensor
+    head_weight: torch.Tensor
+    logit_row_indices: torch.Tensor
+    logits: torch.Tensor
+    sampled_ids: torch.Tensor
+
+    @property
+    def inherited_host_tensors(self):
+        return self.norm_weight, self.head_weight
+
+    @property
+    def all_host_tensors(self):
+        return (self.norm_weight, self.head_weight, self.logit_row_indices,
+                self.logits, self.sampled_ids)
+
+
+def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
+                                     max_logit_rows: int = 16, chunk_rows: int = 64,
+                                     max_host_bytes: int = 4 << 30) -> FinalOutputHostResources:
+    """Load one TP vocabulary shard at a time before the worker forks."""
+    if not isinstance(topology, SegmentTopology) or (topology.tp, topology.dp) != (4, 2):
+        raise ValueError("V4.1 final output requires TP4/DP2 placement")
+    if any(type(value) is not int or value <= 0 for value in
+           (max_logit_rows, chunk_rows, max_host_bytes)):
+        raise ValueError("final output capacities and memory budget must be positive")
+    loader = V41WeightLoader(model_dir, tp_size=topology.tp, tp_rank=0,
+                             ep_size=topology.world, ep_rank=0)
+    vocab, hidden = loader.config.vocab_size, loader.config.hidden_size
+    if vocab % topology.tp:
+        raise ValueError("LM-head vocabulary must divide TP size")
+    shard_rows = vocab // topology.tp
+    sampled_pad = 8
+    required_bytes = (topology.world * shard_rows * hidden * 2
+                      + topology.world * hidden * 2
+                      + topology.world * max_logit_rows * vocab * 4
+                      + topology.world * max_logit_rows * (1 + sampled_pad) * 4)
+    if required_bytes > max_host_bytes:
+        raise ValueError(f"final output host buffers require {required_bytes} bytes")
+
+    norm = torch.empty((topology.world, hidden), dtype=torch.bfloat16).share_memory_()
+    head = torch.empty((topology.world, shard_rows, hidden), dtype=torch.bfloat16).share_memory_()
+    indices = torch.full((topology.world, max_logit_rows), -1, dtype=torch.int32).share_memory_()
+    logits = torch.zeros((topology.world, max_logit_rows, vocab), dtype=torch.float32).share_memory_()
+    sampled = torch.full((topology.world, max_logit_rows, sampled_pad), -1,
+                         dtype=torch.int32).share_memory_()
+
+    norm_value = loader.load("norm.weight").weight
+    if norm_value.dtype != torch.bfloat16 or tuple(norm_value.shape) != (hidden,):
+        raise ValueError("checkpoint final Norm weight disagrees with the lib output ABI")
+    norm.copy_(norm_value.expand_as(norm))
+    for tp_rank in range(topology.tp):
+        rank_loader = (loader if tp_rank == 0 else V41WeightLoader(
+            model_dir, tp_size=topology.tp, tp_rank=tp_rank,
+            ep_size=topology.world, ep_rank=tp_rank))
+        for start in range(0, shard_rows, chunk_rows):
+            stop = min(start + chunk_rows, shard_rows)
+            value = rank_loader.load_rows("head.weight", start, stop).weight
+            if value.dtype != torch.bfloat16 or tuple(value.shape) != (stop - start, hidden):
+                raise ValueError("checkpoint LM-head shard disagrees with the lib output ABI")
+            head[tp_rank, start:stop].copy_(value)
+        head[tp_rank + topology.tp].copy_(head[tp_rank])
+    return FinalOutputHostResources(norm, head, indices, logits, sampled)
+
+
+class FinalOutputRuntime:
+    """Keep output weights resident and stage only request rows per dispatch.
+
+    The host resources must exist before the shared DistributedWorker forks.
+    The caller owns and closes the worker after this runtime releases its tensors.
+    """
+
+    def __init__(self, worker, program, param_names, run_config, topology: SegmentTopology,
+                 host: FinalOutputHostResources, *, prefill_local_capacity: int | None = None):
+        if not isinstance(host, FinalOutputHostResources) or not isinstance(topology, SegmentTopology):
+            raise ValueError("final output requires host resources and a segment topology")
+        world, local = topology.world, topology.local_capacity
+        if any(not tensor.is_shared() for tensor in host.all_host_tensors):
+            raise ValueError("final output host buffers must be shared before worker creation")
+        if (host.norm_weight.dtype != torch.bfloat16 or host.norm_weight.shape != (world, host.head_weight.shape[-1])
+                or host.head_weight.dtype != torch.bfloat16 or host.head_weight.shape[0] != world
+                or host.logit_row_indices.dtype != torch.int32 or host.logit_row_indices.shape != (world, 16)
+                or host.logits.dtype != torch.float32
+                or host.logits.shape != (world, 16, host.head_weight.shape[1] * topology.tp)
+                or host.sampled_ids.dtype != torch.int32 or host.sampled_ids.shape != (world, 16, 8)):
+            raise ValueError("final output host buffers disagree with the lib TP4/DP2 ABI")
+        self.worker, self.host, self.topology = worker, host, topology
+        if (prefill_local_capacity is not None and
+                (type(prefill_local_capacity) is not int or not 0 < prefill_local_capacity <= 1024)):
+            raise ValueError("prefill output capacity must fit the M0 boundary")
+        self.dispatcher = FinalOutput(worker, program, param_names, run_config)
+        self._resident = []
+        try:
+            self.norm_weight = worker.alloc_stacked_tensor(host.norm_weight)
+            self._resident.append(self.norm_weight)
+            self.head_weight = worker.alloc_stacked_tensor(host.head_weight)
+            self._resident.append(self.head_weight)
+            self.normed = alloc_device_buffer(
+                worker, (world, local, host.head_weight.shape[-1]), torch.bfloat16, stacked=True,
+            )
+            self._resident.append(self.normed)
+            self._normed_by_capacity = {local: self.normed}
+            if prefill_local_capacity is not None and prefill_local_capacity != local:
+                prefill_normed = alloc_device_buffer(
+                    worker, (world, prefill_local_capacity, host.head_weight.shape[-1]),
+                    torch.bfloat16, stacked=True)
+                self._resident.append(prefill_normed)
+                self._normed_by_capacity[prefill_local_capacity] = prefill_normed
+        except BaseException:
+            self.close()
+            raise
+
+    def run(self, state, inputs):
+        local = inputs.row_indices.shape[1]
+        normed = self._normed_by_capacity.get(local)
+        if normed is None:
+            raise ValueError("final output capacity was not preallocated before worker dispatch")
+        rows = prepare_final_output_rows(
+            inputs, self.host.logit_row_indices, local_capacity=local,
+        )
+        self.host.logits.zero_()
+        self.host.sampled_ids.fill_(-1)
+        self.dispatcher.run(state, {
+            "norm_weight": self.norm_weight,
+            "head_weight": self.head_weight,
+            "logit_row_indices": self.host.logit_row_indices,
+            "normed": normed,
+            "logits": self.host.logits,
+            "sampled_ids": self.host.sampled_ids,
+        })
+        return collect_final_logits(self.host.logits, rows)
+
+    def close(self):
+        for tensor in reversed(self._resident):
+            self.worker.free_stacked_tensor(tensor)
+        self._resident.clear()
+
+
 # resident_resources
 class V41ResidentResources:
     """Own resident buffers and their shared host mappings until worker close.
@@ -2347,3 +2629,186 @@ class V41ResidentResources:
             self.worker.close()
             self.closed = True
             self._owned.clear()
+
+
+# production_binding
+_MODES = ("swa", "c2a_full", "c2a_reuse", "c1a_full", "c1a_reindex", "c1a_reuse")
+_LOG = logging.getLogger(__name__)
+
+
+def _lib_root():
+    configured = os.environ.get("PYPTO_LIB_ROOT")
+    root = Path(configured) if configured else Path.cwd() / "pypto-lib"
+    root = root.resolve()
+    if not (root / "models/deepseek_v4_1_flash/final_output.py").is_file():
+        raise MissingCompositeInterface(
+            f"V4.1 final-output composite is absent under {root}; set PYPTO_LIB_ROOT "
+            "to a lib checkout containing the verified output entry")
+    return root
+
+
+def _revision(root):
+    return subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], text=True,
+    ).strip()
+
+
+def _sources(layers):
+    return (
+        tuple(layer.layer_id for layer in layers if layer.kv_source == layer.layer_id),
+        tuple(layer.layer_id for layer in layers if layer.index_source == layer.layer_id),
+        tuple(layer.layer_id for layer in layers if layer.mode == "c2a_full"),
+    )
+
+
+def _check_runtime_binaries(platform):
+    from simpler_setup.runtime_builder import RuntimeBuilder
+
+    builder = RuntimeBuilder(platform=platform)
+    for runtime in ("host_build_graph", "tensormap_and_ringbuffer"):
+        builder.get_binaries(runtime)
+
+
+def make_production_bindings(model_dir, max_seq_len):
+    model_dir = Path(model_dir).resolve()
+    raw = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+    layers = plan_layers(raw)
+    groups = build_cache_groups(layers, max_seq_len)
+    root = _lib_root()
+    revision = _revision(root)
+
+    def allocate(plan, device_ids, runtime, options):
+        from pypto_serving.model.common.compiler.compiler import KernelCompiler
+        from pypto_serving.model.common.executor.utils import build_pypto_run_config
+
+        if Path(plan.weights.model_dir).resolve() != model_dir or tuple(plan.layers) != layers:
+            raise ValueError("V4.1 binding and execution plan refer to different checkpoints")
+        if runtime.max_seq_len != max_seq_len or runtime.kv_cache_groups != groups:
+            raise ValueError("V4.1 scheduler and resident cache contracts differ")
+        if len(device_ids) != 8 or options.platform != "a5":
+            raise ValueError("V4.1 production binding requires eight A5 devices")
+        _check_runtime_binaries(options.platform)
+        topology = SegmentTopology.for_decode()
+        run_config = replace(
+            build_pypto_run_config(
+                platform=options.platform,
+                device_ids=device_ids,
+                pypto_build_dir=options.pypto_build_dir,
+            ),
+            ring_heap=1024 * 1024 * 1024,
+        )
+        compiler = KernelCompiler(run_config=run_config)
+        attention, moe = compile_prefill_segments(compiler, root, topology, _MODES)
+        decode, decode_names = compile_decode_layer(compiler, root, topology)
+        final, final_names = compile_final_output(compiler, root, topology)
+        abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
+        kv_sources, index_sources, c2a_sources = _sources(layers)
+        layout = DecodeWeightLayout.from_lib(abi)
+        if (layout.layers, layout.kv_sources, layout.index_sources,
+                layout.c2a_sources, layout.world) != (
+                    len(layers), len(kv_sources), len(index_sources), len(c2a_sources), 8):
+            raise ValueError("V4.1 checkpoint source axes disagree with the selected lib")
+        DecodeWeightBank.validate_abi(decode_names)
+
+        bank_started = time.perf_counter()
+        bank = load_prepacked_bank(model_dir, layout, decode_names)
+        if bank is None:
+            bank = DecodeWeightBank(layout)
+            append_seconds = 0.0
+            layer_started = time.perf_counter()
+            for item in iter_decode_weight_slices(model_dir, topology):
+                append_started = time.perf_counter()
+                bank.append(item)
+                append_seconds += time.perf_counter() - append_started
+                if item.name == "hc_attn_fn":
+                    now = time.perf_counter()
+                    _LOG.info("V4.1 checkpoint layer %d/%d loaded into shared weight bank (%.2fs)",
+                              item.slot + 1, layout.layers, now - layer_started)
+                    layer_started = now
+            bank.finish(decode_names)
+            _LOG.info("V4.1 checkpoint staging %.2fs (bank copies %.2fs)",
+                      time.perf_counter() - bank_started, append_seconds)
+        _LOG.info("V4.1 shared weight bank ready: %.1f GiB",
+                  bank.allocated_bytes / (1 << 30))
+
+        rope = importlib.import_module("models.deepseek_v4_1_flash.rope_tables")
+        swa_tables = rope.precompute_rope_tables(max_seq_len, False)
+        compressed_tables = rope.precompute_rope_tables(max_seq_len, True)
+        cache_plan = plan_decode_cache_pools(
+            layers, groups, max_seq_len=max_seq_len,
+            primary_num_blocks=groups[0].max_blocks_per_seq,
+            request_slots=1, abi=abi,
+        )
+        if (runtime.total_kv_pages is not None and
+                runtime.total_kv_pages < cache_plan.primary_num_blocks):
+            raise ValueError("configured cache pages cannot hold one V4.1 request")
+        resets = make_cache_page_reset_buffers(cache_plan)
+        state_reset = make_state_reset_buffer(cache_plan)
+        family = cache_plan.family_groups
+        host_kwargs = dict(
+            max_seq_len=max_seq_len,
+            max_requests=cache_plan.physical_request_slots,
+            window_pages=cache_plan.physical_group_blocks[family.window],
+            c2a_pages=cache_plan.physical_group_blocks[family.c2a],
+            c1a_pages=cache_plan.physical_group_blocks[family.c1a],
+            rope_tables=swa_tables,
+            compressed_rope_tables=compressed_tables,
+        )
+        prefill_host = PrefillMetadataResources(topology, **host_kwargs)
+        decode_host = PrefillMetadataResources(topology, **host_kwargs)
+        input_host = make_input_host_resources(topology, plan.weights.config.hidden_size)
+        decode_input_host = make_input_host_resources(topology, plan.weights.config.hidden_size)
+        final_host = load_final_output_host_resources(model_dir, topology)
+        programs = (*attention.values(), moe, decode, final)
+        resident_started = time.perf_counter()
+        resident = V41ResidentResources(
+            programs, run_config, weight_bank=bank, weight_param_names=decode_names,
+            cache_plan=cache_plan, state_reset=state_reset, page_resets=resets,
+            input_host=input_host, decode_input_host=decode_input_host,
+            prefill_host=prefill_host, decode_host=decode_host,
+            final_host=final_host, final_program=final, final_param_names=final_names,
+            topology=topology,
+        )
+        _LOG.info("V4.1 resident upload and allocation %.2fs",
+                  time.perf_counter() - resident_started)
+        try:
+            resident.bind_prefill(
+                layers, kv_sources=kv_sources, index_sources=index_sources,
+                c2a_sources=c2a_sources, max_seq_len=max_seq_len,
+            )
+            resident.bind_decode_layers(
+                layers, decode_names, kv_sources=kv_sources,
+                index_sources=index_sources, c2a_sources=c2a_sources,
+            )
+            resident.prefill_segment = PrefillSegment(
+                resident.worker, attention, moe, topology,
+                prefill_host.fields["attention_counts"], prefill_host.fields["moe_counts"],
+                run_config,
+            )
+            resident.decode_segment = DecodeLayerSegment(
+                resident.worker, decode, decode_names, run_config, topology,
+                decode_host.fields["moe_counts"],
+            )
+        except BaseException:
+            resident.close()
+            raise
+        return resident, cache_plan.primary_num_blocks
+
+    return CompositeBindings(
+        revision=revision,
+        entries={},
+        initialize=lambda embeddings, step, resources: resources.begin_step(embeddings, step),
+        output=lambda state, step, resources: resources.finish_step(state, step),
+        allocate=allocate,
+        prepare_weights=lambda plans, layer, resources: None,
+        reset_request=lambda resources, key, owner: resources.reset_request(owner),
+        wait=lambda resources: None,
+        close=lambda resources: resources.close(),
+        cache_groups=groups,
+        input_layout="tp_local_token",
+        output_layout="tp_local_token",
+        prefill_backbone=lambda state, step, resources, plans: resources.run_prefill(
+            resources.prefill_segment, state, step),
+        decode_backbone=lambda state, step, resources, plans: resources.run_decode_layers(
+            resources.decode_segment, state, step),
+    )
