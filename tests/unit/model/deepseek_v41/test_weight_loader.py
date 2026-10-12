@@ -84,6 +84,23 @@ def test_index_and_ownership_do_not_read_payload(checkpoint):
         loader.load("layers.0.ffn.experts.0.w1.weight")
 
 
+def test_layer_read_session_opens_each_shard_once(checkpoint):
+    path, _, _ = checkpoint
+    opened = []
+
+    @contextmanager
+    def opener(shard, device):
+        opened.append(shard)
+        with safe_open(str(shard), framework="pt", device=device) as reader:
+            yield reader
+
+    loader = V41WeightLoader(path, safe_open_fn=opener)
+    with loader.store.slice_session() as session:
+        loader.load("layers.0.hc_attn_fn", session=session)
+        loader.load("layers.0.hc_attn_scale", session=session)
+    assert opened == [path / "text.safetensors"]
+
+
 def test_dense_and_fp8_tp_slices(checkpoint):
     path, _, tensors = checkpoint
     chunks = []

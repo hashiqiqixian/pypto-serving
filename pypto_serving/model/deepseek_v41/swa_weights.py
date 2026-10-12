@@ -114,61 +114,61 @@ def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_
             raise ValueError("selected layer must be a SWA backbone layer")
         prefix = f"layers.{layer_id}."
         a, m = {}, {}
+        with loader.store.slice_session() as session:
+            def load(name):
+                nonlocal held_bytes
+                bundle = loader.load(prefix + name, session=session)
+                held_bytes += sum(t.numel() * t.element_size() for t in (bundle.weight, bundle.scale)
+                                  if t is not None)
+                if 3 * held_bytes > max_bundle_bytes:
+                    raise ValueError("stacked layer weight budget exceeded")
+                return bundle
 
-        def load(name):
-            nonlocal held_bytes
-            bundle = loader.load(prefix + name)
-            held_bytes += sum(t.numel() * t.element_size() for t in (bundle.weight, bundle.scale)
-                              if t is not None)
-            if 3 * held_bytes > max_bundle_bytes:
-                raise ValueError("stacked layer weight budget exceeded")
-            return bundle
-
-        for target, source in {
-            "hc_attn_fn": "hc_attn_fn", "hc_attn_scale": "hc_attn_scale",
-            "hc_attn_base": "hc_attn_base", "attn_norm_weight": "attn_norm.weight",
-            "q_norm_weight": "attn.q_norm.weight", "kv_norm_weight": "attn.kv_norm.weight",
-            "attn_sink": "attn.attn_sink",
-        }.items():
-            a[target] = load(source).weight
-        for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
-            bundle = load(f"attn.{name}.weight")
-            a[name] = bundle.weight
-            if bundle.scale is not None:
-                a[name + "_scale"] = bundle.scale
-        if layer_id in loader.text["kv_source_layer_ids"]:
             for target, source in {
-                "compressor_wkv": "attn.compressor.wkv.weight",
-                "compressor_norm_weight": "attn.compressor.norm.weight",
-                "index_wk": "attn.indexer.wk.weight",
-                "index_norm_weight": "attn.indexer.k_norm.weight",
+                "hc_attn_fn": "hc_attn_fn", "hc_attn_scale": "hc_attn_scale",
+                "hc_attn_base": "hc_attn_base", "attn_norm_weight": "attn_norm.weight",
+                "q_norm_weight": "attn.q_norm.weight", "kv_norm_weight": "attn.kv_norm.weight",
+                "attn_sink": "attn.attn_sink",
             }.items():
                 a[target] = load(source).weight
-            if ratio == 2:
-                a["compressor_wgate"] = load("attn.compressor.wgate.weight").weight
-        if layer_id in loader.text["index_source_layer_ids"]:
-            bundle = load("attn.indexer.wq_b.weight")
-            a["index_wq_b"], a["index_wq_b_scale"] = bundle.weight, bundle.scale
-            a["index_weights_proj"] = load("attn.indexer.weights_proj.weight").weight
-        attention.append(a)
-        if not include_moe:
-            continue
-        for target, source in {
-            "hc_ffn_fn": "hc_ffn_fn", "hc_ffn_scale": "hc_ffn_scale", "hc_ffn_base": "hc_ffn_base",
-            "norm_weight": "ffn_norm.weight", "gate_weight": "ffn.gate.weight",
-            "correction_bias": "ffn.gate.bias",
-        }.items():
-            m[target] = load(source).weight
-        for name in ("w1", "w2", "w3"):
-            bundle = load(f"ffn.shared_experts.{name}.weight")
-            m["shared_" + name], m["shared_" + name + "_scale"] = bundle.weight, bundle.scale
-            count = loader.text["n_routed_experts"] // topology.world
-            bundles = [load(f"ffn.experts.{expert}.{name}.weight")
-                       for expert in range(rank * count, (rank + 1) * count)]
-            m["routed_" + name] = stack_bytes([b.weight for b in bundles])
-            m["routed_" + name + "_scale"] = merge_expert_scales([b.scale for b in bundles])
-            del bundles
-        m["mxfp4_pair_lut"] = mxfp4_pair_lut()
-        moe.append(m)
+            for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
+                bundle = load(f"attn.{name}.weight")
+                a[name] = bundle.weight
+                if bundle.scale is not None:
+                    a[name + "_scale"] = bundle.scale
+            if layer_id in loader.text["kv_source_layer_ids"]:
+                for target, source in {
+                    "compressor_wkv": "attn.compressor.wkv.weight",
+                    "compressor_norm_weight": "attn.compressor.norm.weight",
+                    "index_wk": "attn.indexer.wk.weight",
+                    "index_norm_weight": "attn.indexer.k_norm.weight",
+                }.items():
+                    a[target] = load(source).weight
+                if ratio == 2:
+                    a["compressor_wgate"] = load("attn.compressor.wgate.weight").weight
+            if layer_id in loader.text["index_source_layer_ids"]:
+                bundle = load("attn.indexer.wq_b.weight")
+                a["index_wq_b"], a["index_wq_b_scale"] = bundle.weight, bundle.scale
+                a["index_weights_proj"] = load("attn.indexer.weights_proj.weight").weight
+            attention.append(a)
+            if not include_moe:
+                continue
+            for target, source in {
+                "hc_ffn_fn": "hc_ffn_fn", "hc_ffn_scale": "hc_ffn_scale", "hc_ffn_base": "hc_ffn_base",
+                "norm_weight": "ffn_norm.weight", "gate_weight": "ffn.gate.weight",
+                "correction_bias": "ffn.gate.bias",
+            }.items():
+                m[target] = load(source).weight
+            for name in ("w1", "w2", "w3"):
+                bundle = load(f"ffn.shared_experts.{name}.weight")
+                m["shared_" + name], m["shared_" + name + "_scale"] = bundle.weight, bundle.scale
+                count = loader.text["n_routed_experts"] // topology.world
+                bundles = [load(f"ffn.experts.{expert}.{name}.weight")
+                           for expert in range(rank * count, (rank + 1) * count)]
+                m["routed_" + name] = stack_bytes([b.weight for b in bundles])
+                m["routed_" + name + "_scale"] = merge_expert_scales([b.scale for b in bundles])
+                del bundles
+            m["mxfp4_pair_lut"] = mxfp4_pair_lut()
+            moe.append(m)
     return ({name: stack_bytes([r[name] for r in attention]) for name in attention[0]},
             {name: stack_bytes([r[name] for r in moe]) for name in moe[0]} if moe else {})

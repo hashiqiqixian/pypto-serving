@@ -30,11 +30,11 @@ def test_decode_bank_places_flat_axis_and_singleton_slots():
     bank.append(DecodeWeightSlice("mxfp4_pair_lut", 0,
                                   torch.arange(8, dtype=torch.int16).reshape(2, 2, 2)))
 
-    assert bank.tensors["routed_w1"].shape == (2, 4, 3)
-    assert torch.equal(bank.tensors["routed_w1"][:, 2:].contiguous(),
+    assert bank.tensors["routed_w1"].shape == (2, 2, 2, 3)
+    assert torch.equal(bank.tensors["routed_w1"][1],
                        torch.arange(12, dtype=torch.uint8).reshape(2, 2, 3) + 32)
     assert bank.tensors["wq_a"].shape == (2, 2, 2, 3)
-    assert torch.equal(bank.tensors["wq_a"][:, 1].view(torch.uint8),
+    assert torch.equal(bank.tensors["wq_a"][1].view(torch.uint8),
                        torch.arange(12, dtype=torch.uint8).reshape(2, 2, 3) + 32)
     assert bank.tensors["wq_a"].is_shared()
 
@@ -126,8 +126,11 @@ def test_resident_views_share_layer_storage_without_uploading_again():
         def __init__(self):
             self.next_ptr = 10000
             self.freed = []
+            self.hosts = []
 
         def alloc_stacked_tensor(self, tensor):
+            assert tensor.is_contiguous()
+            self.hosts.append(tensor)
             self.next_ptr += 1000
             return StackedDeviceTensor(
                 tuple(DeviceTensor(self.next_ptr + rank * 100, tensor.shape[1:], tensor.dtype)
@@ -139,6 +142,8 @@ def test_resident_views_share_layer_storage_without_uploading_again():
 
     worker = Worker()
     resident = ResidentDecodeWeights(worker, bank, _ALL)
+    assert any(host.data_ptr() == bank.tensors["wq_a"][1].data_ptr()
+               for host in worker.hosts)
     flat = resident.view("routed_w1", 1)
     axis = resident.view("wq_a", 1)
     assert flat.shape == axis.shape == (2, 2)

@@ -37,8 +37,7 @@ class V41ResidentResources:
         if decode_host is not None and (decode_input_host is None or
                 decode_host.topology != decode_input_host.topology):
             raise ValueError("decode metadata and input must share one TP-local topology")
-        inherited = (tuple(weight_bank.tensors.values())
-                     + input_host.inherited_host_tensors
+        inherited = (input_host.inherited_host_tensors
                      + (() if decode_input_host is None else decode_input_host.inherited_host_tensors)
                      + prefill_host.inherited_host_tensors
                      + (() if decode_host is None else decode_host.inherited_host_tensors)
@@ -46,10 +45,14 @@ class V41ResidentResources:
                      + (state_reset, *page_resets.values()))
         if any(not tensor.is_shared() for tensor in inherited):
             raise ValueError("all inherited V4.1 host buffers must be shared before worker creation")
+        if not weight_bank.prepacked and any(not tensor.is_shared()
+                                            for tensor in weight_bank.tensors.values()):
+            raise ValueError("all inherited V4.1 host buffers must be shared before worker creation")
         if final_program not in programs:
             raise ValueError("final composite must be registered on the shared worker")
 
-        self.worker = worker_factory(programs, run_config, inherited)
+        self.worker = worker_factory(programs, run_config,
+                                     tuple(weight_bank.tensors.values()) + inherited)
         self.host_resources = (weight_bank, input_host, decode_input_host, prefill_host, decode_host,
                                final_host, state_reset, page_resets)
         self.prefill_host = prefill_host

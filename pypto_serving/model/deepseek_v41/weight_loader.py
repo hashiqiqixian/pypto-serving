@@ -145,9 +145,10 @@ class V41WeightLoader:
             raise ValueError(f"weight load requires estimated {estimate} bytes; budget={self.max_load_bytes}")
         return estimate
 
-    def _read(self, name, ranges):
+    def _read(self, name, ranges, session=None):
         spec = self.specs[name]
-        value = self.store.load_slice(name, ranges, shape=spec.shape, dtype=spec.dtype)
+        store = self.store if session is None else session
+        value = store.load_slice(name, ranges, shape=spec.shape, dtype=spec.dtype)
         if spec.dtype == "F8_E8M0" and bool((value.view(torch.uint8) == 255).any()):
             raise ValueError(f"non-finite E8M0 scale: {name}")
         return value
@@ -169,7 +170,7 @@ class V41WeightLoader:
         return WeightBundle(self._read(name, ranges), None, "vocabulary_rows_bf16", (name,),
                             self.tp_rank, self.ep_rank, estimate)
 
-    def load(self, name):
+    def load(self, name, *, session=None):
         """Load one dense weight or one projection with its required scales.
 
         Pass the checkpoint .weight name for projections; scales cannot be
@@ -198,8 +199,8 @@ class V41WeightLoader:
                             slice(k_part.start//divisor, k_part.stop//divisor))
             requests.append((scale_name, scale_ranges))
         estimate = self._estimate(requests)
-        weight = self._read(name, ranges)
-        scale = self._read(*requests[1]) if quantized else None
+        weight = self._read(name, ranges, session)
+        scale = self._read(*requests[1], session=session) if quantized else None
         if spec.dtype == "I8":
             weight = pack_fp4_tiles(weight)
             scale = pack_mx_scale(scale.view(torch.uint8).T.contiguous()).view(torch.float8_e8m0fnu)

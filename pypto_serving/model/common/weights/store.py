@@ -15,6 +15,7 @@ above this layer; all that lives here is the index and the reads.
 """
 
 import logging
+from contextlib import ExitStack
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import ContextManager, Protocol
@@ -123,6 +124,11 @@ class LazySafetensorsStore:
         dtype, and is responsible for its allocation budget. Existing whole-tensor
         staging paths continue to use load_many.
         """
+        path = self._slice_path(name, ranges, shape)
+        with self._safe_open_fn(path, self.device) as reader:
+            return self._checked_slice(reader, name, ranges, shape, dtype)
+
+    def _slice_path(self, name, ranges, shape):
         if len(ranges) != len(shape) or any(
             not isinstance(part, slice) or part.step not in (None, 1)
             or type(part.start) is not int or type(part.stop) is not int
@@ -133,13 +139,19 @@ class LazySafetensorsStore:
         path = self.path_for(name)
         if not path.exists():
             raise FileNotFoundError(self.missing_shard_error.format(path=path))
-        with self._safe_open_fn(path, self.device) as reader:
-            source = reader.get_slice(name)
-            if tuple(source.get_shape()) != shape or source.get_dtype() != dtype:
-                raise ValueError(f"checkpoint shape/dtype mismatch: {name}; expected {shape}/{dtype}")
-            # Clone even contiguous slices: do not retain mmap storage or a
-            # full source-row stride after the reader is closed.
-            return source[ranges].clone(memory_format=torch.contiguous_format)
+        return path
+
+    @staticmethod
+    def _checked_slice(reader, name, ranges, shape, dtype):
+        source = reader.get_slice(name)
+        if tuple(source.get_shape()) != shape or source.get_dtype() != dtype:
+            raise ValueError(f"checkpoint shape/dtype mismatch: {name}; expected {shape}/{dtype}")
+        # Keep an owned contiguous slice after the reader closes.
+        return source[ranges].clone(memory_format=torch.contiguous_format)
+
+    def slice_session(self):
+        """Reuse shard readers while one layer's bounded slices are assembled."""
+        return _SliceSession(self)
 
     def load_many(self, names: Sequence[str]) -> dict[str, torch.Tensor]:
         """Load a set of named tensors grouped by shard file.
@@ -164,3 +176,25 @@ class LazySafetensorsStore:
                     loaded[name] = reader.get_tensor(name)
 
         return {name: loaded[name] for name in unique_names}
+
+
+class _SliceSession:
+    def __init__(self, store):
+        self.store = store
+        self.stack = ExitStack()
+        self.readers = {}
+
+    def __enter__(self):
+        self.stack.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self.stack.__exit__(*exc)
+
+    def load_slice(self, name, ranges, *, shape, dtype):
+        path = self.store._slice_path(name, ranges, shape)
+        reader = self.readers.get(path)
+        if reader is None:
+            reader = self.stack.enter_context(self.store._safe_open_fn(path, self.store.device))
+            self.readers[path] = reader
+        return self.store._checked_slice(reader, name, ranges, shape, dtype)

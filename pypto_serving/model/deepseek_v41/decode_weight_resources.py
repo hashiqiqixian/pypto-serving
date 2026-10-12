@@ -45,9 +45,9 @@ def _destination_shape(layout, name, source_shape):
     slots = layout.slots(name)
     if name in _SINGLE:
         return tuple(source_shape)
-    if name in _FLAT_LAYER | _FLAT_KV | _FLAT_INDEX:
-        return (layout.world, slots * source_shape[1], *source_shape[2:])
-    return (layout.world, slots, *source_shape[1:])
+    # The executable layer ABI borrows one slot at a time. Slot-major storage
+    # keeps each [world, ...] view contiguous for the resident upload.
+    return (slots, *source_shape)
 
 
 def estimate_decode_weight_bytes(layout, geometry):
@@ -109,6 +109,7 @@ class DecodeWeightBank:
         self.allocated_bytes = 0
         self.tensors = {}
         self._seen = set()
+        self.prepacked = False
 
     def append(self, item: DecodeWeightSlice):
         if not isinstance(item, DecodeWeightSlice) or item.name not in _ALL:
@@ -134,13 +135,7 @@ class DecodeWeightBank:
             self.allocated_bytes += size
         if destination.dtype != value.dtype or tuple(destination.shape) != shape:
             raise ValueError("decode weight slices disagree on shape or dtype")
-        if item.name in _SINGLE:
-            target = destination
-        elif item.name in _FLAT_LAYER | _FLAT_KV | _FLAT_INDEX:
-            width = value.shape[1]
-            target = destination[:, item.slot * width:(item.slot + 1) * width]
-        else:
-            target = destination[:, item.slot]
+        target = destination if item.name in _SINGLE else destination[item.slot]
         target.view(torch.uint8).copy_(value.view(torch.uint8))
         self._seen.add(key)
 
@@ -169,7 +164,7 @@ class ResidentDecodeWeights:
         if not isinstance(bank, DecodeWeightBank):
             raise TypeError("decode weight upload requires a completed host bank")
         bank.finish(parameter_names)
-        if any(not tensor.is_shared() for tensor in bank.tensors.values()):
+        if not bank.prepacked and any(not tensor.is_shared() for tensor in bank.tensors.values()):
             raise ValueError("decode weights must be shared before worker startup")
         self.worker = worker
         self.layout = bank.layout
@@ -178,13 +173,7 @@ class ResidentDecodeWeights:
             for name, tensor in bank.tensors.items():
                 slots = self.layout.slots(name)
                 for slot in range(slots):
-                    if name in _SINGLE:
-                        host = tensor
-                    elif name in _FLAT_LAYER | _FLAT_KV | _FLAT_INDEX:
-                        width = tensor.shape[1] // slots
-                        host = tensor[:, slot * width:(slot + 1) * width].contiguous()
-                    else:
-                        host = tensor[:, slot].contiguous()
+                    host = tensor if name in _SINGLE else tensor[slot]
                     self.tensors[name, slot] = worker.alloc_stacked_tensor(host)
         except BaseException:
             self.close()

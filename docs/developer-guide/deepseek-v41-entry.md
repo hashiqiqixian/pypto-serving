@@ -92,6 +92,17 @@ layouts again when lib changes. Current FP4 tiles require K/N multiples of 256;
 native FP8 matrices require K divisible by 64 and N by 32. Unsupported geometry
 is rejected. Torch/safetensors must support the checkpoint E8M0 dtype.
 
+For repeated full-model starts, V4.1 can use a V4-style prepacked sidecar.
+Build it once with `python -m pypto_serving.tools.prepack_deepseek_v41 MODEL_DIR
+--output /path/to/v41-decode.safetensors`, then set
+`PYPTO_V41_PREPACKED_WEIGHTS=/path/to/v41-decode.safetensors` for serving.
+The sidecar stores slot-major, rank-stacked tensors so each layer is contiguous
+at upload. Serving validates the checkpoint fingerprint and mapped fields, and
+falls back to checkpoint packing when the sidecar is absent, stale or cold.
+Prepacking requires roughly 300 GiB each of host staging and output storage;
+it does not make the first preparation free. Startup logs report checkpoint
+staging, bank copies and resident upload separately.
+
 TP slices main-attention grouped/head projections and aligns their scales.
 Indexer query/gating heads are replicated: the C1A/C2A composites at lib
 `fbe92bfc` use global `INDEX_H` on every TP rank and require complete scores.

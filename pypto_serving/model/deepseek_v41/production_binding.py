@@ -14,6 +14,7 @@ import logging
 import os
 from pathlib import Path
 import subprocess
+import time
 
 from .cache_contract import build_cache_groups
 from .cache_resources import (
@@ -31,6 +32,7 @@ from .prefill_metadata_resources import PrefillMetadataResources
 from .prefill_segment import PrefillSegment, compile_prefill_segments
 from .resident_resources import V41ResidentResources
 from .swa_segment import SegmentTopology
+from .weight_sidecar import load_prepacked_bank
 
 
 _MODES = ("swa", "c2a_full", "c2a_reuse", "c1a_full", "c1a_reindex", "c1a_reuse")
@@ -122,13 +124,24 @@ def make_production_bindings(model_dir, max_seq_len):
             raise ValueError("V4.1 checkpoint source axes disagree with the selected lib")
         DecodeWeightBank.validate_abi(decode_names)
 
-        bank = DecodeWeightBank(layout)
-        for item in iter_decode_weight_slices(model_dir, topology):
-            bank.append(item)
-            if item.name == "hc_attn_fn":
-                _LOG.info("V4.1 checkpoint layer %d/%d loaded into shared weight bank",
-                          item.slot + 1, layout.layers)
-        bank.finish(decode_names)
+        bank_started = time.perf_counter()
+        bank = load_prepacked_bank(model_dir, layout, decode_names)
+        if bank is None:
+            bank = DecodeWeightBank(layout)
+            append_seconds = 0.0
+            layer_started = time.perf_counter()
+            for item in iter_decode_weight_slices(model_dir, topology):
+                append_started = time.perf_counter()
+                bank.append(item)
+                append_seconds += time.perf_counter() - append_started
+                if item.name == "hc_attn_fn":
+                    now = time.perf_counter()
+                    _LOG.info("V4.1 checkpoint layer %d/%d loaded into shared weight bank (%.2fs)",
+                              item.slot + 1, layout.layers, now - layer_started)
+                    layer_started = now
+            bank.finish(decode_names)
+            _LOG.info("V4.1 checkpoint staging %.2fs (bank copies %.2fs)",
+                      time.perf_counter() - bank_started, append_seconds)
         _LOG.info("V4.1 shared weight bank ready: %.1f GiB",
                   bank.allocated_bytes / (1 << 30))
 
@@ -161,6 +174,7 @@ def make_production_bindings(model_dir, max_seq_len):
         decode_input_host = make_input_host_resources(topology, plan.weights.config.hidden_size)
         final_host = load_final_output_host_resources(model_dir, topology)
         programs = (*attention.values(), moe, decode, final)
+        resident_started = time.perf_counter()
         resident = V41ResidentResources(
             programs, run_config, weight_bank=bank, weight_param_names=decode_names,
             cache_plan=cache_plan, state_reset=state_reset, page_resets=resets,
@@ -169,6 +183,8 @@ def make_production_bindings(model_dir, max_seq_len):
             final_host=final_host, final_program=final, final_param_names=final_names,
             topology=topology,
         )
+        _LOG.info("V4.1 resident upload and allocation %.2fs",
+                  time.perf_counter() - resident_started)
         try:
             resident.bind_prefill(
                 layers, kv_sources=kv_sources, index_sources=index_sources,
