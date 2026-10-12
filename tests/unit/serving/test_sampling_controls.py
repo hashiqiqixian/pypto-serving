@@ -36,6 +36,7 @@ from pypto_serving.serving.sched.scheduler import (
     SchedulerConfig,
     SchedulerOutput,
 )
+from pypto_serving.serving.sampling.capabilities import SamplingCapabilities, sampling_capabilities
 from pypto_serving.serving.server.ipc import NewRequestData
 from pypto_serving.serving.server.server import ChatCompletionRequest, ChatMessage, ServingServer
 from pypto_serving.serving.server.serving_worker import WorkerProcess
@@ -43,6 +44,10 @@ from pypto_serving.serving.server.serving_worker import WorkerProcess
 
 def _chat_request(**fields) -> ChatCompletionRequest:
     return ChatCompletionRequest(messages=[ChatMessage(role="user", content="Go")], **fields)
+
+
+def test_v41_sampling_uses_host_stop_masks():
+    assert sampling_capabilities("PyptoDeepSeekV41Executor", 0) == SamplingCapabilities()
 
 
 @pytest.mark.parametrize("fields,expected", [
