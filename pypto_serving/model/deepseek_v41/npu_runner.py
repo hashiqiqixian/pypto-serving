@@ -46,6 +46,7 @@ from .weight_loader import (
     LayerPlan,
     RankPlacement,
     ResidentDecodeWeights,
+    ResidentFullDecodeWeights,
     V41ExecutionPlan,
     V41WeightLoader,
     iter_decode_weight_slices,
@@ -406,6 +407,57 @@ class DecodeCachePools:
     def close(self):
         for tensor in reversed(tuple(self.tensors.values())):
             self.worker.free_stacked_tensor(tensor)
+        self.tensors.clear()
+
+
+class DecodeFullCachePools(DecodeCachePools):
+    """One packed pool per field, with source views shared by prefill."""
+
+    def __init__(self, worker, plan, state_reset, page_resets):
+        from pypto.runtime import DeviceTensor, StackedDeviceTensor
+
+        self.worker, self.plan = worker, plan
+        self.state_reset, self.page_resets = state_reset, page_resets
+        self.tensors, self.source_counts, self._full = {}, {}, {}
+        try:
+            for spec in plan.buffers:
+                if spec.name.startswith("window_cache_"):
+                    group = plan.family_groups.window
+                    stride = plan.physical_group_blocks[group]
+                    sources = len(plan.group_sources[group]["window"])
+                elif spec.name.startswith(("compressed_cache_", "index_cache_")):
+                    family = "compressed" if spec.name.startswith("compressed_") else "index"
+                    stride = max(plan.physical_group_blocks[group] for group, families in
+                                 plan.group_sources.items() if family in families)
+                    sources = len({slot for families in plan.group_sources.values()
+                                   for slot in families.get(family, ())})
+                else:
+                    stride = plan.physical_request_slots
+                    sources = spec.shape[1] // stride
+                if spec.shape[1] != sources * stride:
+                    raise ValueError(f"{spec.name} packed cache source axis is invalid")
+                self.source_counts[spec.name] = sources
+                base = alloc_device_buffer(worker, spec.shape, spec.dtype, stacked=True)
+                self._full[spec.name] = base
+                slice_shape = (stride, *spec.shape[2:])
+                slot_bytes = math.prod(slice_shape) * torch.empty((), dtype=spec.dtype).element_size()
+                for source in range(sources):
+                    shards = tuple(DeviceTensor(shard.data_ptr + source * slot_bytes,
+                                                slice_shape, spec.dtype)
+                                   for shard in base.shards)
+                    self.tensors[spec.name, source] = StackedDeviceTensor(
+                        shards, (spec.shape[0], *slice_shape), base.worker_ids)
+        except BaseException:
+            self.close()
+            raise
+
+    def full(self, name):
+        return self._full[name]
+
+    def close(self):
+        for tensor in reversed(tuple(self._full.values())):
+            self.worker.free_stacked_tensor(tensor)
+        self._full.clear()
         self.tensors.clear()
 
 
@@ -1271,6 +1323,83 @@ def compile_decode_layer(compiler, lib_root, topology):
     return program, tuple(entry.param_names)
 
 
+def compile_decode_fwd(compiler, lib_root, topology):
+    """Compile the complete 40-layer backbone from the selected lib revision."""
+    import pypto.language as pl
+
+    load_segment_modules(lib_root, topology)
+    module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
+    entry = module.l3_decode_fwd
+    return (compiler.compile("v41_decode_fwd", entry, attention_num_tokens=pl.RUNTIME),
+            tuple(entry.param_names))
+
+
+class DecodeForwardSegment:
+    """Bind one full-backbone dispatch to resident weights, caches and metadata."""
+
+    _METADATA = {
+        "base_rope_cos": "rope_cos", "base_rope_sin": "rope_sin",
+        "compressed_token_rope_cos": "compressed_rope_cos",
+        "compressed_token_rope_sin": "compressed_rope_sin",
+        "c2a_rope_cos": "c2a_compressed_rope_cos",
+        "c2a_rope_sin": "c2a_compressed_rope_sin",
+        "request_ids": "c2a_request_ids",
+        "token_to_req_indices": "c2a_request_ids",
+        "position_ids": "c2a_position_ids",
+        "c2a_index_block_table": "c2a_index_block_table",
+        "c1a_index_block_table": "c1a_index_block_table",
+        "query_start_loc": "c2a_query_start_loc",
+        "state_block_table": "c2a_state_block_table",
+    }
+
+    def __init__(self, worker, program, param_names, run_config, topology,
+                 weights, cache, metadata):
+        self.worker, self.program = worker, program
+        self.param_names = tuple(param_names)
+        self.run_config, self.topology = run_config, topology
+        self.metadata = metadata
+        arguments = {name: weights.full(name) for name in weights.layout_names}
+        arguments.update({name: cache.full(name) for name in cache._full})
+        arguments.update({name: metadata.fields[source]
+                          for name, source in self._METADATA.items()})
+        arguments.update({name: metadata.fields[name] for name in (
+            "window_slots", "window_indices", "c2a_compressed_lens",
+            "c1a_compressed_lens", "c2a_compressed_slots", "c1a_compressed_slots",
+        )})
+        arguments["moe_num_tokens"] = metadata.fields["moe_counts"]
+        missing = set(param_names) - set(arguments) - {
+            "x_hc", "pre_mix", "attention_num_tokens"}
+        extra = set(arguments) - set(param_names)
+        if missing or extra:
+            raise ValueError(f"full decode ABI mismatch: missing={sorted(missing)} extra={sorted(extra)}")
+        self.arguments = arguments
+        self.failed = False
+
+    def run(self, state, *, group_counts):
+        if self.failed:
+            raise RuntimeError("full decode failed; close the worker before retrying")
+        if state.layout != "tp_local_token":
+            raise ValueError("full decode requires TP-local state")
+        if len(group_counts) != self.topology.dp or len(set(group_counts)) != 1 or group_counts[0] <= 0:
+            raise ValueError("full decode requires equal nonempty token rows on all DP ranks")
+        bound = dict(self.arguments, x_hc=state.residual, pre_mix=state.pre_mix,
+                     attention_num_tokens=ctypes.c_int32(group_counts[0]))
+        if not getattr(self.worker, "_persistent", False) or not hasattr(
+                self.worker, "_reset_persistent_windows"):
+            raise RuntimeError("full decode requires a persistent worker with window reset")
+        previous_reset = self.worker._reset_persistent_windows
+        self.worker._reset_persistent_windows = True
+        try:
+            self.worker.run(self.program.compiled,
+                            *(bound[name] for name in self.param_names), config=self.run_config)
+        except BaseException:
+            self.failed = True
+            raise
+        finally:
+            self.worker._reset_persistent_windows = previous_reset
+        return state
+
+
 class DecodeLayerSegment:
     """Dispatch lib's complete Block once per layer on one persistent worker."""
 
@@ -1967,7 +2096,7 @@ def collect_final_logits(logits: torch.Tensor, rows: FinalOutputRows) -> torch.T
 
 def make_final_output_program(lib_root, topology):
     load_segment_modules(lib_root, topology)
-    module = importlib.import_module("models.deepseek_v4_1_flash.final_output")
+    from . import final_output as module
     return module.make_final_output_program(topology.tp, topology.dp)
 
 
@@ -2510,10 +2639,10 @@ class V41ResidentResources:
         self._inputs = None
         self._group_counts = None
         self._prefill = None
-        self._decode_layers = None
+        self._decode_fwd = None
         self.closed = False
         try:
-            self.weights = self._own(ResidentDecodeWeights(
+            self.weights = self._own(ResidentFullDecodeWeights(
                 self.worker, weight_bank, weight_param_names))
             self.input = self._own(InputStateRuntime(self.worker, input_host))
             self.decode_input = (None if decode_input_host is None else
@@ -2526,7 +2655,7 @@ class V41ResidentResources:
                 cache = allocate_cache_with_retry(
                     self.worker, slots, plan_for_slots, state_reset, page_resets)
             else:
-                cache = DecodeCachePools(self.worker, cache_plan, state_reset, page_resets)
+                cache = DecodeFullCachePools(self.worker, cache_plan, state_reset, page_resets)
             self.cache = self._own(cache)
             if decode_host is not None:
                 plan = cache.plan
@@ -2624,6 +2753,21 @@ class V41ResidentResources:
                 group_counts=self._group_counts)
         return state
 
+    def bind_decode_fwd(self, program, param_names, run_config):
+        if (self.closed or self._decode_fwd is not None or self._step is not None
+                or self.decode_host is None):
+            raise RuntimeError("full decode requires an idle worker and decode metadata")
+        self._decode_fwd = DecodeForwardSegment(
+            self.worker, program, param_names, run_config, self.decode_host.topology,
+            self.weights, self.cache, self.decode_host)
+        return self._decode_fwd
+
+    def run_decode_fwd(self, state, step):
+        if (self.closed or step is not self._step or step.phase != "decode"
+                or self._decode_fwd is None):
+            raise ValueError("full decode requires the active decode step")
+        return self._decode_fwd.run(state, group_counts=self._group_counts)
+
     def finish_step(self, state, step):
         if self.closed or step is not self._step:
             raise ValueError("final output must use the active request step")
@@ -2658,10 +2802,10 @@ def _lib_root():
     configured = os.environ.get("PYPTO_LIB_ROOT")
     root = Path(configured) if configured else Path.cwd() / "pypto-lib"
     root = root.resolve()
-    if not (root / "models/deepseek_v4_1_flash/final_output.py").is_file():
+    if not (root / "models/deepseek_v4_1_flash/decode_fwd.py").is_file():
         raise MissingCompositeInterface(
-            f"V4.1 final-output composite is absent under {root}; set PYPTO_LIB_ROOT "
-            "to a lib checkout containing the verified output entry")
+            f"V4.1 decode_fwd is absent under {root}; set PYPTO_LIB_ROOT "
+            "to a lib checkout containing the complete decode entry")
     return root
 
 
@@ -2748,7 +2892,7 @@ def make_production_bindings(model_dir, max_seq_len):
         )
         compiler = KernelCompiler(run_config=run_config)
         attention, moe = compile_prefill_segments(compiler, root, topology, _MODES)
-        decode, decode_names = compile_decode_layer(compiler, root, topology)
+        decode, decode_names = compile_decode_fwd(compiler, root, topology)
         final, final_names = compile_final_output(compiler, root, topology)
         abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
         kv_sources, index_sources, c2a_sources = _sources(layers)
@@ -2825,18 +2969,11 @@ def make_production_bindings(model_dir, max_seq_len):
                 layers, kv_sources=kv_sources, index_sources=index_sources,
                 c2a_sources=c2a_sources, max_seq_len=max_seq_len,
             )
-            resident.bind_decode_layers(
-                layers, decode_names, kv_sources=kv_sources,
-                index_sources=index_sources, c2a_sources=c2a_sources,
-            )
+            resident.bind_decode_fwd(decode, decode_names, run_config)
             resident.prefill_segment = PrefillSegment(
                 resident.worker, attention, moe, topology,
                 prefill_host.fields["attention_counts"], prefill_host.fields["moe_counts"],
                 run_config,
-            )
-            resident.decode_segment = DecodeLayerSegment(
-                resident.worker, decode, decode_names, run_config, topology,
-                decode_host.fields["moe_counts"],
             )
         except BaseException:
             resident.close()
@@ -2859,6 +2996,6 @@ def make_production_bindings(model_dir, max_seq_len):
         output_layout="tp_local_token",
         prefill_backbone=lambda state, step, resources, plans: resources.run_prefill(
             resources.prefill_segment, state, step),
-        decode_backbone=lambda state, step, resources, plans: resources.run_decode_layers(
-            resources.decode_segment, state, step),
+        decode_backbone=lambda state, step, resources, plans: resources.run_decode_fwd(
+            state, step),
     )

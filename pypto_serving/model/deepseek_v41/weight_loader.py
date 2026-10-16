@@ -862,6 +862,83 @@ class ResidentDecodeWeights:
         self.tensors.clear()
 
 
+class ResidentFullDecodeWeights(ResidentDecodeWeights):
+    """Upload contiguous per-rank banks and alias their layer slices for prefill."""
+
+    def __init__(self, worker, bank: DecodeWeightBank, parameter_names):
+        from pypto.runtime import DeviceTensor, StackedDeviceTensor
+
+        bank.finish(parameter_names)
+        self.worker = worker
+        self.layout = bank.layout
+        self.tensors = {}
+        self._full = {}
+        self._slot_shapes = {}
+        self.layout_names = tuple(bank.tensors)
+        self._device_tensor = DeviceTensor
+        self._stacked_tensor = StackedDeviceTensor
+        try:
+            for name, host in bank.tensors.items():
+                if name in _SINGLE:
+                    self._full[name] = worker.alloc_stacked_tensor(host)
+                    continue
+                slots = self.layout.slots(name)
+                if host.shape[0:2] != (slots, self.layout.world):
+                    raise ValueError(f"{name} weight bank has the wrong slot/rank axes")
+                slot_shape = tuple(host.shape[2:])
+                self._slot_shapes[name] = slot_shape
+                full_shape = ((slots * slot_shape[0], *slot_shape[1:]) if name in
+                              (_FLAT_LAYER | _FLAT_KV | _FLAT_INDEX) else
+                              (slots, *slot_shape))
+                slot_bytes = host[0, 0].numel() * host.element_size()
+                shards = []
+                try:
+                    for rank in range(self.layout.world):
+                        base = worker.alloc_tensor(full_shape, host.dtype, worker_id=rank)
+                        shards.append(base)
+                        for slot in range(slots):
+                            source = host[slot, rank]
+                            if not source.is_contiguous():
+                                raise ValueError(f"{name} weight slice is not contiguous")
+                            worker.copy_to_offset(
+                                base.data_ptr, slot * slot_bytes, source.data_ptr(),
+                                slot_bytes, worker_id=rank,
+                            )
+                except BaseException:
+                    for rank, shard in enumerate(shards):
+                        worker.free_tensor(shard, worker_id=rank)
+                    raise
+                self._full[name] = StackedDeviceTensor(
+                    shards, (self.layout.world, *full_shape), range(self.layout.world))
+        except BaseException:
+            self.close()
+            raise
+
+    def full(self, name):
+        return self._full[name]
+
+    def view(self, name, slot):
+        if name in _SINGLE:
+            if slot != 0:
+                raise ValueError("single weight has only slot zero")
+            return self._full[name]
+        slots = self.layout.slots(name)
+        if type(slot) is not int or not 0 <= slot < slots:
+            raise ValueError("decode weight view slot is outside its source axis")
+        base = self._full[name]
+        shape = self._slot_shapes[name]
+        slot_bytes = math.prod(shape) * torch.empty((), dtype=base.dtype).element_size()
+        shards = tuple(self._device_tensor(shard.data_ptr + slot * slot_bytes, shape, base.dtype)
+                       for shard in base.shards)
+        return self._stacked_tensor(shards, (self.layout.world, *shape), base.worker_ids)
+
+    def close(self):
+        for tensor in reversed(tuple(getattr(self, "_full", {}).values())):
+            self.worker.free_stacked_tensor(tensor)
+        self._full.clear()
+        self.tensors.clear()
+
+
 # weight_sidecar
 _LOG = logging.getLogger(__name__)
 _FORMAT = "pypto-deepseek-v41-decode-slot-major-v1"
