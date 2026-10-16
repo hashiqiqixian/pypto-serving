@@ -544,116 +544,6 @@ def load_composite_bindings(model_dir=None, max_seq_len=None) -> CompositeBindin
     return make_production_bindings(model_dir, max_seq_len)
 
 
-# decode_layer_resources
-class DecodeLayerResources:
-    """Own decode scratch and selections; borrow uploaded weights and caches."""
-
-    def __init__(self, worker, topology, plans, weights, cache, metadata, param_names, *,
-                 kv_sources, index_sources, c2a_sources, index_topk=512):
-        self.worker, self.topology, self.plans = worker, topology, tuple(plans)
-        if len(self.plans) != 40 or tuple(p.layer_id for p in self.plans) != tuple(range(40)):
-            raise ValueError("decode layer binding requires the complete ordered backbone")
-        if type(index_topk) is not int or index_topk <= 0:
-            raise ValueError("decode index top-K must be positive")
-        self._owned = []
-        world, local, tokens = topology.world, topology.local_capacity, topology.capacity
-
-        def allocate(shape, dtype):
-            value = alloc_device_buffer(worker, shape, dtype, stacked=True)
-            self._owned.append(value)
-            return value
-
-        try:
-            states = [(allocate((world, local, 4, 5120), torch.float32),
-                       allocate((world, local, 4), torch.float32)) for _ in range(2)]
-            scratch = {
-                "attention_output": allocate((world, local, 5120), torch.bfloat16),
-                "attention_hidden": allocate((world, local, 4, 5120), torch.float32),
-                "attention_pre_mix": allocate((world, local, 4), torch.float32),
-                "gathered": allocate((world, tokens, 5120), torch.bfloat16),
-                "x_mixed": allocate((world, local, 5120), torch.bfloat16),
-            }
-            topk = {source: allocate((world, tokens, index_topk), torch.int32)
-                    for source in index_sources}
-            unused_topk = allocate((world, tokens, index_topk), torch.int32)
-            unused_indices = allocate((world, tokens, index_topk), torch.int32)
-            compressed_pages = max(cache.plan.physical_group_blocks[group] for group, families in
-                                   cache.plan.group_sources.items() if "compressed" in families)
-            candidate = allocate((world, tokens, compressed_pages * 128), torch.uint8)
-            c2a_metadata = metadata.arguments("c2a_full")
-            c1a_metadata = metadata.arguments("c1a_full")
-            result = {}
-            for plan in self.plans:
-                layer, mode = plan.layer_id, plan.mode
-                a, m = weights.prefill_weights(
-                    plan, kv_sources=kv_sources, index_sources=index_sources,
-                    c2a_sources=c2a_sources)
-                arguments = dict(a)
-                arguments.update(m)
-                arguments["ffn_norm_weight"] = arguments.pop("norm_weight")
-                family_metadata = c1a_metadata if mode.startswith("c1a_") else c2a_metadata
-                arguments.update(family_metadata)
-                arguments.update(cache.prefill_views(
-                    plan, kv_sources=kv_sources, index_sources=index_sources,
-                    c2a_sources=c2a_sources))
-                if mode == "swa":
-                    kv_source, index_source = kv_sources[0], index_sources[0]
-                else:
-                    kv_source, index_source = plan.kv_source, plan.index_source
-                kv_slot = kv_sources.index(kv_source)
-                index_slot = index_sources.index(index_source)
-                for name in ("compressor_norm_weight",):
-                    arguments[name] = weights.view(name, kv_slot)
-                for name in ("index_wk", "index_norm_weight"):
-                    arguments[name] = weights.view(name, index_sources.index(kv_source))
-                for name in ("index_wq_b", "index_wq_b_scale", "index_weights_proj"):
-                    arguments[name] = weights.view(name, index_slot)
-                arguments["compressor_wkv"] = weights.view("c2a_compressor_wkv", 0)
-                arguments["compressor_wgate"] = weights.view("c2a_compressor_wgate", 0)
-                arguments["c1a_compressor_wkv"] = weights.view("c1a_compressor_wkv", 0)
-                if mode == "c2a_full":
-                    c2a_slot = c2a_sources.index(layer)
-                    arguments["compressor_wkv"] = weights.view("c2a_compressor_wkv", c2a_slot)
-                    arguments["compressor_wgate"] = weights.view("c2a_compressor_wgate", c2a_slot)
-                if mode == "swa":
-                    for name in ("compressed_cache", "compressed_cache_scale",
-                                 "index_cache", "index_cache_scale"):
-                        slot = kv_slot if name.startswith("compressed_") else index_slot
-                        arguments[name] = cache.view(name + "_pool", slot)
-                if mode.startswith("c1a_"):
-                    for name in ("index_cache", "index_cache_scale"):
-                        arguments[name] = cache.view(name + "_pool", index_sources.index(kv_source))
-                arguments["state_cache"] = cache.view(
-                    "state_cache_pool", c2a_sources.index(layer) if mode == "c2a_full" else 0)
-                arguments["token_to_req_indices"] = c2a_metadata["token_to_req_indices"]
-                arguments["position_ids"] = c2a_metadata["position_ids"]
-                arguments["query_start_loc"] = c2a_metadata["query_start_loc"]
-                arguments["state_block_table"] = c2a_metadata["state_block_table"]
-                arguments["topk_indices"] = (
-                    topk[index_source] if mode == "c2a_reuse" else topk.get(layer, unused_topk)
-                )
-                arguments["candidate_mask"] = candidate
-                arguments["compressed_indices"] = (
-                    topk[index_source] if mode == "c1a_reuse" else unused_indices)
-                arguments.update(scratch)
-                arguments["x_next"], arguments["next_pre_mix"] = states[layer % 2]
-                reserved = {"x_hc", "incoming_pre_mix", "layer_id", "attention_num_tokens",
-                            "moe_num_tokens", "attention_epoch", "moe_epoch"}
-                missing = set(param_names) - reserved - arguments.keys()
-                if missing:
-                    raise ValueError(f"decode layer {layer} has unbound ABI fields: {sorted(missing)}")
-                result[layer] = arguments
-            self.arguments = result
-        except BaseException:
-            self.close()
-            raise
-
-    def close(self):
-        for value in reversed(self._owned):
-            self.worker.free_stacked_tensor(value)
-        self._owned.clear()
-
-
 # decode_padding
 def pad_single_decode(step: ForwardStep, embeddings: torch.Tensor, cache_plan):
     """Fill idle DP ranks for the collective; the ledger retains the original step."""
@@ -1310,21 +1200,6 @@ def prepare_compressed_metadata(
 
 
 # decode_backbone
-def compile_decode_layer(compiler, lib_root, topology):
-    """Compile lib's complete per-layer Block with family-specific metadata."""
-    import pypto.language as pl
-
-    load_segment_modules(lib_root, topology)
-    module = importlib.import_module("models.deepseek_v4_1_flash.decode_layer")
-    entry = module.l3_decode_layer
-    program = compiler.compile(
-        "v41_decode_layer", entry, layer_id=pl.RUNTIME,
-        attention_num_tokens=pl.RUNTIME, attention_epoch=pl.RUNTIME,
-        moe_epoch=pl.RUNTIME,
-    )
-    return program, tuple(entry.param_names)
-
-
 def compile_decode_fwd(compiler, lib_root, topology):
     """Compile the complete 40-layer backbone from the selected lib revision."""
     import pypto.language as pl
@@ -1400,81 +1275,6 @@ class DecodeForwardSegment:
         finally:
             self.worker._reset_persistent_windows = previous_reset
         return state
-
-
-class DecodeLayerSegment:
-    """Dispatch lib's complete Block once per layer on one persistent worker."""
-
-    def __init__(self, worker, program, param_names, run_config, topology, moe_counts):
-        expected = {"x_hc", "incoming_pre_mix", "x_next", "next_pre_mix",
-                    "layer_id", "attention_num_tokens", "moe_num_tokens",
-                    "attention_epoch", "moe_epoch"}
-        self.param_names = tuple(param_names)
-        if len(set(self.param_names)) != len(self.param_names) or not expected <= set(self.param_names):
-            raise ValueError("decode layer ABI is missing complete Block state or counts")
-        if (not isinstance(moe_counts, torch.Tensor) or moe_counts.device.type != "cpu"
-                or moe_counts.dtype != torch.int32 or moe_counts.shape != (topology.world,)
-                or not moe_counts.is_shared()):
-            raise ValueError("decode MoE counts must be shared before worker startup")
-        self.worker, self.program, self.run_config = worker, program, run_config
-        self.topology, self.moe_counts = topology, moe_counts
-        self.epoch = 0
-        self.failed = False
-
-    def run_layer(self, state: LayerState, plan, arguments, *, group_counts):
-        if self.failed:
-            raise RuntimeError("decode Block failed; recreate the worker")
-        if state.layout != "tp_local_token":
-            raise ValueError("decode Block requires TP-local state")
-        if type(plan.layer_id) is not int or not 0 <= plan.layer_id < 40:
-            raise ValueError("decode Block requires a checkpoint layer ID")
-        if (len(group_counts) != self.topology.dp or
-                any(type(n) is not int or not 0 <= n <= self.topology.capacity for n in group_counts)):
-            raise ValueError("decode Block requires one bounded count per DP group")
-        if len(set(group_counts)) != 1 or not group_counts[0]:
-            raise MissingCompositeInterface(
-                "decode_layer has one scalar attention_num_tokens for both DP groups; "
-                "asymmetric or empty groups require isolated filler rows and cache pages "
-                "before serving can safely use that ABI")
-        reserved = {"x_hc", "incoming_pre_mix", "layer_id", "attention_num_tokens",
-                    "moe_num_tokens", "attention_epoch", "moe_epoch"}
-        if reserved & arguments.keys():
-            raise ValueError("decode Block state and runtime scalars must come from dispatch")
-        missing = set(self.param_names) - reserved - arguments.keys()
-        if missing:
-            raise ValueError("missing decode Block arguments: " + ", ".join(sorted(missing)))
-        if (arguments["x_next"] is state.residual or arguments["next_pre_mix"] is state.pre_mix
-                or arguments["x_next"] is arguments["next_pre_mix"]):
-            raise ValueError("decode Block input and output state must not alias")
-        if self.epoch >= (2**31 - 1) // 2:
-            raise OverflowError("decode Block communication epoch exhausted")
-        _, local = self.topology.counts(group_counts)
-        self.moe_counts.copy_(torch.tensor(local, dtype=torch.int32))
-        reset_windows = self.epoch == 512
-        epoch = 1 if reset_windows else self.epoch + 1
-        bound = dict(arguments, x_hc=state.residual, incoming_pre_mix=state.pre_mix,
-                     layer_id=ctypes.c_int32(plan.layer_id),
-                     attention_num_tokens=ctypes.c_int32(group_counts[0]),
-                     moe_num_tokens=self.moe_counts,
-                     attention_epoch=ctypes.c_int32(epoch), moe_epoch=ctypes.c_int32(epoch))
-        if reset_windows:
-            if not getattr(self.worker, "_persistent", False) or not hasattr(
-                self.worker, "_reset_persistent_windows"
-            ):
-                raise RuntimeError("decode epoch reset requires a persistent PyPTO worker")
-            previous_reset = self.worker._reset_persistent_windows
-            self.worker._reset_persistent_windows = True
-        try:
-            self.worker.run(self.program.compiled,
-                            *(bound[name] for name in self.param_names), config=self.run_config)
-        except BaseException:
-            self.failed = True
-            raise
-        finally:
-            if reset_windows:
-                self.worker._reset_persistent_windows = previous_reset
-        self.epoch = epoch
-        return LayerState(arguments["x_next"], arguments["next_pre_mix"], "tp_local_token")
 
 
 # npu_runner
@@ -2721,39 +2521,6 @@ class V41ResidentResources:
         return segment.run_chain(
             state, self._prefill.plans, self._prefill.attention, self._prefill.moe,
             group_counts=self._group_counts)
-
-    def decode_backbone_metadata(self, step):
-        """Reject the current lib ABI before binding unequal C2A/C1A fields."""
-        if (self.closed or step is not self._step or step.phase != "decode"
-                or self.decode_host is None):
-            raise ValueError("decode metadata requires the active decode step")
-        raise MissingCompositeInterface(
-            "decode_fwd accepts one compressed_lens, compressed_slots, "
-            "index_block_table and compressed_rope pair for both C2A and C1A; "
-            "the two families have different values and page namespaces")
-
-    def bind_decode_layers(self, plans, param_names, *, kv_sources, index_sources,
-                           c2a_sources, index_topk=512):
-        """Prepare the lib's complete per-layer Block on this worker."""
-        if (self.closed or self._decode_layers is not None or self._step is not None
-                or self.decode_host is None or self.decode_input is None):
-            raise RuntimeError("decode Blocks require pre-fork metadata and one idle worker")
-        self._decode_layers = self._own(DecodeLayerResources(
-            self.worker, self.decode_host.topology, plans, self.weights, self.cache,
-            self.decode_host, param_names, kv_sources=kv_sources,
-            index_sources=index_sources, c2a_sources=c2a_sources,
-            index_topk=index_topk))
-        return self._decode_layers
-
-    def run_decode_layers(self, segment, state, step):
-        if (self.closed or self._decode_layers is None or step is not self._step
-                or step.phase != "decode" or segment.worker is not self.worker):
-            raise ValueError("decode Blocks require the active step and shared worker")
-        for plan in self._decode_layers.plans:
-            state = segment.run_layer(
-                state, plan, self._decode_layers.arguments[plan.layer_id],
-                group_counts=self._group_counts)
-        return state
 
     def bind_decode_fwd(self, program, param_names, run_config):
         if (self.closed or self._decode_fwd is not None or self._step is not None
