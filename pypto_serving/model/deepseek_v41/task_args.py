@@ -27,12 +27,15 @@ class V41CacheGroups:
     c1a: str
 
 
-def build_cache_groups(layers: tuple[LayerPlan, ...], max_seq_len: int) -> tuple[KVCacheGroupSpec, ...]:
+def build_cache_groups(layers: tuple[LayerPlan, ...], max_seq_len: int, *,
+                       dp_size: int = 8) -> tuple[KVCacheGroupSpec, ...]:
     """Declare the three scheduler page namespaces from checkpoint producers."""
     if len(layers) != 40 or tuple(layer.layer_id for layer in layers) != tuple(range(40)):
         raise ValueError("V4.1 cache groups require the complete ordered backbone")
     if type(max_seq_len) is not int or max_seq_len <= 0:
         raise ValueError("V4.1 cache groups require a positive context length")
+    if type(dp_size) is not int or dp_size <= 0:
+        raise ValueError("V4.1 cache groups require a positive DP size")
     producers = {
         "window": tuple(range(40)),
         "c2a": tuple(layer.layer_id for layer in layers
@@ -42,20 +45,23 @@ def build_cache_groups(layers: tuple[LayerPlan, ...], max_seq_len: int) -> tuple
     }
     groups = tuple(KVCacheGroupSpec(
         name, producers[name], KVCacheSpec(block_size, 16, ratio),
-        (max_seq_len + block_size - 1) // block_size, num_partitions=2,
+        (max_seq_len + block_size - 1) // block_size, num_partitions=dp_size,
     ) for name, block_size, ratio in (("window", 128, 1), ("c2a", 256, 2), ("c1a", 128, 1)))
-    validate_cache_groups(layers, groups, max_seq_len)
+    validate_cache_groups(layers, groups, max_seq_len, dp_size=dp_size)
     return groups
 
 
 def validate_cache_groups(
     layers: tuple[LayerPlan, ...], groups: tuple[KVCacheGroupSpec, ...], max_seq_len: int,
+    *, dp_size: int = 8,
 ) -> V41CacheGroups:
     """Resolve the three full-history page families before device allocation."""
     if len(layers) != 40 or tuple(layer.layer_id for layer in layers) != tuple(range(40)):
         raise ValueError("V4.1 cache contract requires the complete ordered 40-layer backbone")
     if type(max_seq_len) is not int or max_seq_len <= 0:
         raise ValueError("V4.1 cache contract requires a positive sequence capacity")
+    if type(dp_size) is not int or dp_size <= 0:
+        raise ValueError("V4.1 cache contract requires a positive DP size")
     if (len(groups) != 3 or any(not isinstance(group, KVCacheGroupSpec) for group in groups)
             or len({group.name for group in groups}) != 3):
         raise ValueError("V4.1 requires separate window, C2A and C1A cache groups")
@@ -78,7 +84,7 @@ def validate_cache_groups(
         family = matches[0]
         _, block_size, ratio = expected[family]
         if (group.spec.block_size != block_size or group.spec.compress_ratio != ratio
-                or group.spec.storage_block_size != 128 or group.num_partitions != 2
+                or group.spec.storage_block_size != 128 or group.num_partitions != dp_size
                 or group.sliding_window is not None or group.is_eagle_group):
             raise ValueError(f"V4.1 {family} cache page layout disagrees with the lib ABI")
         required = (max_seq_len + block_size - 1) // block_size
@@ -139,7 +145,7 @@ class RequestProgress:
 
 class RequestLedger:
     """One synchronous in-flight batch; slots survive omission and reordering."""
-    def __init__(self, *, max_requests, max_seq_len, partitions=2):
+    def __init__(self, *, max_requests, max_seq_len, partitions=8):
         if any(type(v) is not int or v <= 0 for v in (max_requests, max_seq_len, partitions)):
             raise ValueError("request capacities must be positive integers")
         self.max_seq_len = max_seq_len

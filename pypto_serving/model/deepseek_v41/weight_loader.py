@@ -57,6 +57,22 @@ def _positive(value, name):
     return value
 
 
+def _validate_shard_paths(model_dir, weight_map):
+    shared_root = os.environ.get("PYPTO_V41_SHARED_SHARD_DIR")
+    shared_root = Path(shared_root).resolve() if shared_root else None
+    if shared_root is not None and not shared_root.is_dir():
+        raise ValueError("PYPTO_V41_SHARED_SHARD_DIR must be an existing directory")
+    for name, filename in weight_map.items():
+        if not isinstance(name, str) or not isinstance(filename, str):
+            raise ValueError("weight_map must map names to shard filenames")
+        relative = Path(filename)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("checkpoint shard path must stay inside model directory")
+        path = (model_dir / relative).resolve()
+        if not path.is_relative_to(model_dir) and (shared_root is None or not path.is_relative_to(shared_root)):
+            raise ValueError("checkpoint shard path must stay inside model or shared shard directory")
+
+
 @dataclass(frozen=True)
 class WeightBundle:
     """Owned CPU tensors, with explicit layout and checkpoint provenance."""
@@ -101,12 +117,7 @@ class V41WeightLoader:
         weight_map = index.get("weight_map") if isinstance(index, dict) else None
         if not isinstance(weight_map, dict) or not weight_map:
             raise ValueError("checkpoint index requires a nonempty weight_map")
-        for name, filename in weight_map.items():
-            if not isinstance(name, str) or not isinstance(filename, str):
-                raise ValueError("weight_map must map names to shard filenames")
-            path = (self.model_dir / filename).resolve()
-            if Path(filename).is_absolute() or not path.is_relative_to(self.model_dir):
-                raise ValueError("checkpoint shard path must stay inside model directory")
+        _validate_shard_paths(self.model_dir, weight_map)
         # Deferred-module entries are not required, validated or opened. Only
         # declared text weights are reachable through this loader.
         self.store = LazySafetensorsStore(model_dir=self.model_dir, weight_map=weight_map,
@@ -239,8 +250,8 @@ class RankPlacement:
     """Contiguous TP groups inside an EP world; rank is not a physical device ID."""
 
     rank: int
-    tp_size: int = 4
-    dp_size: int = 2
+    tp_size: int = 1
+    dp_size: int = 8
     ep_size: int = 8
 
     def __post_init__(self):
@@ -444,6 +455,7 @@ def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_
     if type(max_bundle_bytes) is not int or max_bundle_bytes <= 0:
         raise ValueError("max_bundle_bytes must be positive")
     attention, moe = [], []
+    shared_bundles = {}
     held_bytes = 0
     if loaders is None:
         loaders = tuple(V41WeightLoader(
@@ -468,7 +480,12 @@ def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_
         with loader.store.slice_session() as session:
             def load(name):
                 nonlocal held_bytes
-                bundle = loader.load(prefix + name, session=session)
+                key = (loader.tp_rank, name) if not name.startswith("ffn.experts.") else None
+                bundle = shared_bundles.get(key) if key is not None else None
+                if bundle is None:
+                    bundle = loader.load(prefix + name, session=session)
+                    if key is not None:
+                        shared_bundles[key] = bundle
                 held_bytes += sum(t.numel() * t.element_size() for t in (bundle.weight, bundle.scale)
                                   if t is not None)
                 if 3 * held_bytes > max_bundle_bytes:
@@ -602,8 +619,8 @@ def iter_decode_weight_slices(model_dir, topology, *, max_bundle_bytes=32 << 30)
     """Yield one layer at a time in checkpoint order for bounded staging."""
     raw = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
     layers = plan_layers(raw)
-    if len(layers) != 40 or (topology.tp, topology.dp, topology.world) != (4, 2, 8):
-        raise ValueError("lib decode_fwd requires the 40-layer TP4/DP2/EP8 schedule")
+    if len(layers) != 40 or (topology.tp, topology.dp, topology.world) != (1, 8, 8):
+        raise ValueError("V4.1 M0 requires the 40-layer TP1/DP8/EP8 schedule")
     text = raw["text_config"]
     kv_sources = tuple(text["kv_source_layer_ids"])
     index_sources = tuple(text["index_source_layer_ids"])
@@ -689,17 +706,21 @@ class DecodeWeightLayout:
     index_sources: int
     c2a_sources: int
     world: int = 8
+    tp_size: int = 1
 
     @classmethod
     def from_lib(cls, abi):
         return cls(abi.N_LAYERS, abi.KV_SOURCE_COUNT, abi.INDEX_SOURCE_COUNT,
-                   abi.C2A_SOURCE_COUNT, abi.EP_SIZE)
+                   abi.C2A_SOURCE_COUNT, abi.EP_SIZE, abi.TP_SIZE)
 
     def __post_init__(self):
         if any(type(n) is not int or n <= 0 for n in (
-            self.layers, self.kv_sources, self.index_sources, self.c2a_sources, self.world,
+            self.layers, self.kv_sources, self.index_sources, self.c2a_sources,
+            self.world, self.tp_size,
         )):
             raise ValueError("decode weight dimensions must be positive integers")
+        if self.world % self.tp_size:
+            raise ValueError("decode weight world size must be divisible by TP size")
 
     def slots(self, name):
         if name in _FLAT_LAYER | _AXIS_LAYER:
