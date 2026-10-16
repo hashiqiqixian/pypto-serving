@@ -1,5 +1,7 @@
 """CPU contracts for the complete V4.1 decode dispatch."""
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -7,6 +9,26 @@ import torch
 from pypto.runtime import DeviceTensor
 from pypto_serving.model.deepseek_v41.npu_runner import DecodeForwardSegment, LayerState, SegmentTopology
 from pypto_serving.model.deepseek_v41.weight_loader import ResidentFullDecodeWeights
+from pypto_serving.model.deepseek_v41.weight_loader import _ALL
+
+
+def test_selected_lib_full_decode_abi_is_fully_bound():
+    source = Path(__file__).resolve().parents[4] / "pypto-lib/models/deepseek_v4_1_flash/decode_fwd.py"
+    module = ast.parse(source.read_text(encoding="utf-8"))
+    entry = next(node for node in module.body
+                 if isinstance(node, ast.FunctionDef) and node.name == "l3_decode_fwd")
+    parameters = {argument.arg for argument in entry.args.args}
+    metadata = set(DecodeForwardSegment._METADATA) | {
+        "window_slots", "window_indices", "c2a_compressed_lens", "c1a_compressed_lens",
+        "c2a_compressed_slots", "c1a_compressed_slots", "moe_num_tokens",
+    }
+    caches = {
+        "window_cache_pool", "window_cache_scale_pool", "compressed_cache_pool",
+        "compressed_cache_scale_pool", "index_cache_pool", "index_cache_scale_pool",
+        "state_cache_pool",
+    }
+    assert parameters == _ALL | metadata | caches | {
+        "x_hc", "pre_mix", "attention_num_tokens"}
 
 
 def test_weight_views_alias_one_full_rank_allocation():
@@ -25,6 +47,10 @@ def test_weight_views_alias_one_full_rank_allocation():
 
         def free_tensor(self, tensor, *, worker_id):
             self.freed.append((tensor.data_ptr, worker_id))
+
+        def free_stacked_tensor(self, tensor):
+            for worker_id, shard in enumerate(tensor.shards):
+                self.free_tensor(shard, worker_id=worker_id)
 
     host = torch.arange(24, dtype=torch.float32).reshape(2, 2, 2, 3).share_memory_()
     bank = SimpleNamespace(
