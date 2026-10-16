@@ -45,6 +45,11 @@ def test_weight_views_alias_one_full_rank_allocation():
         def copy_to(self, base, source, nbytes, *, dst_offset, worker_id):
             self.copies.append((base, dst_offset, nbytes, worker_id))
 
+        def view_tensor(self, parent, shape, *, byte_offset, worker_id):
+            assert parent.shape[0] == 4
+            assert worker_id in (0, 1)
+            return DeviceTensor(parent.data_ptr, shape, parent.dtype, byte_offset=byte_offset)
+
         def free_tensor(self, tensor, *, worker_id):
             self.freed.append((tensor.data_ptr, worker_id))
 
@@ -64,8 +69,9 @@ def test_weight_views_alias_one_full_rank_allocation():
     second = resident.view("hc_attn_fn", 1)
     assert full.shape == (2, 4, 3)
     assert second.shape == (2, 2, 3)
-    assert second.shards[0].data_ptr == full.shards[0].data_ptr + 2 * 3 * 4
-    assert second.shards[1].data_ptr == full.shards[1].data_ptr + 2 * 3 * 4
+    assert second.shards[0].data_ptr == full.shards[0].data_ptr
+    assert second.shards[1].data_ptr == full.shards[1].data_ptr
+    assert second.shards[0].byte_offset == second.shards[1].byte_offset == 2 * 3 * 4
     assert len(worker.copies) == 4
     resident.close()
     assert len(worker.freed) == 2

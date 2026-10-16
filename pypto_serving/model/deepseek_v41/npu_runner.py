@@ -414,7 +414,7 @@ class DecodeFullCachePools(DecodeCachePools):
     """One packed pool per field, with source views shared by prefill."""
 
     def __init__(self, worker, plan, state_reset, page_resets):
-        from pypto.runtime import DeviceTensor, StackedDeviceTensor
+        from pypto.runtime import StackedDeviceTensor
 
         self.worker, self.plan = worker, plan
         self.state_reset, self.page_resets = state_reset, page_resets
@@ -442,9 +442,10 @@ class DecodeFullCachePools(DecodeCachePools):
                 slice_shape = (stride, *spec.shape[2:])
                 slot_bytes = math.prod(slice_shape) * torch.empty((), dtype=spec.dtype).element_size()
                 for source in range(sources):
-                    shards = tuple(DeviceTensor(shard.data_ptr + source * slot_bytes,
-                                                slice_shape, spec.dtype)
-                                   for shard in base.shards)
+                    shards = tuple(worker.view_tensor(shard, slice_shape,
+                                                      byte_offset=source * slot_bytes,
+                                                      worker_id=rank)
+                                   for rank, shard in enumerate(base.shards))
                     self.tensors[spec.name, source] = StackedDeviceTensor(
                         shards, (spec.shape[0], *slice_shape), base.worker_ids)
         except BaseException:

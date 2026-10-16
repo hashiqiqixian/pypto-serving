@@ -866,7 +866,7 @@ class ResidentFullDecodeWeights(ResidentDecodeWeights):
     """Upload contiguous per-rank banks and alias their layer slices for prefill."""
 
     def __init__(self, worker, bank: DecodeWeightBank, parameter_names):
-        from pypto.runtime import DeviceTensor, StackedDeviceTensor
+        from pypto.runtime import StackedDeviceTensor
 
         bank.finish(parameter_names)
         self.worker = worker
@@ -875,7 +875,6 @@ class ResidentFullDecodeWeights(ResidentDecodeWeights):
         self._full = {}
         self._slot_shapes = {}
         self.layout_names = tuple(bank.tensors)
-        self._device_tensor = DeviceTensor
         self._stacked_tensor = StackedDeviceTensor
         try:
             for name, host in bank.tensors.items():
@@ -928,8 +927,9 @@ class ResidentFullDecodeWeights(ResidentDecodeWeights):
         base = self._full[name]
         shape = self._slot_shapes[name]
         slot_bytes = math.prod(shape) * torch.empty((), dtype=base.dtype).element_size()
-        shards = tuple(self._device_tensor(shard.data_ptr + slot * slot_bytes, shape, base.dtype)
-                       for shard in base.shards)
+        shards = tuple(self.worker.view_tensor(shard, shape, byte_offset=slot * slot_bytes,
+                                               worker_id=rank)
+                       for rank, shard in enumerate(base.shards))
         return self._stacked_tensor(shards, (self.layout.world, *shape), base.worker_ids)
 
     def close(self):
