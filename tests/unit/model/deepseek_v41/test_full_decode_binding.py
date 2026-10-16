@@ -42,8 +42,8 @@ def test_weight_views_alias_one_full_rank_allocation():
             self.next_ptr += 1000
             return DeviceTensor(self.next_ptr, shape, dtype)
 
-        def copy_to_offset(self, base, offset, source, nbytes, *, worker_id):
-            self.copies.append((base, offset, nbytes, worker_id))
+        def copy_to(self, base, source, nbytes, *, dst_offset, worker_id):
+            self.copies.append((base, dst_offset, nbytes, worker_id))
 
         def free_tensor(self, tensor, *, worker_id):
             self.freed.append((tensor.data_ptr, worker_id))

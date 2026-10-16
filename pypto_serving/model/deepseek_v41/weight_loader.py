@@ -900,9 +900,9 @@ class ResidentFullDecodeWeights(ResidentDecodeWeights):
                             source = host[slot, rank]
                             if not source.is_contiguous():
                                 raise ValueError(f"{name} weight slice is not contiguous")
-                            worker.copy_to_offset(
-                                base.data_ptr, slot * slot_bytes, source.data_ptr(),
-                                slot_bytes, worker_id=rank,
+                            worker.copy_to(
+                                base.data_ptr, source.data_ptr(), slot_bytes,
+                                dst_offset=slot * slot_bytes, worker_id=rank,
                             )
                 except BaseException:
                     for rank, shard in enumerate(shards):
