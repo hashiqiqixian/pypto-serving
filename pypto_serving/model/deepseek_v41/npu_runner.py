@@ -351,7 +351,7 @@ class DecodeCachePools:
             state = self.view("state_cache_pool", index)
             self.worker.copy_to(
                 state.shards[partition].data_ptr, source.data_ptr(), row_bytes,
-                dst_offset=slot * row_bytes,
+                dst_offset=state.shards[partition].byte_offset + slot * row_bytes,
                 worker_id=partition,
             )
 
@@ -391,7 +391,8 @@ class DecodeCachePools:
                         for page in pages:
                             self.worker.copy_to(
                                 target.shards[partition].data_ptr, zero[partition].data_ptr(), page_bytes,
-                                dst_offset=page * page_bytes, worker_id=partition,
+                                dst_offset=target.shards[partition].byte_offset + page * page_bytes,
+                                worker_id=partition,
                             )
         self.reset_state_slot(partition, owner.slot)
 

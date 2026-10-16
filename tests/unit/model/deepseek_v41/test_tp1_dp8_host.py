@@ -258,7 +258,7 @@ def test_request_cache_reset_touches_only_its_tp1_rank():
         group_blocks={name: 1 for name in _pages()},
         physical_group_blocks={name: 2 for name in _pages()},
         group_sources={
-            "window": {"window": (0,)},
+            "window": {"window": (0, 1)},
             "c2a": {"compressed": (0,), "index": (0,)},
             "c1a": {},
         },
@@ -272,12 +272,15 @@ def test_request_cache_reset_touches_only_its_tp1_rank():
     pool.state_reset = torch.zeros((8, 2), dtype=torch.float32)
     pool.page_resets = {name: torch.zeros((8, 2), dtype=torch.uint8) for name in names}
     pool.source_counts = {"state_cache_pool": 3}
-    pool.worker = SimpleNamespace(copy_to=lambda *args, **kwargs: calls.append(kwargs["worker_id"]))
+    pool.worker = SimpleNamespace(copy_to=lambda *args, **kwargs:
+                                  calls.append((kwargs["worker_id"], kwargs["dst_offset"])))
     pool.view = lambda name, source: SimpleNamespace(
-        shards=[SimpleNamespace(data_ptr=rank) for rank in range(8)],
+        shards=[SimpleNamespace(data_ptr=rank, byte_offset=source * 100) for rank in range(8)],
     )
     pool.reset_request(SimpleNamespace(partition=7, slot=0, pages=_pages()))
-    assert calls and set(calls) == {7}
+    assert calls and {rank for rank, _ in calls} == {7}
+    assert any(offset == 100 for _, offset in calls)
+    assert any(offset == 200 for _, offset in calls)
 
 
 def test_final_head_weight_is_present_on_every_dp_rank(monkeypatch):
