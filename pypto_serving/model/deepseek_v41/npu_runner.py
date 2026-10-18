@@ -2744,10 +2744,21 @@ class V41ResidentResources:
         self._prefill = None
         self._prefill_fwd = None
         self._decode_fwd = None
+        self._decode_binding = None
+        self._weight_bank = weight_bank
+        self._weight_param_names = tuple(weight_param_names)
+        self._prefill_binding = (prefill_program, prefill_param_names, prefill_manifest,
+                                 prefill_offsets, run_config, topology)
+        self._lut = None
+        self.weights = None
         self.closed = False
         try:
-            self.weights = self._own(ResidentFullDecodeWeights(
-                self.worker, weight_bank, weight_param_names))
+            if prefill_program is None:
+                self.weights = ResidentFullDecodeWeights(
+                    self.worker, weight_bank, weight_param_names)
+            else:
+                self._lut = self.worker.alloc_stacked_tensor(
+                    weight_bank.tensors["mxfp4_pair_lut"])
             self.input = self._own(InputStateRuntime(self.worker, input_host))
             self.decode_input = (None if decode_input_host is None else
                                  self._own(InputStateRuntime(self.worker, decode_input_host)))
@@ -2765,10 +2776,7 @@ class V41ResidentResources:
                 if (prefill_param_names is None or prefill_manifest is None
                         or prefill_offsets is None or prefill_host.full_hidden_size is None):
                     raise ValueError("full prefill binding requires its ABI, manifest and metadata")
-                self._prefill_fwd = self._own(PrefillForwardSegment(
-                    self.worker, prefill_program, prefill_param_names, run_config, topology,
-                    prefill_manifest, prefill_offsets, prefill_host, self.cache, self.final,
-                    self.weights.full("mxfp4_pair_lut")))
+                self._activate_prefill()
             if decode_host is not None:
                 plan = cache.plan
                 if decode_host.max_requests < plan.physical_request_slots:
@@ -2787,9 +2795,43 @@ class V41ResidentResources:
         self._owned.append(resource)
         return resource
 
+    def _activate_prefill(self):
+        if self._prefill_fwd is not None:
+            return
+        program, names, manifest, offsets, run_config, topology = self._prefill_binding
+        if program is None:
+            raise RuntimeError("full prefill was not registered")
+        if self.weights is not None:
+            self.weights.close()
+            self.weights = None
+            self._decode_fwd = None
+        self._prefill_fwd = PrefillForwardSegment(
+            self.worker, program, names, run_config, topology,
+            manifest, offsets, self.prefill_host, self.cache, self.final, self._lut)
+
+    def _activate_decode(self):
+        if self._decode_fwd is not None:
+            return
+        if self._decode_binding is None:
+            raise RuntimeError("full decode was not registered")
+        if self._prefill_fwd is not None:
+            self._prefill_fwd.close()
+            self._prefill_fwd = None
+        if self.weights is None:
+            self.weights = ResidentFullDecodeWeights(
+                self.worker, self._weight_bank, self._weight_param_names)
+        program, names, run_config, counts_are_tensor = self._decode_binding
+        self._decode_fwd = DecodeForwardSegment(
+            self.worker, program, names, run_config, self.decode_host.topology,
+            counts_are_tensor, self.weights, self.cache, self.decode_host)
+
     def begin_step(self, embeddings, step):
         if self.closed or self._step is not None:
             raise RuntimeError("V4.1 worker is closed or a step is already active")
+        if step.phase == "prefill" and self._prefill_binding[0] is not None:
+            self._activate_prefill()
+        elif step.phase == "decode":
+            self._activate_decode()
         dispatch_step = step
         if step.phase == "decode":
             dispatch_step, embeddings, padding_partitions = pad_single_decode(
@@ -2841,13 +2883,12 @@ class V41ResidentResources:
         return self._prefill_fwd.run()
 
     def bind_decode_fwd(self, program, param_names, run_config, counts_are_tensor):
-        if (self.closed or self._decode_fwd is not None or self._step is not None
+        if (self.closed or self._decode_binding is not None or self._step is not None
                 or self.decode_host is None):
             raise RuntimeError("full decode requires an idle worker and decode metadata")
-        self._decode_fwd = DecodeForwardSegment(
-            self.worker, program, param_names, run_config, self.decode_host.topology,
-            counts_are_tensor,
-            self.weights, self.cache, self.decode_host)
+        self._decode_binding = (program, tuple(param_names), run_config, counts_are_tensor)
+        if self._prefill_binding[0] is None:
+            self._activate_decode()
         return self._decode_fwd
 
     def run_decode_fwd(self, state, step):
@@ -2873,6 +2914,15 @@ class V41ResidentResources:
             return
         self._step = self._inputs = self._group_counts = None
         try:
+            if self._prefill_fwd is not None:
+                self._prefill_fwd.close()
+                self._prefill_fwd = None
+            if self.weights is not None:
+                self.weights.close()
+                self.weights = None
+            if self._lut is not None:
+                self.worker.free_stacked_tensor(self._lut)
+                self._lut = None
             for resource in reversed(self._owned):
                 resource.close()
         finally:

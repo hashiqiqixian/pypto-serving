@@ -17,8 +17,10 @@ import pytest
 import torch
 
 from pypto.runtime import DeviceTensor, StackedDeviceTensor
+from pypto_serving.model.deepseek_v41 import npu_runner
 from pypto_serving.model.deepseek_v41.npu_runner import (
     DecodeForwardSegment, DecodeFullCachePools, LayerState, SegmentTopology,
+    V41ResidentResources,
     compile_prefill_fwd,
 )
 from pypto_serving.model.deepseek_v41.weight_loader import ResidentFullDecodeWeights
@@ -144,6 +146,61 @@ def test_full_prefill_import_uses_serving_capacity_and_complete_abi():
     assert {"embedding", "bank8", "bank4", "counts", "window_cache",
             "compressed_cache", "index_cache", "state_cache", "logits",
             "sampled_ids"} <= set(names)
+
+
+def test_full_forward_weight_banks_swap_between_prefill_and_decode(monkeypatch):
+    events = []
+
+    class Prefill:
+        def __init__(self, *args):
+            events.append("prefill_open")
+
+        def close(self):
+            events.append("prefill_close")
+
+    class Weights:
+        def __init__(self, *args):
+            events.append("decode_open")
+            self.layout_names = ()
+
+        def close(self):
+            events.append("decode_close")
+
+    class Decode:
+        def __init__(self, *args):
+            events.append("decode_bind")
+
+    monkeypatch.setattr(npu_runner, "PrefillForwardSegment", Prefill)
+    monkeypatch.setattr(npu_runner, "ResidentFullDecodeWeights", Weights)
+    monkeypatch.setattr(npu_runner, "DecodeForwardSegment", Decode)
+    resources = V41ResidentResources.__new__(V41ResidentResources)
+    resources.worker = SimpleNamespace(
+        free_stacked_tensor=lambda tensor: events.append("lut_close"),
+        close=lambda: events.append("worker_close"),
+    )
+    resources._weight_bank = object()
+    resources._weight_param_names = ()
+    resources._prefill_binding = (object(), (), object(), {}, object(), object())
+    resources._decode_binding = (object(), (), object(), True)
+    resources._lut = object()
+    resources.prefill_host = object()
+    resources.decode_host = SimpleNamespace(topology=object())
+    resources.cache = resources.final = object()
+    resources.weights = resources._prefill_fwd = resources._decode_fwd = None
+    resources._owned = []
+    resources._step = resources._inputs = resources._group_counts = None
+    resources.closed = False
+
+    resources._activate_prefill()
+    resources._activate_prefill()
+    resources._activate_decode()
+    resources._activate_decode()
+    resources._activate_prefill()
+    resources.close()
+
+    assert events == ["prefill_open", "prefill_close", "decode_open", "decode_bind",
+                      "decode_close", "prefill_open", "prefill_close", "lut_close",
+                      "worker_close"]
 
 
 def test_full_decode_binds_distinct_c2a_and_c1a_metadata():
