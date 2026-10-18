@@ -28,7 +28,8 @@ from pypto_serving.model.deepseek_v41.weight_loader import _ALL
 
 
 def test_selected_lib_full_decode_abi_is_fully_bound():
-    source = Path(__file__).resolve().parents[4] / "pypto-lib/models/deepseek_v4_1_flash/decode_fwd.py"
+    root = Path(os.environ.get("PYPTO_LIB_ROOT") or Path(__file__).resolve().parents[4] / "pypto-lib")
+    source = root / "models/deepseek_v4_1_flash/decode_fwd.py"
     module = ast.parse(source.read_text(encoding="utf-8"))
     entry = next(node for node in module.body
                  if isinstance(node, ast.FunctionDef) and node.name == "l3_decode_fwd")
