@@ -91,7 +91,7 @@ def test_full_prefill_cache_views_borrow_decode_pools_without_copy():
     class Worker:
         def view_tensor(self, parent, shape, *, byte_offset, worker_id):
             assert byte_offset == 0
-            return DeviceTensor(parent.data_ptr, shape, parent.dtype, byte_offset=byte_offset)
+            return DeviceTensor(parent.data_ptr, shape, parent.dtype)
 
     pool = DecodeFullCachePools.__new__(DecodeFullCachePools)
     pool.worker = Worker()
