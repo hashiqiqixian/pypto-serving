@@ -19,6 +19,7 @@ from pypto_serving.model.deepseek_v41.npu_runner import (
     DecodeCachePlan,
     DecodeCachePools,
     MissingCompositeInterface,
+    PrefillMetadataResources,
     SegmentTopology,
     load_final_output_host_resources,
     make_cache_page_reset_buffers,
@@ -110,6 +111,36 @@ def test_tp1_segment_accepts_80_rows_per_dp_and_rejects_81():
     with pytest.raises(ValueError, match="segment capacity"):
         prepare_segment_inputs(torch.ones((81, 4), dtype=torch.bfloat16),
                                ForwardStep("prefill", (oversized,), 1), topology)
+
+
+def test_full_prefill_metadata_preserves_two_stage_history_and_page_families():
+    topology = SegmentTopology(tp=1, dp=8, local_capacity=16)
+    cosine = torch.ones((256, 32), dtype=torch.float32)
+    sine = torch.zeros_like(cosine)
+    host = PrefillMetadataResources(
+        topology, max_seq_len=256, max_requests=2, window_pages=3,
+        c2a_pages=3, c1a_pages=3, rope_tables=(cosine, sine),
+        compressed_rope_tables=(cosine, sine), full_hidden_size=4,
+    )
+    requests = (
+        RequestSlice("A", 0, 0, 0, (11, 12), 2, MappingProxyType(_pages())),
+        RequestSlice("B", 7, 1, 1, (21,), 2, MappingProxyType(_pages())),
+    )
+    step = ForwardStep("prefill", requests, 1)
+    embeddings = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+    assert host.stage_full(step, embeddings) == (2, 0, 0, 0, 0, 0, 0, 1)
+    args = host.full_arguments()
+    assert all(tensor.is_shared() for tensor in args.values())
+    assert args["counts"].tolist() == [[2, 2]] + [[0, 0]] * 6 + [[1, 1]]
+    assert args["embedding"][0, :2].equal(embeddings[:2])
+    assert args["embedding"][7, 0].equal(embeddings[2])
+    assert args["position_ids"][7, :, 0].tolist() == [1, 1]
+    assert args["replay_rows"][7, :2].tolist() == [0, -1]
+    assert args["compressed_lens"][7, :, 0].tolist() == [1, 2]
+    assert args["logit_rows"][0, 0] == 1
+    assert args["logit_rows"][7, 0] == 0
+    assert args["index_block_tables"][0, 0, 0, 0] == 0
+    assert args["index_block_tables"][7, 1, 0, 0] == 0
 
 
 def test_decode_cache_plan_uses_the_lib_tp1_ep8_constants():

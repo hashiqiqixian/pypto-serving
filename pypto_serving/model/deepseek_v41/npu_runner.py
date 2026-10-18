@@ -2162,7 +2162,8 @@ class PrefillMetadataResources:
     """Keep C2A and C1A page/length contracts separate across one layer chain."""
 
     def __init__(self, topology, *, max_seq_len, max_requests, window_pages,
-                 c2a_pages, c1a_pages, rope_tables, compressed_rope_tables):
+                 c2a_pages, c1a_pages, rope_tables, compressed_rope_tables,
+                 full_hidden_size=None):
         if any(type(value) is not int or value <= 0 for value in
                (max_seq_len, max_requests, window_pages, c2a_pages, c1a_pages)):
             raise ValueError("prefill metadata capacities must be positive integers")
@@ -2177,6 +2178,9 @@ class PrefillMetadataResources:
         self.window_pages = window_pages
         self.compressed_pages = {"c2a": c2a_pages, "c1a": c1a_pages}
         self.fields = {}
+        self.full_hidden_size = full_hidden_size
+        if full_hidden_size is not None and (type(full_hidden_size) is not int or full_hidden_size <= 0):
+            raise ValueError("full prefill hidden size must be positive")
 
         def shared(name, shape, dtype, fill=0):
             value = torch.empty(shape, dtype=dtype).share_memory_()
@@ -2212,6 +2216,24 @@ class PrefillMetadataResources:
                                 (world, max_seq_len, width), torch.float32)
                 target.copy_(value[:max_seq_len].unsqueeze(0).expand_as(target))
             self.tables[prefix] = pair
+        if full_hidden_size is not None:
+            shared("full_embedding", (world, tokens, full_hidden_size), torch.bfloat16)
+            shared("full_embedding_ids", (world, tokens), torch.int64)
+            shared("full_initial_pre", (world, tokens, 4), torch.float32)
+            shared("full_identity_rows", (world, tokens), torch.int32, -1)
+            shared("full_counts", (world, 2), torch.int32)
+            shared("full_replay_rows", (world, tokens), torch.int32, -1)
+            shared("full_position_ids", (world, 2, tokens), torch.int32, -1)
+            shared("full_rope_cos", (world, 3, tokens, width), torch.float32)
+            shared("full_rope_sin", (world, 3, tokens, width), torch.float32)
+            shared("full_window_slots", (world, 2, tokens), torch.int64, -1)
+            shared("full_window_indices", (world, 2, tokens, 128), torch.int32, -1)
+            shared("full_token_requests", (world, 2, tokens), torch.int32, -1)
+            shared("full_compressed_lens", (world, 2, tokens), torch.int32)
+            shared("full_query_starts", (world, 2, max_requests + 1), torch.int32)
+            shared("full_index_block_tables", (
+                world, 2, max_requests, max(c2a_pages, c1a_pages)), torch.int32, -1)
+            shared("full_logit_rows", (world, 16), torch.int32, -1)
 
     @property
     def inherited_host_tensors(self):
@@ -2265,6 +2287,79 @@ class PrefillMetadataResources:
                 self.fields["compressed_rope_cos"].copy_(rows[0])
                 self.fields["compressed_rope_sin"].copy_(rows[1])
         return swa.group_counts
+
+    def stage_full(self, step, embeddings):
+        """Lower one chunk into the two-stage lib prefill ABI using scheduler pages."""
+        if self.full_hidden_size is None:
+            raise ValueError("full prefill staging was not allocated before worker startup")
+        if embeddings.shape[-1] != self.full_hidden_size:
+            raise ValueError("full prefill embedding width disagrees with the checkpoint")
+        counts = self.stage(step)
+        packed = prepare_segment_inputs(embeddings, step, self.topology)
+        f = self.fields
+        f["full_embedding"].zero_()
+        active = packed.row_indices >= 0
+        f["full_embedding"][active] = embeddings[packed.row_indices[active]]
+        f["full_embedding_ids"].copy_(
+            torch.arange(self.topology.capacity, dtype=torch.int64).expand(self.topology.world, -1))
+        f["full_initial_pre"].zero_()
+        f["full_initial_pre"][:, :, 0] = 1
+        f["full_identity_rows"].fill_(-1)
+        f["full_replay_rows"].fill_(-1)
+        f["full_counts"].zero_()
+        for rank, count in enumerate(counts):
+            f["full_counts"][rank] = count
+            f["full_identity_rows"][rank, :count] = torch.arange(count, dtype=torch.int32)
+            f["full_replay_rows"][rank, :count] = torch.arange(count, dtype=torch.int32)
+        for stage, family in enumerate(("c2a", "c1a")):
+            f["full_position_ids"][:, stage].copy_(f[family + "_position_ids"])
+            f["full_window_slots"][:, stage].copy_(f["window_slots"])
+            f["full_window_indices"][:, stage].copy_(f["window_indices"])
+            f["full_token_requests"][:, stage].copy_(f[family + "_request_ids"])
+            f["full_compressed_lens"][:, stage].copy_(f[family + "_compressed_lens"])
+            f["full_query_starts"][:, stage].copy_(f[family + "_query_start_loc"])
+            table = f["full_index_block_tables"][:, stage]
+            table.fill_(-1)
+            source = f[family + "_index_block_table"]
+            table[:, :, :source.shape[-1]].copy_(source)
+        for profile, source in enumerate(("rope", "compressed_rope", "compressed_rope")):
+            f["full_rope_cos"][:, profile].copy_(f[source + "_cos"])
+            f["full_rope_sin"][:, profile].copy_(f[source + "_sin"])
+        f["full_logit_rows"].fill_(-1)
+        per_rank = [0] * self.topology.world
+        rows_per_rank = [0] * self.topology.world
+        for request in step.requests:
+            rank = request.partition
+            slot = per_rank[rank]
+            if slot >= 16:
+                raise ValueError("full prefill supports at most 16 output requests per rank")
+            f["full_logit_rows"][rank, slot] = rows_per_rank[rank] + len(request.token_ids) - 1
+            rows_per_rank[rank] += len(request.token_ids)
+            per_rank[rank] += 1
+        return counts
+
+    def full_arguments(self):
+        if self.full_hidden_size is None:
+            raise ValueError("full prefill staging was not allocated")
+        f = self.fields
+        names = {
+            "embedding": "full_embedding", "embedding_ids": "full_embedding_ids",
+            "initial_pre": "full_initial_pre", "identity_rows": "full_identity_rows",
+            "counts": "full_counts", "replay_rows": "full_replay_rows",
+            "position_ids": "full_position_ids", "rope_cos": "full_rope_cos",
+            "rope_sin": "full_rope_sin", "window_slots": "full_window_slots",
+            "window_indices": "full_window_indices", "token_requests": "full_token_requests",
+            "compressed_lens": "full_compressed_lens", "query_starts": "full_query_starts",
+            "index_block_tables": "full_index_block_tables", "logit_rows": "full_logit_rows",
+            "compressed_cos": "c2a_compressed_rope_cos",
+            "compressed_sin": "c2a_compressed_rope_sin",
+            "publisher_cos": "compressed_rope_cos",
+            "publisher_sin": "compressed_rope_sin",
+            "compressed_slots": "c2a_compressed_slots",
+            "publisher_slots": "c1a_compressed_slots",
+            "state_block_table": "c2a_state_block_table",
+        }
+        return {name: f[source] for name, source in names.items()}
 
     def arguments(self, mode):
         common = {name: self.fields[name] for name in
