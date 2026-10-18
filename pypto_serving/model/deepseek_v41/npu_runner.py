@@ -45,6 +45,7 @@ from .weight_loader import (
     DecodeWeightBank,
     DecodeWeightLayout,
     LayerPlan,
+    PrepackedPrefillBank,
     RankPlacement,
     ResidentDecodeWeights,
     ResidentFullDecodeWeights,
@@ -3093,6 +3094,12 @@ def make_production_bindings(model_dir, max_seq_len):
         prefill_utils = importlib.import_module("models.deepseek_v4_1_flash.utils")
         prefill_manifest = prefill_utils.ResidentPrefillWeights(
             prefill_utils.PrefillCheckpoint(model_dir), ep_size=topology.world)
+        prefill_sidecar = os.environ.get("PYPTO_V41_PREFILL_BANK_DIR")
+        if prefill_sidecar:
+            prefill_source = PrepackedPrefillBank(
+                prefill_sidecar, model_dir, layout, revision, prefill_manifest)
+        else:
+            prefill_source = prefill_manifest
         prefill_offsets = {
             name: value.unsqueeze(0).expand(topology.world, *value.shape).contiguous().share_memory_()
             for name, value in prefill_manifest.offset_tensors.items()
@@ -3108,7 +3115,7 @@ def make_production_bindings(model_dir, max_seq_len):
             prefill_host=prefill_host, decode_host=decode_host,
             final_host=final_host, final_program=final, final_param_names=final_names,
             topology=topology, prefill_program=prefill, prefill_param_names=prefill_names,
-            prefill_manifest=prefill_manifest, prefill_offsets=prefill_offsets,
+            prefill_manifest=prefill_source, prefill_offsets=prefill_offsets,
         )
         _LOG.info("V4.1 resident upload and allocation %.2fs",
                   time.perf_counter() - resident_started)

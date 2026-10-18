@@ -10,14 +10,18 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
+import importlib
 import json
 import logging
 import math
 import os
 import re
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -1018,3 +1022,103 @@ def load_prepacked_bank(model_dir, layout, parameter_names, *, path=None):
         return bank
     finally:
         os.close(fd)
+
+
+def _prefill_bank_metadata(model_dir, layout, lib_revision, manifest):
+    return {
+        "format": "pypto-deepseek-v41-prefill-bank-v1",
+        "source_fingerprint": source_fingerprint(model_dir, layout),
+        "lib_revision": lib_revision,
+        "ranks": manifest.ranks,
+        "banks": {name: {"shape": list(shape), "dtype": str(dtype),
+                         "nbytes": math.prod(shape) * torch.empty((), dtype=dtype).element_size()}
+                  for name, (shape, dtype) in manifest.tensor_layouts.items()},
+    }
+
+
+class PrepackedPrefillBank:
+    """Read a complete rank-major prefill bank produced from this checkpoint and lib."""
+
+    def __init__(self, path, model_dir, layout, lib_revision, manifest):
+        self.path = Path(path)
+        expected = _prefill_bank_metadata(model_dir, layout, lib_revision, manifest)
+        recorded = json.loads((self.path / "manifest.json").read_text(encoding="utf-8"))
+        if recorded != expected:
+            raise ValueError("V4.1 prefill bank sidecar is stale or has another layout")
+        for rank in range(manifest.ranks):
+            for name, spec in expected["banks"].items():
+                if (self.path / f"rank{rank}-{name}.bin").stat().st_size != spec["nbytes"]:
+                    raise ValueError(f"V4.1 prefill bank sidecar is truncated: rank {rank} {name}")
+        self.ranks = manifest.ranks
+        self.tensor_layouts = manifest.tensor_layouts
+        self.bytes_per_rank = manifest.bytes_per_rank
+
+    def upload(self, worker, rank, handles):
+        if not 0 <= rank < self.ranks:
+            raise ValueError("prefill bank rank is out of range")
+        for name, (shape, dtype) in self.tensor_layouts.items():
+            size = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+            mapped = torch.from_file(str(self.path / f"rank{rank}-{name}.bin"),
+                                     shared=False, size=size, dtype=torch.uint8)
+            for offset in range(0, size, 64 << 20):
+                count = min(64 << 20, size - offset)
+                worker.copy_to(handles[name].data_ptr, mapped.data_ptr() + offset,
+                               count, dst_offset=offset, worker_id=rank)
+
+
+def prepack_prefill_bank(manifest, model_dir, layout, lib_revision, path):
+    """Create the reusable prefill bank without holding NPU devices."""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    metadata = _prefill_bank_metadata(model_dir, layout, lib_revision, manifest)
+    marker = path / "manifest.json"
+    if marker.exists():
+        PrepackedPrefillBank(path, model_dir, layout, lib_revision, manifest)
+        return
+
+    class HostCopy:
+        @staticmethod
+        def copy_to(dst_ptr, src_ptr, count, *, dst_offset, worker_id):
+            ctypes.memmove(dst_ptr + dst_offset, src_ptr, count)
+
+    for rank in range(manifest.ranks):
+        tensors = {}
+        handles = {}
+        for name, spec in metadata["banks"].items():
+            target = path / f"rank{rank}-{name}.bin"
+            with target.open("wb") as output:
+                output.truncate(spec["nbytes"])
+            tensor = torch.from_file(str(target), shared=True,
+                                     size=spec["nbytes"], dtype=torch.uint8)
+            tensors[name] = tensor
+            handles[name] = SimpleNamespace(data_ptr=tensor.data_ptr())
+        manifest.upload(HostCopy(), rank, handles)
+        for name in tensors:
+            with (path / f"rank{rank}-{name}.bin").open("r+b") as output:
+                os.fsync(output.fileno())
+        tensors.clear()
+        _LOG.info("Packed V4.1 prefill bank rank %d/%d", rank + 1, manifest.ranks)
+    pending = path / "manifest.json.tmp"
+    pending.write_text(json.dumps(metadata, sort_keys=True), encoding="utf-8")
+    pending.replace(marker)
+
+
+def _prepack_prefill_main():
+    if len(sys.argv) != 5 or sys.argv[1] != "--prefill-bank":
+        raise SystemExit("usage: python -m pypto_serving.model.deepseek_v41.weight_loader "
+                         "--prefill-bank MODEL_DIR LIB_ROOT OUTPUT_DIR")
+    model_dir, lib_root, output = map(Path, sys.argv[2:])
+    from .npu_runner import SegmentTopology, load_segment_modules, _revision
+
+    topology = SegmentTopology.for_decode()
+    load_segment_modules(lib_root, topology)
+    abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
+    utils = importlib.import_module("models.deepseek_v4_1_flash.utils")
+    layout = DecodeWeightLayout.from_lib(abi)
+    manifest = utils.ResidentPrefillWeights(utils.PrefillCheckpoint(model_dir),
+                                            ep_size=topology.world)
+    prepack_prefill_bank(manifest, model_dir, layout, _revision(lib_root), output)
+
+
+if __name__ == "__main__":
+    _prepack_prefill_main()

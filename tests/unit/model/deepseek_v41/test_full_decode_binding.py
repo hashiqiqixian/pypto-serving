@@ -9,7 +9,10 @@
 """CPU contracts for the complete V4.1 decode dispatch."""
 
 import ast
+import ctypes
+import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,7 +26,9 @@ from pypto_serving.model.deepseek_v41.npu_runner import (
     V41ResidentResources,
     compile_prefill_fwd,
 )
-from pypto_serving.model.deepseek_v41.weight_loader import ResidentFullDecodeWeights
+from pypto_serving.model.deepseek_v41.weight_loader import (
+    PrepackedPrefillBank, ResidentFullDecodeWeights, prepack_prefill_bank,
+)
 from pypto_serving.model.deepseek_v41.weight_loader import _ALL
 
 
@@ -202,6 +207,51 @@ def test_full_forward_weight_banks_swap_between_prefill_and_decode(monkeypatch):
     assert events == ["prefill_open", "prefill_close", "decode_open", "decode_bind",
                       "decode_close", "prefill_open", "prefill_close", "lut_close",
                       "worker_close"]
+
+
+def test_prefill_bank_sidecar_replays_exact_bytes_and_rejects_stale_source(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    (model / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"x": "shard.bin"}}), encoding="utf-8")
+    (model / "shard.bin").write_bytes(b"source")
+
+    @dataclass
+    class Layout:
+        world: int = 2
+
+    class Manifest:
+        ranks = 2
+        tensor_layouts = {"bank8": ((4,), torch.uint8), "bf16": ((2,), torch.bfloat16)}
+        bytes_per_rank = 8
+
+        @staticmethod
+        def upload(runtime, rank, handles):
+            for name, values in (("bank8", (rank, 1, 2, 3)),
+                                 ("bf16", (4, 5, 6, rank))):
+                source = torch.tensor(values, dtype=torch.uint8)
+                runtime.copy_to(handles[name].data_ptr, source.data_ptr(), 4,
+                                dst_offset=0, worker_id=rank)
+
+    sidecar = tmp_path / "prefill"
+    prepack_prefill_bank(Manifest(), model, Layout(), "lib-rev", sidecar)
+    packed = PrepackedPrefillBank(sidecar, model, Layout(), "lib-rev", Manifest())
+    recorded = {}
+
+    class Worker:
+        @staticmethod
+        def copy_to(dst_ptr, src_ptr, count, *, dst_offset, worker_id):
+            recorded[(worker_id, dst_ptr + dst_offset)] = ctypes.string_at(src_ptr, count)
+
+    for rank in range(2):
+        packed.upload(Worker(), rank, {
+            "bank8": SimpleNamespace(data_ptr=100), "bf16": SimpleNamespace(data_ptr=200),
+        })
+        assert recorded[(rank, 100)] == bytes((rank, 1, 2, 3))
+        assert recorded[(rank, 200)] == bytes((4, 5, 6, rank))
+    with pytest.raises(ValueError, match="stale"):
+        PrepackedPrefillBank(sidecar, model, Layout(), "different-lib", Manifest())
 
 
 def test_full_decode_binds_distinct_c2a_and_c1a_metadata():
