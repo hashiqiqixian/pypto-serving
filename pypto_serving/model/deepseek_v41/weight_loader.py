@@ -27,7 +27,6 @@ import torch
 
 from pypto_serving.model.common.weights.store import LazySafetensorsStore
 from pypto_serving.model.deepseek.weight_loader import (
-    _PREPACKED_MIN_CACHE_RESIDENCY,
     _map_shared_prepacked_tensors,
     _sample_file_page_cache_residency,
 )
@@ -983,10 +982,8 @@ def load_prepacked_bank(model_dir, layout, parameter_names, *, path=None):
     fd = os.open(path, os.O_RDONLY)
     try:
         residency = _sample_file_page_cache_residency(fd, path)
-        if residency is None or residency < _PREPACKED_MIN_CACHE_RESIDENCY:
-            _LOG.info("Skipping cold V4.1 weight sidecar %s (residency %.1f%%)",
-                      path, 0 if residency is None else 100 * residency)
-            return None
+        _LOG.info("V4.1 weight sidecar page-cache residency: %s",
+                  "unknown" if residency is None else f"{100 * residency:.1f}%")
         with safe_open(f"/proc/self/fd/{fd}", framework="pt", device="cpu") as reader:
             metadata = reader.metadata() or {}
             if metadata.get("format") != _FORMAT or metadata.get("source_fingerprint") != source_fingerprint(
