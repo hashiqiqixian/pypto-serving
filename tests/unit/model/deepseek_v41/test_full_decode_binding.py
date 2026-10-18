@@ -14,8 +14,10 @@ from types import SimpleNamespace
 
 import torch
 
-from pypto.runtime import DeviceTensor
-from pypto_serving.model.deepseek_v41.npu_runner import DecodeForwardSegment, LayerState, SegmentTopology
+from pypto.runtime import DeviceTensor, StackedDeviceTensor
+from pypto_serving.model.deepseek_v41.npu_runner import (
+    DecodeForwardSegment, DecodeFullCachePools, LayerState, SegmentTopology,
+)
 from pypto_serving.model.deepseek_v41.weight_loader import ResidentFullDecodeWeights
 from pypto_serving.model.deepseek_v41.weight_loader import _ALL
 
@@ -83,6 +85,45 @@ def test_weight_views_alias_one_full_rank_allocation():
     assert len(worker.copies) == 4
     resident.close()
     assert len(worker.freed) == 2
+
+
+def test_full_prefill_cache_views_borrow_decode_pools_without_copy():
+    class Worker:
+        def view_tensor(self, parent, shape, *, byte_offset, worker_id):
+            assert byte_offset == 0
+            return DeviceTensor(parent.data_ptr, shape, parent.dtype, byte_offset=byte_offset)
+
+    pool = DecodeFullCachePools.__new__(DecodeFullCachePools)
+    pool.worker = Worker()
+    pool.plan = SimpleNamespace(
+        family_groups=SimpleNamespace(window="window", c2a="c2a", c1a="c1a"),
+        physical_group_blocks={"window": 2, "c2a": 2, "c1a": 2},
+        physical_request_slots=2,
+    )
+    sources = {
+        "window_cache_pool": 40, "window_cache_scale_pool": 40,
+        "compressed_cache_pool": 4, "compressed_cache_scale_pool": 4,
+        "index_cache_pool": 8, "index_cache_scale_pool": 8,
+        "state_cache_pool": 3,
+    }
+    pool.source_counts = sources
+    pool._full = {}
+    for offset, (name, count) in enumerate(sources.items()):
+        shape = (count * 2, 128, 1, 4)
+        shards = tuple(DeviceTensor(10000 + offset * 100 + rank, shape, torch.uint8)
+                       for rank in range(2))
+        pool._full[name] = StackedDeviceTensor(shards, (2, *shape), (0, 1))
+    views = pool.prefill_full_views()
+    assert views["window_cache"].shape == (2, 40, 2, 128, 1, 4)
+    assert views["index_cache"].shape == (2, 4, 2, 128, 1, 4)
+    assert views["state_cache"].shape == (2, 3, 2, 128, 1, 4)
+    assert all(views[target].shards[rank].data_ptr == pool.full(source).shards[rank].data_ptr
+               for target, source in (
+                   ("window_cache", "window_cache_pool"),
+                   ("compressed_cache", "compressed_cache_pool"),
+                   ("index_cache", "index_cache_pool"),
+                   ("state_cache", "state_cache_pool"),
+               ) for rank in range(2))
 
 
 def test_full_decode_binds_distinct_c2a_and_c1a_metadata():

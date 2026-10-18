@@ -457,6 +457,43 @@ class DecodeFullCachePools(DecodeCachePools):
     def full(self, name):
         return self._full[name]
 
+    def prefill_full_views(self):
+        """Borrow lib prefill's source/page axes from the decode flat pools."""
+        from pypto.runtime import StackedDeviceTensor
+
+        plan = self.plan
+        family = plan.family_groups
+        window_pages = plan.physical_group_blocks[family.window]
+        compressed_pages = max(plan.physical_group_blocks[family.c2a],
+                               plan.physical_group_blocks[family.c1a])
+        if window_pages != compressed_pages:
+            raise ValueError("lib prefill requires one common cache page extent")
+        names = {
+            "window_cache": "window_cache_pool",
+            "window_scales": "window_cache_scale_pool",
+            "compressed_cache": "compressed_cache_pool",
+            "compressed_scales": "compressed_cache_scale_pool",
+            "index_cache": "index_cache_pool",
+            "index_scales": "index_cache_scale_pool",
+            "state_cache": "state_cache_pool",
+        }
+        compressed_sources = self.source_counts["compressed_cache_pool"]
+        if compressed_sources != 4 or self.source_counts["index_cache_pool"] < compressed_sources:
+            raise ValueError("lib prefill requires four shared compressed/index KV sources")
+        result = {}
+        for target, source in names.items():
+            base = self.full(source)
+            pages = plan.physical_request_slots if target == "state_cache" else window_pages
+            sources = compressed_sources if target in ("index_cache", "index_scales") else self.source_counts[source]
+            if base.shape[1] < sources * pages or (target not in ("index_cache", "index_scales")
+                                                   and base.shape[1] != sources * pages):
+                raise ValueError(f"{source} cannot be viewed with lib prefill source/page axes")
+            shape = (sources, pages, *base.shape[2:])
+            shards = tuple(self.worker.view_tensor(shard, shape, byte_offset=0, worker_id=rank)
+                           for rank, shard in enumerate(base.shards))
+            result[target] = StackedDeviceTensor(shards, (base.shape[0], *shape), base.worker_ids)
+        return result
+
     def close(self):
         for tensor in reversed(tuple(self._full.values())):
             self.worker.free_stacked_tensor(tensor)
