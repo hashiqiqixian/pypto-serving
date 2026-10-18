@@ -1640,6 +1640,22 @@ def compile_prefill_segments(compiler, lib_root, topology, modes):
     return attention, ffn
 
 
+def compile_prefill_fwd(compiler, lib_root, topology):
+    """Compile the lib's complete CED prefill at the serving row capacity."""
+    load_segment_modules(lib_root, topology)
+    previous_argv = sys.argv[:]
+    try:
+        sys.argv = [previous_argv[0], "--tp", str(topology.tp), "--ep", str(topology.world),
+                    "--dp", str(topology.dp), "--capacity", str(topology.local_capacity)]
+        module = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd")
+    finally:
+        sys.argv = previous_argv
+    if (module.CAPACITY, module.RANKS) != (topology.local_capacity, topology.world):
+        raise ValueError("lib prefill_fwd was imported for another capacity or EP topology")
+    entry = module.l3_prefill_fwd
+    return compiler.compile("v41_prefill_fwd", entry), tuple(entry.param_names)
+
+
 class PrefillSegment(SwaSegment):
     """Carry device residual/pre_mix through a selected prefill mode and MoE.
 
@@ -2574,6 +2590,113 @@ class FinalOutputRuntime:
         self._resident.clear()
 
 
+class ResidentPrefillBank:
+    """Stream checkpoint weights into the lib's five packed device banks."""
+
+    def __init__(self, worker, manifest):
+        from pypto.runtime import StackedDeviceTensor
+
+        self.worker = worker
+        self.tensors = {}
+        self._owned = []
+        layouts = manifest.tensor_layouts
+        try:
+            for rank in range(manifest.ranks):
+                handles = {}
+                for name, (shape, dtype) in layouts.items():
+                    handle = worker.alloc_tensor(shape, dtype, worker_id=rank)
+                    self._owned.append((rank, handle))
+                    handles[name] = handle
+                    self.tensors.setdefault(name, []).append(handle)
+                manifest.upload(worker, rank, handles)
+            self.tensors = {
+                name: StackedDeviceTensor(tuple(shards),
+                                          (manifest.ranks, *layouts[name][0]),
+                                          range(manifest.ranks))
+                for name, shards in self.tensors.items()
+            }
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        for rank, handle in reversed(self._owned):
+            self.worker.free_tensor(handle, worker_id=rank)
+        self._owned.clear()
+        self.tensors.clear()
+
+
+class PrefillForwardSegment:
+    """Run the lib's complete 40-layer prefill with fresh communication windows."""
+
+    def __init__(self, worker, program, param_names, run_config, topology,
+                 manifest, offsets, metadata, cache, final, lut):
+        self.worker, self.program = worker, program
+        self.param_names = tuple(param_names)
+        self.run_config, self.metadata = run_config, metadata
+        self.failed = False
+        self._owned = []
+        self.bank = None
+        free = min(worker.device_memory_info(rank)[0] for rank in range(topology.world))
+        reserve = 1 << 30
+        if free < manifest.bytes_per_rank + reserve:
+            raise MemoryError(
+                f"V4.1 full prefill needs {manifest.bytes_per_rank / (1 << 30):.2f} GiB "
+                f"per rank plus 1 GiB reserve; only {free / (1 << 30):.2f} GiB is free "
+                "after decode weights and caches")
+        try:
+            self.bank = ResidentPrefillBank(worker, manifest)
+            self.residual = alloc_device_buffer(
+                worker, (topology.world, topology.local_capacity, 4,
+                         final.host.head_weight.shape[-1]), torch.float32, stacked=True)
+            self._owned.append(self.residual)
+            self.pre_mix = alloc_device_buffer(
+                worker, (topology.world, topology.local_capacity, 4),
+                torch.float32, stacked=True)
+            self._owned.append(self.pre_mix)
+            self.arguments = dict(
+                metadata.full_arguments(), **self.bank.tensors, **offsets,
+                **cache.prefill_full_views(),
+                mxfp4_pair_lut=lut,
+                final_norm=final.norm_weight, head=final.head_weight,
+                x_hc_out=self.residual, pre_mix_out=self.pre_mix,
+                logits=final.host.logits, sampled_ids=final.host.sampled_ids,
+            )
+            if len(self.param_names) != len(set(self.param_names)) or set(self.param_names) != set(self.arguments):
+                raise ValueError("lib full prefill ABI differs from the serving binding")
+        except BaseException:
+            self.close()
+            raise
+
+    def run(self):
+        if self.failed:
+            raise RuntimeError("full prefill failed; recreate the worker before reuse")
+        if not getattr(self.worker, "_persistent", False) or not hasattr(
+            self.worker, "_reset_persistent_windows"
+        ):
+            raise RuntimeError("full prefill requires a worker that can reset communication windows")
+        previous_reset = self.worker._reset_persistent_windows
+        self.worker._reset_persistent_windows = True
+        try:
+            self.worker.run(self.program.compiled,
+                            *(self.arguments[name] for name in self.param_names),
+                            config=self.run_config)
+        except BaseException:
+            self.failed = True
+            raise
+        finally:
+            self.worker._reset_persistent_windows = previous_reset
+        return LayerState(self.residual, self.pre_mix, "tp_local_token")
+
+    def close(self):
+        for tensor in reversed(self._owned):
+            self.worker.free_stacked_tensor(tensor)
+        self._owned.clear()
+        if self.bank is not None:
+            self.bank.close()
+            self.bank = None
+
+
 # resident_resources
 class V41ResidentResources:
     """Own resident buffers and their shared host mappings until worker close.
@@ -2586,7 +2709,9 @@ class V41ResidentResources:
     def __init__(self, programs, run_config, *, weight_bank, weight_param_names,
                  cache_plan, state_reset, page_resets, input_host, final_host,
                  prefill_host, final_program, final_param_names, topology,
-                 decode_input_host=None, decode_host=None, worker_factory=make_segment_worker):
+                 decode_input_host=None, decode_host=None, worker_factory=make_segment_worker,
+                 prefill_program=None, prefill_param_names=None, prefill_manifest=None,
+                 prefill_offsets=None):
         weight_bank.finish(weight_param_names)
         if decode_host is not None and (decode_input_host is None or
                 decode_host.topology != decode_input_host.topology):
@@ -2596,6 +2721,7 @@ class V41ResidentResources:
                      + prefill_host.inherited_host_tensors
                      + (() if decode_host is None else decode_host.inherited_host_tensors)
                      + final_host.all_host_tensors
+                     + (() if prefill_offsets is None else tuple(prefill_offsets.values()))
                      + (state_reset, *page_resets.values()))
         if any(not tensor.is_shared() for tensor in inherited):
             raise ValueError("all inherited V4.1 host buffers must be shared before worker creation")
@@ -2616,6 +2742,7 @@ class V41ResidentResources:
         self._inputs = None
         self._group_counts = None
         self._prefill = None
+        self._prefill_fwd = None
         self._decode_fwd = None
         self.closed = False
         try:
@@ -2634,6 +2761,14 @@ class V41ResidentResources:
             else:
                 cache = DecodeFullCachePools(self.worker, cache_plan, state_reset, page_resets)
             self.cache = self._own(cache)
+            if prefill_program is not None:
+                if (prefill_param_names is None or prefill_manifest is None
+                        or prefill_offsets is None or prefill_host.full_hidden_size is None):
+                    raise ValueError("full prefill binding requires its ABI, manifest and metadata")
+                self._prefill_fwd = self._own(PrefillForwardSegment(
+                    self.worker, prefill_program, prefill_param_names, run_config, topology,
+                    prefill_manifest, prefill_offsets, prefill_host, self.cache, self.final,
+                    self.weights.full("mxfp4_pair_lut")))
             if decode_host is not None:
                 plan = cache.plan
                 if decode_host.max_requests < plan.physical_request_slots:
@@ -2662,7 +2797,9 @@ class V41ResidentResources:
             for partition in padding_partitions:
                 self.cache.reset_padding(partition)
         host = self.prefill_host if step.phase == "prefill" else self.decode_host
-        counts = host.stage(dispatch_step) if host is not None else None
+        counts = (host.stage_full(dispatch_step, embeddings)
+                  if step.phase == "prefill" and self._prefill_fwd is not None else
+                  host.stage(dispatch_step) if host is not None else None)
         input_runtime = self.decode_input if step.phase == "decode" else self.input
         if input_runtime is None:
             raise ValueError("decode requires its own TP-local input capacity")
@@ -2696,6 +2833,12 @@ class V41ResidentResources:
         return segment.run_chain(
             state, self._prefill.plans, self._prefill.attention, self._prefill.moe,
             group_counts=self._group_counts)
+
+    def run_prefill_fwd(self, state, step):
+        if (self.closed or step is not self._step or step.phase != "prefill"
+                or self._prefill_fwd is None):
+            raise ValueError("full prefill requires the active prefill step")
+        return self._prefill_fwd.run()
 
     def bind_decode_fwd(self, program, param_names, run_config, counts_are_tensor):
         if (self.closed or self._decode_fwd is not None or self._step is not None
@@ -2836,7 +2979,7 @@ def make_production_bindings(model_dir, max_seq_len):
             ring_heap=2 * 1024 * 1024 * 1024,
         )
         compiler = KernelCompiler(run_config=run_config)
-        attention, moe = compile_prefill_segments(compiler, root, topology, _MODES)
+        prefill, prefill_names = compile_prefill_fwd(compiler, root, topology)
         decode, decode_names, decode_counts_are_tensor = compile_decode_fwd(
             compiler, root, topology)
         final, final_names = compile_final_output(compiler, root, topology)
@@ -2893,12 +3036,20 @@ def make_production_bindings(model_dir, max_seq_len):
             rope_tables=swa_tables,
             compressed_rope_tables=compressed_tables,
         )
-        prefill_host = PrefillMetadataResources(topology, **host_kwargs)
         decode_host = PrefillMetadataResources(topology, **host_kwargs)
         input_host = make_input_host_resources(topology, plan.weights.config.hidden_size)
         decode_input_host = make_input_host_resources(topology, plan.weights.config.hidden_size)
         final_host = load_final_output_host_resources(model_dir, topology)
-        programs = (*attention.values(), moe, decode, final)
+        prefill_utils = importlib.import_module("models.deepseek_v4_1_flash.utils")
+        prefill_manifest = prefill_utils.ResidentPrefillWeights(
+            prefill_utils.PrefillCheckpoint(model_dir), ep_size=topology.world)
+        prefill_offsets = {
+            name: value.unsqueeze(0).expand(topology.world, *value.shape).contiguous().share_memory_()
+            for name, value in prefill_manifest.offset_tensors.items()
+        }
+        prefill_host = PrefillMetadataResources(
+            topology, **host_kwargs, full_hidden_size=plan.weights.config.hidden_size)
+        programs = (prefill, decode, final)
         resident_started = time.perf_counter()
         resident = V41ResidentResources(
             programs, run_config, weight_bank=bank, weight_param_names=decode_names,
@@ -2906,22 +3057,14 @@ def make_production_bindings(model_dir, max_seq_len):
             input_host=input_host, decode_input_host=decode_input_host,
             prefill_host=prefill_host, decode_host=decode_host,
             final_host=final_host, final_program=final, final_param_names=final_names,
-            topology=topology,
+            topology=topology, prefill_program=prefill, prefill_param_names=prefill_names,
+            prefill_manifest=prefill_manifest, prefill_offsets=prefill_offsets,
         )
         _LOG.info("V4.1 resident upload and allocation %.2fs",
                   time.perf_counter() - resident_started)
         try:
-            resident.bind_prefill(
-                layers, kv_sources=kv_sources, index_sources=index_sources,
-                c2a_sources=c2a_sources, max_seq_len=max_seq_len,
-            )
             resident.bind_decode_fwd(
                 decode, decode_names, run_config, decode_counts_are_tensor)
-            resident.prefill_segment = PrefillSegment(
-                resident.worker, attention, moe, topology,
-                prefill_host.fields["attention_counts"], prefill_host.fields["moe_counts"],
-                run_config,
-            )
         except BaseException:
             resident.close()
             raise
@@ -2941,8 +3084,8 @@ def make_production_bindings(model_dir, max_seq_len):
         segment_topology=topology,
         input_layout="tp_local_token",
         output_layout="tp_local_token",
-        prefill_backbone=lambda state, step, resources, plans: resources.run_prefill(
-            resources.prefill_segment, state, step),
+        prefill_backbone=lambda state, step, resources, plans: resources.run_prefill_fwd(
+            state, step),
         decode_backbone=lambda state, step, resources, plans: resources.run_decode_fwd(
             state, step),
     )
