@@ -1,3 +1,11 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """CPU contracts for the complete V4.1 decode dispatch."""
 
 import ast
@@ -102,7 +110,7 @@ def test_full_decode_binds_distinct_c2a_and_c1a_metadata():
     program = SimpleNamespace(compiled=object())
     segment = DecodeForwardSegment(worker, program, names, object(),
                                    SegmentTopology.for_decode(tp=1, dp=8),
-                                   weights, cache, metadata)
+                                   False, weights, cache, metadata)
     state = LayerState(object(), object(), "tp_local_token")
     assert segment.run(state, group_counts=(1,) * 8) is state
     bound = dict(zip(names, calls[0][1:]))
@@ -112,3 +120,11 @@ def test_full_decode_binds_distinct_c2a_and_c1a_metadata():
     assert bound["pre_mix"] is state.pre_mix
     assert bound["hc_attn_fn"] is weight
     assert worker._reset_persistent_windows is False
+
+    calls.clear()
+    tensor_segment = DecodeForwardSegment(
+        worker, program, names, object(), SegmentTopology.for_decode(tp=1, dp=8),
+        True, weights, cache, metadata)
+    assert tensor_segment.run(state, group_counts=(1,) * 8) is state
+    tensor_bound = dict(zip(names, calls[0][1:]))
+    assert tensor_bound["attention_num_tokens"] is fields["moe_counts"]

@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import ctypes
 import importlib
+import inspect
 import json
 import logging
 import math
@@ -1207,8 +1208,17 @@ def compile_decode_fwd(compiler, lib_root, topology):
     load_segment_modules(lib_root, topology)
     module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
     entry = module.l3_decode_fwd
-    return (compiler.compile("v41_decode_fwd", entry, attention_num_tokens=pl.RUNTIME),
-            tuple(entry.param_names))
+    annotation = inspect.signature(entry._func).parameters["attention_num_tokens"].annotation
+    shape = tuple(getattr(annotation, "shape", ()))
+    if shape == (topology.world,):
+        program = compiler.compile("v41_decode_fwd", entry)
+        counts_are_tensor = True
+    elif not shape:
+        program = compiler.compile("v41_decode_fwd", entry, attention_num_tokens=pl.RUNTIME)
+        counts_are_tensor = False
+    else:
+        raise ValueError(f"unsupported decode attention_num_tokens shape: {shape}")
+    return program, tuple(entry.param_names), counts_are_tensor
 
 
 class DecodeForwardSegment:
@@ -1230,10 +1240,12 @@ class DecodeForwardSegment:
     }
 
     def __init__(self, worker, program, param_names, run_config, topology,
+                 counts_are_tensor,
                  weights, cache, metadata):
         self.worker, self.program = worker, program
         self.param_names = tuple(param_names)
         self.run_config, self.topology = run_config, topology
+        self.counts_are_tensor = counts_are_tensor
         self.metadata = metadata
         arguments = {name: weights.full(name) for name in weights.layout_names}
         arguments.update({name: cache.full(name) for name in cache._full})
@@ -1244,6 +1256,10 @@ class DecodeForwardSegment:
             "c1a_compressed_lens", "c2a_compressed_slots", "c1a_compressed_slots",
         )})
         arguments["moe_num_tokens"] = metadata.fields["moe_counts"]
+        if counts_are_tensor:
+            if topology.tp != 1:
+                raise ValueError("decode attention counts share MoE rows only at TP1")
+            arguments["attention_num_tokens"] = metadata.fields["moe_counts"]
         missing = set(param_names) - set(arguments) - {
             "x_hc", "pre_mix", "attention_num_tokens"}
         extra = set(arguments) - set(param_names)
@@ -1259,8 +1275,9 @@ class DecodeForwardSegment:
             raise ValueError("full decode requires TP-local state")
         if len(group_counts) != self.topology.dp or len(set(group_counts)) != 1 or group_counts[0] <= 0:
             raise ValueError("full decode requires equal nonempty token rows on all DP ranks")
-        bound = dict(self.arguments, x_hc=state.residual, pre_mix=state.pre_mix,
-                     attention_num_tokens=ctypes.c_int32(group_counts[0]))
+        bound = dict(self.arguments, x_hc=state.residual, pre_mix=state.pre_mix)
+        if not self.counts_are_tensor:
+            bound["attention_num_tokens"] = ctypes.c_int32(group_counts[0])
         if not getattr(self.worker, "_persistent", False) or not hasattr(
                 self.worker, "_reset_persistent_windows"):
             raise RuntimeError("full decode requires a persistent worker with window reset")
@@ -1898,6 +1915,17 @@ def collect_final_logits(logits: torch.Tensor, rows: FinalOutputRows) -> torch.T
 
 def make_final_output_program(lib_root, topology):
     load_segment_modules(lib_root, topology)
+    previous_argv = sys.argv[:]
+    try:
+        sys.argv = [previous_argv[0], "--tp", str(topology.tp), "--dp", str(topology.dp)]
+        lm_head = importlib.import_module("models.deepseek_v4_1_flash.lm_head")
+    finally:
+        sys.argv = previous_argv
+    if hasattr(lm_head, "l3_final_output"):
+        if (lm_head.TP_SIZE, lm_head.DP_SIZE, lm_head.WORLD_SIZE) != (
+                topology.tp, topology.dp, topology.world):
+            raise ValueError("V4.1 final output was imported for a different topology")
+        return lm_head.l3_final_output
     from . import final_output as module
     return module.make_final_output_program(topology.tp, topology.dp)
 
@@ -1906,11 +1934,16 @@ def compile_final_output(compiler, lib_root, topology):
     import pypto.language as pl
 
     entry = make_final_output_program(lib_root, topology)
-    return compiler.compile("v41_final_output", entry, done_epoch=pl.RUNTIME), tuple(entry.param_names)
+    param_names = tuple(entry.param_names)
+    if "done_epoch" in param_names:
+        program = compiler.compile("v41_final_output", entry, done_epoch=pl.RUNTIME)
+    else:
+        program = compiler.compile("v41_final_output", entry)
+    return program, param_names
 
 
 class FinalOutput:
-    """Dispatch final logits while retaining one completion epoch per worker."""
+    """Dispatch final logits under the selected lib communication contract."""
 
     def __init__(self, worker, program, param_names, run_config):
         self.worker = worker
@@ -1919,33 +1952,40 @@ class FinalOutput:
         self.run_config = run_config
         self.epoch = 0
         self.failed = False
-        required = {"x_hc", "pre_mix", "norm_weight", "head_weight", "logit_row_indices",
-                    "normed", "logits", "sampled_ids", "done_epoch"}
-        if set(self.param_names) != required or len(self.param_names) != len(required):
+        legacy = {"x_hc", "pre_mix", "norm_weight", "head_weight", "logit_row_indices",
+                  "normed", "logits", "sampled_ids", "done_epoch"}
+        current = {"x_hc", "pre_mix", "final_norm_weight", "lm_head_weight",
+                   "logit_row_indices", "logits", "sampled_ids"}
+        names = set(self.param_names)
+        if names not in (legacy, current) or len(self.param_names) != len(names):
             raise ValueError("final output ABI differs from the lib composite")
+        self.fresh_windows = names == current
 
     def run(self, state: LayerState, arguments):
         if self.failed:
             raise RuntimeError("output dispatch failed; close the worker before retrying")
         if state.layout != "tp_local_token":
             raise ValueError("final output requires TP-local residual and pre_mix")
-        reserved = {"x_hc", "pre_mix", "done_epoch"}
+        reserved = {"x_hc", "pre_mix"}
+        if not self.fresh_windows:
+            reserved.add("done_epoch")
         if reserved & arguments.keys():
             raise ValueError("final state and epoch must come from this dispatch")
         missing = set(self.param_names) - reserved - arguments.keys()
         if missing:
             raise ValueError("missing output ABI arguments: " + ", ".join(sorted(missing)))
-        if self.epoch >= (2**31 - 1) // 16:
+        if not self.fresh_windows and self.epoch >= (2**31 - 1) // 16:
             raise OverflowError("output completion epoch exhausted; recreate worker")
-        reset_windows = self.epoch == 128
+        reset_windows = self.fresh_windows or self.epoch == 128
         next_epoch = 1 if reset_windows else self.epoch + 1
-        bound = dict(arguments, x_hc=state.residual, pre_mix=state.pre_mix,
-                     done_epoch=ctypes.c_int32(next_epoch))
+        bound = dict(arguments, x_hc=state.residual, pre_mix=state.pre_mix)
+        if not self.fresh_windows:
+            bound["done_epoch"] = ctypes.c_int32(next_epoch)
         if reset_windows:
             if not getattr(self.worker, "_persistent", False) or not hasattr(
                 self.worker, "_reset_persistent_windows"
             ):
-                raise RuntimeError("final output epoch reset requires a persistent PyPTO worker")
+                raise RuntimeError("final output window reset requires a persistent PyPTO worker")
             previous_reset = self.worker._reset_persistent_windows
             self.worker._reset_persistent_windows = True
         try:
@@ -1957,7 +1997,8 @@ class FinalOutput:
         finally:
             if reset_windows:
                 self.worker._reset_persistent_windows = previous_reset
-        self.epoch = next_epoch
+        if not self.fresh_windows:
+            self.epoch = next_epoch
         return arguments["logits"], arguments["sampled_ids"]
 
 
@@ -2059,8 +2100,6 @@ class PrefillLayerResources:
             return value
 
         try:
-            # A layer's Attention and MoE outputs must differ from each other
-            # and from the preceding MoE output. Three slots suffice for all layers.
             states = [(allocate((world, local, 4, 5120), torch.float32),
                        allocate((world, local, 4), torch.float32)) for _ in range(3)]
             attention_hidden = allocate((world, tokens, 5120), torch.bfloat16)
@@ -2358,17 +2397,19 @@ class FinalOutputRuntime:
             self._resident.append(self.norm_weight)
             self.head_weight = worker.alloc_stacked_tensor(host.head_weight)
             self._resident.append(self.head_weight)
-            self.normed = alloc_device_buffer(
-                worker, (world, local, host.head_weight.shape[-1]), torch.bfloat16, stacked=True,
-            )
-            self._resident.append(self.normed)
-            self._normed_by_capacity = {local: self.normed}
-            if prefill_local_capacity is not None and prefill_local_capacity != local:
-                prefill_normed = alloc_device_buffer(
-                    worker, (world, prefill_local_capacity, host.head_weight.shape[-1]),
-                    torch.bfloat16, stacked=True)
-                self._resident.append(prefill_normed)
-                self._normed_by_capacity[prefill_local_capacity] = prefill_normed
+            self._normed_by_capacity = {}
+            if not self.dispatcher.fresh_windows:
+                normed = alloc_device_buffer(
+                    worker, (world, local, host.head_weight.shape[-1]), torch.bfloat16, stacked=True,
+                )
+                self._resident.append(normed)
+                self._normed_by_capacity[local] = normed
+                if prefill_local_capacity is not None and prefill_local_capacity != local:
+                    prefill_normed = alloc_device_buffer(
+                        worker, (world, prefill_local_capacity, host.head_weight.shape[-1]),
+                        torch.bfloat16, stacked=True)
+                    self._resident.append(prefill_normed)
+                    self._normed_by_capacity[prefill_local_capacity] = prefill_normed
         except BaseException:
             self.close()
             raise
@@ -2376,21 +2417,23 @@ class FinalOutputRuntime:
     def run(self, state, inputs):
         local = inputs.row_indices.shape[1]
         normed = self._normed_by_capacity.get(local)
-        if normed is None:
+        if not self.dispatcher.fresh_windows and normed is None:
             raise ValueError("final output capacity was not preallocated before worker dispatch")
         rows = prepare_final_output_rows(
             inputs, self.host.logit_row_indices, local_capacity=local,
         )
         self.host.logits.zero_()
         self.host.sampled_ids.fill_(-1)
-        self.dispatcher.run(state, {
-            "norm_weight": self.norm_weight,
-            "head_weight": self.head_weight,
+        arguments = {
             "logit_row_indices": self.host.logit_row_indices,
-            "normed": normed,
             "logits": self.host.logits,
             "sampled_ids": self.host.sampled_ids,
-        })
+        }
+        if self.dispatcher.fresh_windows:
+            arguments.update(final_norm_weight=self.norm_weight, lm_head_weight=self.head_weight)
+        else:
+            arguments.update(norm_weight=self.norm_weight, head_weight=self.head_weight, normed=normed)
+        self.dispatcher.run(state, arguments)
         return collect_final_logits(self.host.logits, rows)
 
     def close(self):
@@ -2522,12 +2565,13 @@ class V41ResidentResources:
             state, self._prefill.plans, self._prefill.attention, self._prefill.moe,
             group_counts=self._group_counts)
 
-    def bind_decode_fwd(self, program, param_names, run_config):
+    def bind_decode_fwd(self, program, param_names, run_config, counts_are_tensor):
         if (self.closed or self._decode_fwd is not None or self._step is not None
                 or self.decode_host is None):
             raise RuntimeError("full decode requires an idle worker and decode metadata")
         self._decode_fwd = DecodeForwardSegment(
             self.worker, program, param_names, run_config, self.decode_host.topology,
+            counts_are_tensor,
             self.weights, self.cache, self.decode_host)
         return self._decode_fwd
 
@@ -2657,11 +2701,12 @@ def make_production_bindings(model_dir, max_seq_len):
                 device_ids=device_ids,
                 pypto_build_dir=options.pypto_build_dir,
             ),
-            ring_heap=1024 * 1024 * 1024,
+            ring_heap=2 * 1024 * 1024 * 1024,
         )
         compiler = KernelCompiler(run_config=run_config)
         attention, moe = compile_prefill_segments(compiler, root, topology, _MODES)
-        decode, decode_names = compile_decode_fwd(compiler, root, topology)
+        decode, decode_names, decode_counts_are_tensor = compile_decode_fwd(
+            compiler, root, topology)
         final, final_names = compile_final_output(compiler, root, topology)
         abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
         kv_sources, index_sources, c2a_sources = _sources(layers)
@@ -2738,7 +2783,8 @@ def make_production_bindings(model_dir, max_seq_len):
                 layers, kv_sources=kv_sources, index_sources=index_sources,
                 c2a_sources=c2a_sources, max_seq_len=max_seq_len,
             )
-            resident.bind_decode_fwd(decode, decode_names, run_config)
+            resident.bind_decode_fwd(
+                decode, decode_names, run_config, decode_counts_are_tensor)
             resident.prefill_segment = PrefillSegment(
                 resident.worker, attention, moe, topology,
                 prefill_host.fields["attention_counts"], prefill_host.fields["moe_counts"],
