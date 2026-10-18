@@ -9,14 +9,17 @@
 """CPU contracts for the complete V4.1 decode dispatch."""
 
 import ast
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from pypto.runtime import DeviceTensor, StackedDeviceTensor
 from pypto_serving.model.deepseek_v41.npu_runner import (
     DecodeForwardSegment, DecodeFullCachePools, LayerState, SegmentTopology,
+    compile_prefill_fwd,
 )
 from pypto_serving.model.deepseek_v41.weight_loader import ResidentFullDecodeWeights
 from pypto_serving.model.deepseek_v41.weight_loader import _ALL
@@ -124,6 +127,23 @@ def test_full_prefill_cache_views_borrow_decode_pools_without_copy():
                    ("index_cache", "index_cache_pool"),
                    ("state_cache", "state_cache_pool"),
                ) for rank in range(2))
+
+
+def test_full_prefill_import_uses_serving_capacity_and_complete_abi():
+    root = os.environ.get("PYPTO_LIB_ROOT")
+    if not root:
+        pytest.skip("set PYPTO_LIB_ROOT to test the selected V4.1 lib checkout")
+
+    class Compiler:
+        def compile(self, name, entry):
+            assert name == "v41_prefill_fwd"
+            return SimpleNamespace(compiled=entry)
+
+    _, names = compile_prefill_fwd(Compiler(), root, SegmentTopology.for_decode())
+    assert len(names) == 48
+    assert {"embedding", "bank8", "bank4", "counts", "window_cache",
+            "compressed_cache", "index_cache", "state_cache", "logits",
+            "sampled_ids"} <= set(names)
 
 
 def test_full_decode_binds_distinct_c2a_and_c1a_metadata():
