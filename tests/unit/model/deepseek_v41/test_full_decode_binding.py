@@ -9,19 +9,32 @@
 """CPU contracts for the complete V4.1 decode dispatch."""
 
 import ast
+import ctypes
+import json
+import os
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
-from pypto.runtime import DeviceTensor
-from pypto_serving.model.deepseek_v41.npu_runner import DecodeForwardSegment, LayerState, SegmentTopology
-from pypto_serving.model.deepseek_v41.weight_loader import ResidentFullDecodeWeights
+from pypto.runtime import DeviceTensor, StackedDeviceTensor
+from pypto_serving.model.deepseek_v41 import npu_runner
+from pypto_serving.model.deepseek_v41.npu_runner import (
+    DecodeForwardSegment, DecodeFullCachePools, LayerState, SegmentTopology,
+    V41ResidentResources,
+    compile_prefill_fwd,
+)
+from pypto_serving.model.deepseek_v41.weight_loader import (
+    PrepackedPrefillBank, ResidentFullDecodeWeights, prepack_prefill_bank,
+)
 from pypto_serving.model.deepseek_v41.weight_loader import _ALL
 
 
 def test_selected_lib_full_decode_abi_is_fully_bound():
-    source = Path(__file__).resolve().parents[4] / "pypto-lib/models/deepseek_v4_1_flash/decode_fwd.py"
+    root = Path(os.environ.get("PYPTO_LIB_ROOT") or Path(__file__).resolve().parents[4] / "pypto-lib")
+    source = root / "models/deepseek_v4_1_flash/decode_fwd.py"
     module = ast.parse(source.read_text(encoding="utf-8"))
     entry = next(node for node in module.body
                  if isinstance(node, ast.FunctionDef) and node.name == "l3_decode_fwd")
@@ -45,6 +58,7 @@ def test_weight_views_alias_one_full_rank_allocation():
             self.next_ptr = 1000
             self.copies = []
             self.freed = []
+            self.views = []
 
         def alloc_tensor(self, shape, dtype, *, worker_id):
             self.next_ptr += 1000
@@ -56,7 +70,8 @@ def test_weight_views_alias_one_full_rank_allocation():
         def view_tensor(self, parent, shape, *, byte_offset, worker_id):
             assert parent.shape[0] == 4
             assert worker_id in (0, 1)
-            return DeviceTensor(parent.data_ptr, shape, parent.dtype, byte_offset=byte_offset)
+            self.views.append((worker_id, byte_offset))
+            return DeviceTensor(parent.data_ptr, shape, parent.dtype)
 
         def free_tensor(self, tensor, *, worker_id):
             self.freed.append((tensor.data_ptr, worker_id))
@@ -79,10 +94,166 @@ def test_weight_views_alias_one_full_rank_allocation():
     assert second.shape == (2, 2, 3)
     assert second.shards[0].data_ptr == full.shards[0].data_ptr
     assert second.shards[1].data_ptr == full.shards[1].data_ptr
-    assert second.shards[0].byte_offset == second.shards[1].byte_offset == 2 * 3 * 4
+    assert worker.views == [(0, 2 * 3 * 4), (1, 2 * 3 * 4)]
     assert len(worker.copies) == 4
     resident.close()
     assert len(worker.freed) == 2
+
+
+def test_full_prefill_cache_views_borrow_decode_pools_without_copy():
+    class Worker:
+        def view_tensor(self, parent, shape, *, byte_offset, worker_id):
+            assert byte_offset == 0
+            return DeviceTensor(parent.data_ptr, shape, parent.dtype)
+
+    pool = DecodeFullCachePools.__new__(DecodeFullCachePools)
+    pool.worker = Worker()
+    pool.plan = SimpleNamespace(
+        family_groups=SimpleNamespace(window="window", c2a="c2a", c1a="c1a"),
+        physical_group_blocks={"window": 2, "c2a": 2, "c1a": 2},
+        physical_request_slots=2,
+    )
+    sources = {
+        "window_cache_pool": 40, "window_cache_scale_pool": 40,
+        "compressed_cache_pool": 4, "compressed_cache_scale_pool": 4,
+        "index_cache_pool": 8, "index_cache_scale_pool": 8,
+        "state_cache_pool": 3,
+    }
+    pool.source_counts = sources
+    pool._full = {}
+    for offset, (name, count) in enumerate(sources.items()):
+        shape = (count * 2, 128, 1, 4)
+        shards = tuple(DeviceTensor(10000 + offset * 100 + rank, shape, torch.uint8)
+                       for rank in range(2))
+        pool._full[name] = StackedDeviceTensor(shards, (2, *shape), (0, 1))
+    views = pool.prefill_full_views()
+    assert views["window_cache"].shape == (2, 40, 2, 128, 1, 4)
+    assert views["index_cache"].shape == (2, 4, 2, 128, 1, 4)
+    assert views["state_cache"].shape == (2, 3, 2, 128, 1, 4)
+    assert all(views[target].shards[rank].data_ptr == pool.full(source).shards[rank].data_ptr
+               for target, source in (
+                   ("window_cache", "window_cache_pool"),
+                   ("compressed_cache", "compressed_cache_pool"),
+                   ("index_cache", "index_cache_pool"),
+                   ("state_cache", "state_cache_pool"),
+               ) for rank in range(2))
+
+
+def test_full_prefill_import_uses_serving_capacity_and_complete_abi():
+    root = os.environ.get("PYPTO_LIB_ROOT")
+    if not root:
+        pytest.skip("set PYPTO_LIB_ROOT to test the selected V4.1 lib checkout")
+
+    class Compiler:
+        def compile(self, name, entry):
+            assert name == "v41_prefill_fwd"
+            return SimpleNamespace(compiled=entry)
+
+    _, names = compile_prefill_fwd(Compiler(), root, SegmentTopology.for_decode())
+    assert len(names) == 48
+    assert {"embedding", "bank8", "bank4", "counts", "window_cache",
+            "compressed_cache", "index_cache", "state_cache", "logits",
+            "sampled_ids"} <= set(names)
+
+
+def test_full_forward_weight_banks_swap_between_prefill_and_decode(monkeypatch):
+    events = []
+
+    class Prefill:
+        def __init__(self, *args):
+            events.append("prefill_open")
+
+        def close(self):
+            events.append("prefill_close")
+
+    class Weights:
+        def __init__(self, *args):
+            events.append("decode_open")
+            self.layout_names = ()
+
+        def close(self):
+            events.append("decode_close")
+
+    class Decode:
+        def __init__(self, *args):
+            events.append("decode_bind")
+
+    monkeypatch.setattr(npu_runner, "PrefillForwardSegment", Prefill)
+    monkeypatch.setattr(npu_runner, "ResidentFullDecodeWeights", Weights)
+    monkeypatch.setattr(npu_runner, "DecodeForwardSegment", Decode)
+    resources = V41ResidentResources.__new__(V41ResidentResources)
+    resources.worker = SimpleNamespace(
+        free_stacked_tensor=lambda tensor: events.append("lut_close"),
+        close=lambda: events.append("worker_close"),
+    )
+    resources._weight_bank = object()
+    resources._weight_param_names = ()
+    resources._prefill_binding = (object(), (), object(), {}, object(), object())
+    resources._decode_binding = (object(), (), object(), True)
+    resources._lut = object()
+    resources.prefill_host = object()
+    resources.decode_host = SimpleNamespace(topology=object())
+    resources.cache = resources.final = object()
+    resources.weights = resources._prefill_fwd = resources._decode_fwd = None
+    resources._owned = []
+    resources._step = resources._inputs = resources._group_counts = None
+    resources.closed = False
+
+    resources._activate_prefill()
+    resources._activate_prefill()
+    resources._activate_decode()
+    resources._activate_decode()
+    resources._activate_prefill()
+    resources.close()
+
+    assert events == ["prefill_open", "prefill_close", "decode_open", "decode_bind",
+                      "decode_close", "prefill_open", "prefill_close", "lut_close",
+                      "worker_close"]
+
+
+def test_prefill_bank_sidecar_replays_exact_bytes_and_rejects_stale_source(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    (model / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"x": "shard.bin"}}), encoding="utf-8")
+    (model / "shard.bin").write_bytes(b"source")
+
+    @dataclass
+    class Layout:
+        world: int = 2
+
+    class Manifest:
+        ranks = 2
+        tensor_layouts = {"bank8": ((4,), torch.uint8), "bf16": ((2,), torch.bfloat16)}
+        bytes_per_rank = 8
+
+        @staticmethod
+        def upload(runtime, rank, handles):
+            for name, values in (("bank8", (rank, 1, 2, 3)),
+                                 ("bf16", (4, 5, 6, rank))):
+                source = torch.tensor(values, dtype=torch.uint8)
+                runtime.copy_to(handles[name].data_ptr, source.data_ptr(), 4,
+                                dst_offset=0, worker_id=rank)
+
+    sidecar = tmp_path / "prefill"
+    prepack_prefill_bank(Manifest(), model, Layout(), "lib-rev", sidecar)
+    packed = PrepackedPrefillBank(sidecar, model, Layout(), "lib-rev", Manifest())
+    recorded = {}
+
+    class Worker:
+        @staticmethod
+        def copy_to(dst_ptr, src_ptr, count, *, dst_offset, worker_id):
+            recorded[(worker_id, dst_ptr + dst_offset)] = ctypes.string_at(src_ptr, count)
+
+    for rank in range(2):
+        packed.upload(Worker(), rank, {
+            "bank8": SimpleNamespace(data_ptr=100), "bf16": SimpleNamespace(data_ptr=200),
+        })
+        assert recorded[(rank, 100)] == bytes((rank, 1, 2, 3))
+        assert recorded[(rank, 200)] == bytes((4, 5, 6, rank))
+    with pytest.raises(ValueError, match="stale"):
+        PrepackedPrefillBank(sidecar, model, Layout(), "different-lib", Manifest())
 
 
 def test_full_decode_binds_distinct_c2a_and_c1a_metadata():

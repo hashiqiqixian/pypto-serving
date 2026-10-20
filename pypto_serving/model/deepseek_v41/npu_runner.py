@@ -45,6 +45,7 @@ from .weight_loader import (
     DecodeWeightBank,
     DecodeWeightLayout,
     LayerPlan,
+    PrepackedPrefillBank,
     RankPlacement,
     ResidentDecodeWeights,
     ResidentFullDecodeWeights,
@@ -350,9 +351,10 @@ class DecodeCachePools:
         source = self.state_reset[partition]
         for index in range(self.source_counts["state_cache_pool"]):
             state = self.view("state_cache_pool", index)
+            shard = state.shards[partition]
             self.worker.copy_to(
-                state.shards[partition].data_ptr, source.data_ptr(), row_bytes,
-                dst_offset=state.shards[partition].byte_offset + slot * row_bytes,
+                shard.data_ptr - shard.byte_offset, source.data_ptr(), row_bytes,
+                dst_offset=shard.byte_offset + slot * row_bytes,
                 worker_id=partition,
             )
 
@@ -389,10 +391,11 @@ class DecodeCachePools:
                     page_bytes = zero[0].numel() * zero.element_size()
                     for source in sources:
                         target = self.view(name, source)
+                        shard = target.shards[partition]
                         for page in pages:
                             self.worker.copy_to(
-                                target.shards[partition].data_ptr, zero[partition].data_ptr(), page_bytes,
-                                dst_offset=target.shards[partition].byte_offset + page * page_bytes,
+                                shard.data_ptr - shard.byte_offset, zero[partition].data_ptr(), page_bytes,
+                                dst_offset=shard.byte_offset + page * page_bytes,
                                 worker_id=partition,
                             )
         self.reset_state_slot(partition, owner.slot)
@@ -456,6 +459,43 @@ class DecodeFullCachePools(DecodeCachePools):
 
     def full(self, name):
         return self._full[name]
+
+    def prefill_full_views(self):
+        """Borrow lib prefill's source/page axes from the decode flat pools."""
+        from pypto.runtime import StackedDeviceTensor
+
+        plan = self.plan
+        family = plan.family_groups
+        window_pages = plan.physical_group_blocks[family.window]
+        compressed_pages = max(plan.physical_group_blocks[family.c2a],
+                               plan.physical_group_blocks[family.c1a])
+        if window_pages != compressed_pages:
+            raise ValueError("lib prefill requires one common cache page extent")
+        names = {
+            "window_cache": "window_cache_pool",
+            "window_scales": "window_cache_scale_pool",
+            "compressed_cache": "compressed_cache_pool",
+            "compressed_scales": "compressed_cache_scale_pool",
+            "index_cache": "index_cache_pool",
+            "index_scales": "index_cache_scale_pool",
+            "state_cache": "state_cache_pool",
+        }
+        compressed_sources = self.source_counts["compressed_cache_pool"]
+        if compressed_sources != 4 or self.source_counts["index_cache_pool"] < compressed_sources:
+            raise ValueError("lib prefill requires four shared compressed/index KV sources")
+        result = {}
+        for target, source in names.items():
+            base = self.full(source)
+            pages = plan.physical_request_slots if target == "state_cache" else window_pages
+            sources = compressed_sources if target in ("index_cache", "index_scales") else self.source_counts[source]
+            if base.shape[1] < sources * pages or (target not in ("index_cache", "index_scales")
+                                                   and base.shape[1] != sources * pages):
+                raise ValueError(f"{source} cannot be viewed with lib prefill source/page axes")
+            shape = (sources, pages, *base.shape[2:])
+            shards = tuple(self.worker.view_tensor(shard, shape, byte_offset=0, worker_id=rank)
+                           for rank, shard in enumerate(base.shards))
+            result[target] = StackedDeviceTensor(shards, (base.shape[0], *shape), base.worker_ids)
+        return result
 
     def close(self):
         for tensor in reversed(tuple(self._full.values())):
@@ -1603,6 +1643,22 @@ def compile_prefill_segments(compiler, lib_root, topology, modes):
     return attention, ffn
 
 
+def compile_prefill_fwd(compiler, lib_root, topology):
+    """Compile the lib's complete CED prefill at the serving row capacity."""
+    load_segment_modules(lib_root, topology)
+    previous_argv = sys.argv[:]
+    try:
+        sys.argv = [previous_argv[0], "--tp", str(topology.tp), "--ep", str(topology.world),
+                    "--dp", str(topology.dp), "--capacity", str(topology.local_capacity)]
+        module = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd")
+    finally:
+        sys.argv = previous_argv
+    if (module.CAPACITY, module.RANKS) != (topology.local_capacity, topology.world):
+        raise ValueError("lib prefill_fwd was imported for another capacity or EP topology")
+    entry = module.l3_prefill_fwd
+    return compiler.compile("v41_prefill_fwd", entry), tuple(entry.param_names)
+
+
 class PrefillSegment(SwaSegment):
     """Carry device residual/pre_mix through a selected prefill mode and MoE.
 
@@ -2162,7 +2218,8 @@ class PrefillMetadataResources:
     """Keep C2A and C1A page/length contracts separate across one layer chain."""
 
     def __init__(self, topology, *, max_seq_len, max_requests, window_pages,
-                 c2a_pages, c1a_pages, rope_tables, compressed_rope_tables):
+                 c2a_pages, c1a_pages, rope_tables, compressed_rope_tables,
+                 full_hidden_size=None):
         if any(type(value) is not int or value <= 0 for value in
                (max_seq_len, max_requests, window_pages, c2a_pages, c1a_pages)):
             raise ValueError("prefill metadata capacities must be positive integers")
@@ -2177,6 +2234,9 @@ class PrefillMetadataResources:
         self.window_pages = window_pages
         self.compressed_pages = {"c2a": c2a_pages, "c1a": c1a_pages}
         self.fields = {}
+        self.full_hidden_size = full_hidden_size
+        if full_hidden_size is not None and (type(full_hidden_size) is not int or full_hidden_size <= 0):
+            raise ValueError("full prefill hidden size must be positive")
 
         def shared(name, shape, dtype, fill=0):
             value = torch.empty(shape, dtype=dtype).share_memory_()
@@ -2212,6 +2272,24 @@ class PrefillMetadataResources:
                                 (world, max_seq_len, width), torch.float32)
                 target.copy_(value[:max_seq_len].unsqueeze(0).expand_as(target))
             self.tables[prefix] = pair
+        if full_hidden_size is not None:
+            shared("full_embedding", (world, tokens, full_hidden_size), torch.bfloat16)
+            shared("full_embedding_ids", (world, tokens), torch.int64)
+            shared("full_initial_pre", (world, tokens, 4), torch.float32)
+            shared("full_identity_rows", (world, tokens), torch.int32, -1)
+            shared("full_counts", (world, 2), torch.int32)
+            shared("full_replay_rows", (world, tokens), torch.int32, -1)
+            shared("full_position_ids", (world, 2, tokens), torch.int32, -1)
+            shared("full_rope_cos", (world, 3, tokens, width), torch.float32)
+            shared("full_rope_sin", (world, 3, tokens, width), torch.float32)
+            shared("full_window_slots", (world, 2, tokens), torch.int64, -1)
+            shared("full_window_indices", (world, 2, tokens, 128), torch.int32, -1)
+            shared("full_token_requests", (world, 2, tokens), torch.int32, -1)
+            shared("full_compressed_lens", (world, 2, tokens), torch.int32)
+            shared("full_query_starts", (world, 2, max_requests + 1), torch.int32)
+            shared("full_index_block_tables", (
+                world, 2, max_requests, max(c2a_pages, c1a_pages)), torch.int32, -1)
+            shared("full_logit_rows", (world, 16), torch.int32, -1)
 
     @property
     def inherited_host_tensors(self):
@@ -2265,6 +2343,79 @@ class PrefillMetadataResources:
                 self.fields["compressed_rope_cos"].copy_(rows[0])
                 self.fields["compressed_rope_sin"].copy_(rows[1])
         return swa.group_counts
+
+    def stage_full(self, step, embeddings):
+        """Lower one chunk into the two-stage lib prefill ABI using scheduler pages."""
+        if self.full_hidden_size is None:
+            raise ValueError("full prefill staging was not allocated before worker startup")
+        if embeddings.shape[-1] != self.full_hidden_size:
+            raise ValueError("full prefill embedding width disagrees with the checkpoint")
+        counts = self.stage(step)
+        packed = prepare_segment_inputs(embeddings, step, self.topology)
+        f = self.fields
+        f["full_embedding"].zero_()
+        active = packed.row_indices >= 0
+        f["full_embedding"][active] = embeddings[packed.row_indices[active]]
+        f["full_embedding_ids"].copy_(
+            torch.arange(self.topology.capacity, dtype=torch.int64).expand(self.topology.world, -1))
+        f["full_initial_pre"].zero_()
+        f["full_initial_pre"][:, :, 0] = 1
+        f["full_identity_rows"].fill_(-1)
+        f["full_replay_rows"].fill_(-1)
+        f["full_counts"].zero_()
+        for rank, count in enumerate(counts):
+            f["full_counts"][rank] = count
+            f["full_identity_rows"][rank, :count] = torch.arange(count, dtype=torch.int32)
+            f["full_replay_rows"][rank, :count] = torch.arange(count, dtype=torch.int32)
+        for stage, family in enumerate(("c2a", "c1a")):
+            f["full_position_ids"][:, stage].copy_(f[family + "_position_ids"])
+            f["full_window_slots"][:, stage].copy_(f["window_slots"])
+            f["full_window_indices"][:, stage].copy_(f["window_indices"])
+            f["full_token_requests"][:, stage].copy_(f[family + "_request_ids"])
+            f["full_compressed_lens"][:, stage].copy_(f[family + "_compressed_lens"])
+            f["full_query_starts"][:, stage].copy_(f[family + "_query_start_loc"])
+            table = f["full_index_block_tables"][:, stage]
+            table.fill_(-1)
+            source = f[family + "_index_block_table"]
+            table[:, :, :source.shape[-1]].copy_(source)
+        for profile, source in enumerate(("rope", "compressed_rope", "compressed_rope")):
+            f["full_rope_cos"][:, profile].copy_(f[source + "_cos"])
+            f["full_rope_sin"][:, profile].copy_(f[source + "_sin"])
+        f["full_logit_rows"].fill_(-1)
+        per_rank = [0] * self.topology.world
+        rows_per_rank = [0] * self.topology.world
+        for request in step.requests:
+            rank = request.partition
+            slot = per_rank[rank]
+            if slot >= 16:
+                raise ValueError("full prefill supports at most 16 output requests per rank")
+            f["full_logit_rows"][rank, slot] = rows_per_rank[rank] + len(request.token_ids) - 1
+            rows_per_rank[rank] += len(request.token_ids)
+            per_rank[rank] += 1
+        return counts
+
+    def full_arguments(self):
+        if self.full_hidden_size is None:
+            raise ValueError("full prefill staging was not allocated")
+        f = self.fields
+        names = {
+            "embedding": "full_embedding", "embedding_ids": "full_embedding_ids",
+            "initial_pre": "full_initial_pre", "identity_rows": "full_identity_rows",
+            "counts": "full_counts", "replay_rows": "full_replay_rows",
+            "position_ids": "full_position_ids", "rope_cos": "full_rope_cos",
+            "rope_sin": "full_rope_sin", "window_slots": "full_window_slots",
+            "window_indices": "full_window_indices", "token_requests": "full_token_requests",
+            "compressed_lens": "full_compressed_lens", "query_starts": "full_query_starts",
+            "index_block_tables": "full_index_block_tables", "logit_rows": "full_logit_rows",
+            "compressed_cos": "c2a_compressed_rope_cos",
+            "compressed_sin": "c2a_compressed_rope_sin",
+            "publisher_cos": "compressed_rope_cos",
+            "publisher_sin": "compressed_rope_sin",
+            "compressed_slots": "c2a_compressed_slots",
+            "publisher_slots": "c1a_compressed_slots",
+            "state_block_table": "c2a_state_block_table",
+        }
+        return {name: f[source] for name, source in names.items()}
 
     def arguments(self, mode):
         common = {name: self.fields[name] for name in
@@ -2442,6 +2593,113 @@ class FinalOutputRuntime:
         self._resident.clear()
 
 
+class ResidentPrefillBank:
+    """Stream checkpoint weights into the lib's five packed device banks."""
+
+    def __init__(self, worker, manifest):
+        from pypto.runtime import StackedDeviceTensor
+
+        self.worker = worker
+        self.tensors = {}
+        self._owned = []
+        layouts = manifest.tensor_layouts
+        try:
+            for rank in range(manifest.ranks):
+                handles = {}
+                for name, (shape, dtype) in layouts.items():
+                    handle = worker.alloc_tensor(shape, dtype, worker_id=rank)
+                    self._owned.append((rank, handle))
+                    handles[name] = handle
+                    self.tensors.setdefault(name, []).append(handle)
+                manifest.upload(worker, rank, handles)
+            self.tensors = {
+                name: StackedDeviceTensor(tuple(shards),
+                                          (manifest.ranks, *layouts[name][0]),
+                                          range(manifest.ranks))
+                for name, shards in self.tensors.items()
+            }
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        for rank, handle in reversed(self._owned):
+            self.worker.free_tensor(handle, worker_id=rank)
+        self._owned.clear()
+        self.tensors.clear()
+
+
+class PrefillForwardSegment:
+    """Run the lib's complete 40-layer prefill with fresh communication windows."""
+
+    def __init__(self, worker, program, param_names, run_config, topology,
+                 manifest, offsets, metadata, cache, final, lut):
+        self.worker, self.program = worker, program
+        self.param_names = tuple(param_names)
+        self.run_config, self.metadata = run_config, metadata
+        self.failed = False
+        self._owned = []
+        self.bank = None
+        free = min(worker.device_memory_info(rank)[0] for rank in range(topology.world))
+        reserve = 1 << 30
+        if free < manifest.bytes_per_rank + reserve:
+            raise MemoryError(
+                f"V4.1 full prefill needs {manifest.bytes_per_rank / (1 << 30):.2f} GiB "
+                f"per rank plus 1 GiB reserve; only {free / (1 << 30):.2f} GiB is free "
+                "after decode weights and caches")
+        try:
+            self.bank = ResidentPrefillBank(worker, manifest)
+            self.residual = alloc_device_buffer(
+                worker, (topology.world, topology.local_capacity, 4,
+                         final.host.head_weight.shape[-1]), torch.float32, stacked=True)
+            self._owned.append(self.residual)
+            self.pre_mix = alloc_device_buffer(
+                worker, (topology.world, topology.local_capacity, 4),
+                torch.float32, stacked=True)
+            self._owned.append(self.pre_mix)
+            self.arguments = dict(
+                metadata.full_arguments(), **self.bank.tensors, **offsets,
+                **cache.prefill_full_views(),
+                mxfp4_pair_lut=lut,
+                final_norm=final.norm_weight, head=final.head_weight,
+                x_hc_out=self.residual, pre_mix_out=self.pre_mix,
+                logits=final.host.logits, sampled_ids=final.host.sampled_ids,
+            )
+            if len(self.param_names) != len(set(self.param_names)) or set(self.param_names) != set(self.arguments):
+                raise ValueError("lib full prefill ABI differs from the serving binding")
+        except BaseException:
+            self.close()
+            raise
+
+    def run(self):
+        if self.failed:
+            raise RuntimeError("full prefill failed; recreate the worker before reuse")
+        if not getattr(self.worker, "_persistent", False) or not hasattr(
+            self.worker, "_reset_persistent_windows"
+        ):
+            raise RuntimeError("full prefill requires a worker that can reset communication windows")
+        previous_reset = self.worker._reset_persistent_windows
+        self.worker._reset_persistent_windows = True
+        try:
+            self.worker.run(self.program.compiled,
+                            *(self.arguments[name] for name in self.param_names),
+                            config=self.run_config)
+        except BaseException:
+            self.failed = True
+            raise
+        finally:
+            self.worker._reset_persistent_windows = previous_reset
+        return LayerState(self.residual, self.pre_mix, "tp_local_token")
+
+    def close(self):
+        for tensor in reversed(self._owned):
+            self.worker.free_stacked_tensor(tensor)
+        self._owned.clear()
+        if self.bank is not None:
+            self.bank.close()
+            self.bank = None
+
+
 # resident_resources
 class V41ResidentResources:
     """Own resident buffers and their shared host mappings until worker close.
@@ -2454,7 +2712,9 @@ class V41ResidentResources:
     def __init__(self, programs, run_config, *, weight_bank, weight_param_names,
                  cache_plan, state_reset, page_resets, input_host, final_host,
                  prefill_host, final_program, final_param_names, topology,
-                 decode_input_host=None, decode_host=None, worker_factory=make_segment_worker):
+                 decode_input_host=None, decode_host=None, worker_factory=make_segment_worker,
+                 prefill_program=None, prefill_param_names=None, prefill_manifest=None,
+                 prefill_offsets=None):
         weight_bank.finish(weight_param_names)
         if decode_host is not None and (decode_input_host is None or
                 decode_host.topology != decode_input_host.topology):
@@ -2464,6 +2724,7 @@ class V41ResidentResources:
                      + prefill_host.inherited_host_tensors
                      + (() if decode_host is None else decode_host.inherited_host_tensors)
                      + final_host.all_host_tensors
+                     + (() if prefill_offsets is None else tuple(prefill_offsets.values()))
                      + (state_reset, *page_resets.values()))
         if any(not tensor.is_shared() for tensor in inherited):
             raise ValueError("all inherited V4.1 host buffers must be shared before worker creation")
@@ -2484,11 +2745,23 @@ class V41ResidentResources:
         self._inputs = None
         self._group_counts = None
         self._prefill = None
+        self._prefill_fwd = None
         self._decode_fwd = None
+        self._decode_binding = None
+        self._weight_bank = weight_bank
+        self._weight_param_names = tuple(weight_param_names)
+        self._prefill_binding = (prefill_program, prefill_param_names, prefill_manifest,
+                                 prefill_offsets, run_config, topology)
+        self._lut = None
+        self.weights = None
         self.closed = False
         try:
-            self.weights = self._own(ResidentFullDecodeWeights(
-                self.worker, weight_bank, weight_param_names))
+            if prefill_program is None:
+                self.weights = ResidentFullDecodeWeights(
+                    self.worker, weight_bank, weight_param_names)
+            else:
+                self._lut = self.worker.alloc_stacked_tensor(
+                    weight_bank.tensors["mxfp4_pair_lut"])
             self.input = self._own(InputStateRuntime(self.worker, input_host))
             self.decode_input = (None if decode_input_host is None else
                                  self._own(InputStateRuntime(self.worker, decode_input_host)))
@@ -2502,6 +2775,11 @@ class V41ResidentResources:
             else:
                 cache = DecodeFullCachePools(self.worker, cache_plan, state_reset, page_resets)
             self.cache = self._own(cache)
+            if prefill_program is not None:
+                if (prefill_param_names is None or prefill_manifest is None
+                        or prefill_offsets is None or prefill_host.full_hidden_size is None):
+                    raise ValueError("full prefill binding requires its ABI, manifest and metadata")
+                self._activate_prefill()
             if decode_host is not None:
                 plan = cache.plan
                 if decode_host.max_requests < plan.physical_request_slots:
@@ -2520,9 +2798,43 @@ class V41ResidentResources:
         self._owned.append(resource)
         return resource
 
+    def _activate_prefill(self):
+        if self._prefill_fwd is not None:
+            return
+        program, names, manifest, offsets, run_config, topology = self._prefill_binding
+        if program is None:
+            raise RuntimeError("full prefill was not registered")
+        if self.weights is not None:
+            self.weights.close()
+            self.weights = None
+            self._decode_fwd = None
+        self._prefill_fwd = PrefillForwardSegment(
+            self.worker, program, names, run_config, topology,
+            manifest, offsets, self.prefill_host, self.cache, self.final, self._lut)
+
+    def _activate_decode(self):
+        if self._decode_fwd is not None:
+            return
+        if self._decode_binding is None:
+            raise RuntimeError("full decode was not registered")
+        if self._prefill_fwd is not None:
+            self._prefill_fwd.close()
+            self._prefill_fwd = None
+        if self.weights is None:
+            self.weights = ResidentFullDecodeWeights(
+                self.worker, self._weight_bank, self._weight_param_names)
+        program, names, run_config, counts_are_tensor = self._decode_binding
+        self._decode_fwd = DecodeForwardSegment(
+            self.worker, program, names, run_config, self.decode_host.topology,
+            counts_are_tensor, self.weights, self.cache, self.decode_host)
+
     def begin_step(self, embeddings, step):
         if self.closed or self._step is not None:
             raise RuntimeError("V4.1 worker is closed or a step is already active")
+        if step.phase == "prefill" and self._prefill_binding[0] is not None:
+            self._activate_prefill()
+        elif step.phase == "decode":
+            self._activate_decode()
         dispatch_step = step
         if step.phase == "decode":
             dispatch_step, embeddings, padding_partitions = pad_single_decode(
@@ -2530,7 +2842,9 @@ class V41ResidentResources:
             for partition in padding_partitions:
                 self.cache.reset_padding(partition)
         host = self.prefill_host if step.phase == "prefill" else self.decode_host
-        counts = host.stage(dispatch_step) if host is not None else None
+        counts = (host.stage_full(dispatch_step, embeddings)
+                  if step.phase == "prefill" and self._prefill_fwd is not None else
+                  host.stage(dispatch_step) if host is not None else None)
         input_runtime = self.decode_input if step.phase == "decode" else self.input
         if input_runtime is None:
             raise ValueError("decode requires its own TP-local input capacity")
@@ -2565,14 +2879,19 @@ class V41ResidentResources:
             state, self._prefill.plans, self._prefill.attention, self._prefill.moe,
             group_counts=self._group_counts)
 
+    def run_prefill_fwd(self, state, step):
+        if (self.closed or step is not self._step or step.phase != "prefill"
+                or self._prefill_fwd is None):
+            raise ValueError("full prefill requires the active prefill step")
+        return self._prefill_fwd.run()
+
     def bind_decode_fwd(self, program, param_names, run_config, counts_are_tensor):
-        if (self.closed or self._decode_fwd is not None or self._step is not None
+        if (self.closed or self._decode_binding is not None or self._step is not None
                 or self.decode_host is None):
             raise RuntimeError("full decode requires an idle worker and decode metadata")
-        self._decode_fwd = DecodeForwardSegment(
-            self.worker, program, param_names, run_config, self.decode_host.topology,
-            counts_are_tensor,
-            self.weights, self.cache, self.decode_host)
+        self._decode_binding = (program, tuple(param_names), run_config, counts_are_tensor)
+        if self._prefill_binding[0] is None:
+            self._activate_decode()
         return self._decode_fwd
 
     def run_decode_fwd(self, state, step):
@@ -2598,6 +2917,15 @@ class V41ResidentResources:
             return
         self._step = self._inputs = self._group_counts = None
         try:
+            if self._prefill_fwd is not None:
+                self._prefill_fwd.close()
+                self._prefill_fwd = None
+            if self.weights is not None:
+                self.weights.close()
+                self.weights = None
+            if self._lut is not None:
+                self.worker.free_stacked_tensor(self._lut)
+                self._lut = None
             for resource in reversed(self._owned):
                 resource.close()
         finally:
@@ -2704,7 +3032,7 @@ def make_production_bindings(model_dir, max_seq_len):
             ring_heap=2 * 1024 * 1024 * 1024,
         )
         compiler = KernelCompiler(run_config=run_config)
-        attention, moe = compile_prefill_segments(compiler, root, topology, _MODES)
+        prefill, prefill_names = compile_prefill_fwd(compiler, root, topology)
         decode, decode_names, decode_counts_are_tensor = compile_decode_fwd(
             compiler, root, topology)
         final, final_names = compile_final_output(compiler, root, topology)
@@ -2761,12 +3089,26 @@ def make_production_bindings(model_dir, max_seq_len):
             rope_tables=swa_tables,
             compressed_rope_tables=compressed_tables,
         )
-        prefill_host = PrefillMetadataResources(topology, **host_kwargs)
         decode_host = PrefillMetadataResources(topology, **host_kwargs)
         input_host = make_input_host_resources(topology, plan.weights.config.hidden_size)
         decode_input_host = make_input_host_resources(topology, plan.weights.config.hidden_size)
         final_host = load_final_output_host_resources(model_dir, topology)
-        programs = (*attention.values(), moe, decode, final)
+        prefill_utils = importlib.import_module("models.deepseek_v4_1_flash.utils")
+        prefill_manifest = prefill_utils.ResidentPrefillWeights(
+            prefill_utils.PrefillCheckpoint(model_dir), ep_size=topology.world)
+        prefill_sidecar = os.environ.get("PYPTO_V41_PREFILL_BANK_DIR")
+        if prefill_sidecar:
+            prefill_source = PrepackedPrefillBank(
+                prefill_sidecar, model_dir, layout, revision, prefill_manifest)
+        else:
+            prefill_source = prefill_manifest
+        prefill_offsets = {
+            name: value.unsqueeze(0).expand(topology.world, *value.shape).contiguous().share_memory_()
+            for name, value in prefill_manifest.offset_tensors.items()
+        }
+        prefill_host = PrefillMetadataResources(
+            topology, **host_kwargs, full_hidden_size=plan.weights.config.hidden_size)
+        programs = (prefill, decode, final)
         resident_started = time.perf_counter()
         resident = V41ResidentResources(
             programs, run_config, weight_bank=bank, weight_param_names=decode_names,
@@ -2774,22 +3116,14 @@ def make_production_bindings(model_dir, max_seq_len):
             input_host=input_host, decode_input_host=decode_input_host,
             prefill_host=prefill_host, decode_host=decode_host,
             final_host=final_host, final_program=final, final_param_names=final_names,
-            topology=topology,
+            topology=topology, prefill_program=prefill, prefill_param_names=prefill_names,
+            prefill_manifest=prefill_source, prefill_offsets=prefill_offsets,
         )
         _LOG.info("V4.1 resident upload and allocation %.2fs",
                   time.perf_counter() - resident_started)
         try:
-            resident.bind_prefill(
-                layers, kv_sources=kv_sources, index_sources=index_sources,
-                c2a_sources=c2a_sources, max_seq_len=max_seq_len,
-            )
             resident.bind_decode_fwd(
                 decode, decode_names, run_config, decode_counts_are_tensor)
-            resident.prefill_segment = PrefillSegment(
-                resident.worker, attention, moe, topology,
-                prefill_host.fields["attention_counts"], prefill_host.fields["moe_counts"],
-                run_config,
-            )
         except BaseException:
             resident.close()
             raise
@@ -2809,8 +3143,8 @@ def make_production_bindings(model_dir, max_seq_len):
         segment_topology=topology,
         input_layout="tp_local_token",
         output_layout="tp_local_token",
-        prefill_backbone=lambda state, step, resources, plans: resources.run_prefill(
-            resources.prefill_segment, state, step),
+        prefill_backbone=lambda state, step, resources, plans: resources.run_prefill_fwd(
+            state, step),
         decode_backbone=lambda state, step, resources, plans: resources.run_decode_fwd(
             state, step),
     )
