@@ -40,7 +40,7 @@ def test_selected_lib_full_decode_abi_is_fully_bound():
                  if isinstance(node, ast.FunctionDef) and node.name == "l3_decode_fwd")
     parameters = {argument.arg for argument in entry.args.args}
     metadata = set(DecodeForwardSegment._METADATA) | {
-        "window_slots", "window_indices", "c2a_compressed_lens", "c1a_compressed_lens",
+        "window_slots", "window_indices",
         "c2a_compressed_slots", "c1a_compressed_slots", "moe_num_tokens",
     }
     caches = {
@@ -49,7 +49,8 @@ def test_selected_lib_full_decode_abi_is_fully_bound():
         "state_cache_pool",
     }
     assert parameters == _ALL | metadata | caches | {
-        "x_hc", "pre_mix", "attention_num_tokens"}
+        "x_hc", "pre_mix", "attention_num_tokens", "final_norm_weight",
+        "lm_head_weight", "logit_row_indices", "logits", "sampled_ids"}
 
 
 def test_weight_views_alias_one_full_rank_allocation():
@@ -150,13 +151,26 @@ def test_full_prefill_import_uses_serving_capacity_and_complete_abi():
             return SimpleNamespace(compiled=entry)
 
     _, names = compile_prefill_fwd(Compiler(), root, SegmentTopology.for_decode())
-    assert len(names) == 48
-    assert {"embedding", "bank8", "bank4", "counts", "window_cache",
-            "compressed_cache", "index_cache", "state_cache", "logits",
-            "sampled_ids"} <= set(names)
+    inputs = {
+        "embedding", "embedding_ids", "initial_pre", "identity_rows", "counts",
+        "replay_rows", "position_ids", "freqs_cos", "freqs_sin", "window_slots",
+        "window_indices", "c2a_compressed_slots", "c1a_compressed_slots",
+        "token_to_req_indices", "query_start_loc", "c2a_index_block_table",
+        "c1a_index_block_table", "state_block_table", "logit_rows",
+    }
+    caches = {
+        "window_cache", "window_scales", "compressed_cache", "compressed_scales",
+        "index_cache", "index_scales", "state_cache",
+    }
+    outputs = {
+        "final_norm_weight", "lm_head_weight", "x_hc_out", "pre_mix_out",
+        "logits", "sampled_ids",
+    }
+    assert set(names) == _ALL | inputs | caches | outputs
+    assert not {"bank8", "bank4", "scales8", "offsets"} & set(names)
 
 
-def test_full_forward_weight_banks_swap_between_prefill_and_decode(monkeypatch):
+def test_full_forward_reuses_one_weight_bank_between_prefill_and_decode(monkeypatch):
     events = []
 
     class Prefill:
@@ -188,13 +202,13 @@ def test_full_forward_weight_banks_swap_between_prefill_and_decode(monkeypatch):
     )
     resources._weight_bank = object()
     resources._weight_param_names = ()
-    resources._prefill_binding = (object(), (), object(), {}, object(), object())
+    resources._prefill_binding = (object(), (), object(), object())
     resources._decode_binding = (object(), (), object(), True)
-    resources._lut = object()
+    resources.weights = Weights()
     resources.prefill_host = object()
     resources.decode_host = SimpleNamespace(topology=object())
     resources.cache = resources.final = object()
-    resources.weights = resources._prefill_fwd = resources._decode_fwd = None
+    resources._prefill_fwd = resources._decode_fwd = None
     resources._owned = []
     resources._step = resources._inputs = resources._group_counts = None
     resources.closed = False
@@ -206,9 +220,8 @@ def test_full_forward_weight_banks_swap_between_prefill_and_decode(monkeypatch):
     resources._activate_prefill()
     resources.close()
 
-    assert events == ["prefill_open", "prefill_close", "decode_open", "decode_bind",
-                      "decode_close", "prefill_open", "prefill_close", "lut_close",
-                      "worker_close"]
+    assert events == ["decode_open", "prefill_open", "decode_bind",
+                      "prefill_close", "decode_close", "worker_close"]
 
 
 def test_prefill_bank_sidecar_replays_exact_bytes_and_rejects_stale_source(tmp_path):
@@ -259,7 +272,7 @@ def test_prefill_bank_sidecar_replays_exact_bytes_and_rejects_stale_source(tmp_p
 def test_full_decode_binds_distinct_c2a_and_c1a_metadata():
     fields = {source: object() for source in DecodeForwardSegment._METADATA.values()}
     for name in (
-        "window_slots", "window_indices", "c2a_compressed_lens", "c1a_compressed_lens",
+        "window_slots", "window_indices",
         "c2a_compressed_slots", "c1a_compressed_slots", "moe_counts",
     ):
         fields[name] = object()
@@ -272,20 +285,23 @@ def test_full_decode_binds_distinct_c2a_and_c1a_metadata():
     names = (
         "x_hc", "pre_mix", "attention_num_tokens", "hc_attn_fn", "window_cache_pool",
         "moe_num_tokens", *DecodeForwardSegment._METADATA,
-        "window_slots", "window_indices", "c2a_compressed_lens", "c1a_compressed_lens",
+        "window_slots", "window_indices",
         "c2a_compressed_slots", "c1a_compressed_slots",
+        "final_norm_weight", "lm_head_weight", "logit_row_indices", "logits", "sampled_ids",
     )
+    final = SimpleNamespace(norm_weight=object(), head_weight=object(), host=SimpleNamespace(
+        logit_row_indices=object(), logits=object(), sampled_ids=object()))
     calls = []
     worker = SimpleNamespace(_persistent=True, _reset_persistent_windows=False,
                              run=lambda *args, **kwargs: calls.append(args))
     program = SimpleNamespace(compiled=object())
     segment = DecodeForwardSegment(worker, program, names, object(),
                                    SegmentTopology.for_decode(tp=1, dp=8),
-                                   False, weights, cache, metadata)
+                                   False, weights, cache, metadata, final)
     state = LayerState(object(), object(), "tp_local_token")
     assert segment.run(state, group_counts=(1,) * 8) is state
     bound = dict(zip(names, calls[0][1:]))
-    assert bound["c2a_compressed_lens"] is not bound["c1a_compressed_lens"]
+    assert bound["c2a_compressed_slots"] is not bound["c1a_compressed_slots"]
     assert bound["c2a_index_block_table"] is not bound["c1a_index_block_table"]
     assert bound["x_hc"] is state.residual
     assert bound["pre_mix"] is state.pre_mix
@@ -295,7 +311,7 @@ def test_full_decode_binds_distinct_c2a_and_c1a_metadata():
     calls.clear()
     tensor_segment = DecodeForwardSegment(
         worker, program, names, object(), SegmentTopology.for_decode(tp=1, dp=8),
-        True, weights, cache, metadata)
+        True, weights, cache, metadata, final)
     assert tensor_segment.run(state, group_counts=(1,) * 8) is state
     tensor_bound = dict(zip(names, calls[0][1:]))
     assert tensor_bound["attention_num_tokens"] is fields["moe_counts"]

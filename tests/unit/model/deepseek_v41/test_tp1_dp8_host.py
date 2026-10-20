@@ -136,11 +136,13 @@ def test_full_prefill_metadata_preserves_two_stage_history_and_page_families():
     assert args["embedding"][7, 0].equal(embeddings[2])
     assert args["position_ids"][7, :, 0].tolist() == [1, 1]
     assert args["replay_rows"][7, :2].tolist() == [0, -1]
-    assert args["compressed_lens"][7, :, 0].tolist() == [1, 2]
+    assert args["freqs_cos"].shape == (8, 2, 256, 32)
+    assert args["freqs_sin"].shape == (8, 2, 256, 32)
+    assert args["token_to_req_indices"][7, :, 0].tolist() == [0, 0]
     assert args["logit_rows"][0, 0] == 1
     assert args["logit_rows"][7, 0] == 0
-    assert args["index_block_tables"][0, 0, 0, 0] == 0
-    assert args["index_block_tables"][7, 1, 0, 0] == 0
+    assert args["c2a_index_block_table"][0, 0, 0] == 0
+    assert args["c1a_index_block_table"][7, 0, 0] == 0
 
 
 def test_decode_cache_plan_uses_the_lib_tp1_ep8_constants():

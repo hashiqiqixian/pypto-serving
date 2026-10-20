@@ -42,11 +42,11 @@ def _exercise(names):
     return output, state, arguments, calls
 
 
-def test_current_lib_final_output_resets_windows_every_call():
+def test_current_lib_final_output_reuses_persistent_windows():
     output, state, arguments, calls = _exercise(CURRENT_NAMES)
     assert output.fresh_windows
     assert output.epoch == 0
-    assert [reset for _, reset in calls] == [True, True]
+    assert [reset for _, reset in calls] == [False, False]
     for bound, _ in calls:
         assert bound["x_hc"] is state.residual
         assert bound["pre_mix"] is state.pre_mix
