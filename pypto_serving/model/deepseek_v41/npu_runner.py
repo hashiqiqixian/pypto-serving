@@ -10,14 +10,22 @@
 
 from __future__ import annotations
 
+import ast
 import ctypes
 import importlib
+import inspect
+import json
+import logging
 import math
+import os
+import subprocess
 import sys
+import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
+from types import MappingProxyType
 from typing import Callable
 
 import torch
@@ -25,8 +33,435 @@ import torch
 from pypto_serving.config.types import DecodeResult, KVCacheGroupSpec, PrefillResult
 from pypto_serving.model.common.runner.buffer_set import alloc_device_buffer
 
-from .task_args import ForwardStep, RequestLedger, validate_cache_groups
-from .weight_loader import LayerPlan, RankPlacement, V41ExecutionPlan, V41WeightLoader
+from .task_args import (
+    ForwardStep,
+    RequestLedger,
+    RequestSlice,
+    V41CacheGroups,
+    build_cache_groups,
+    validate_cache_groups,
+)
+from .weight_loader import (
+    DecodeWeightBank,
+    DecodeWeightLayout,
+    LayerPlan,
+    RankPlacement,
+    ResidentDecodeWeights,
+    ResidentFullDecodeWeights,
+    V41ExecutionPlan,
+    V41WeightLoader,
+    iter_decode_weight_slices,
+    load_prepacked_bank,
+    plan_layers,
+)
+
+
+# cache_resources
+@dataclass(frozen=True)
+class CacheBufferSpec:
+    name: str
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+
+
+@dataclass(frozen=True)
+class DecodeCachePlan:
+    primary_num_blocks: int
+    family_groups: V41CacheGroups
+    group_blocks: dict[str, int]
+    physical_group_blocks: dict[str, int]
+    group_sources: dict[str, dict[str, tuple[int, ...]]]
+    buffers: tuple[CacheBufferSpec, ...]
+    request_slots: int
+    physical_request_slots: int
+
+
+def cache_bytes_per_rank(plan: DecodeCachePlan) -> int:
+    """Count the physical pool, including pages hidden from the scheduler."""
+    return sum(torch.Size(spec.shape[1:]).numel() * torch.empty((), dtype=spec.dtype).element_size()
+               for spec in plan.buffers)
+
+
+def make_post_resident_cache_planner(layers, groups, *, max_seq_len, abi,
+                                     utilization, max_request_slots,
+                                     reserved_bytes_per_rank, requested_pages=None):
+    """Build a V4-style post-resident cache planner for one persistent worker.
+
+    The caller must charge every layer scratch allocation that follows cache
+    allocation in ``reserved_bytes_per_rank``. Group capacities remain unset
+    until the worker reports HBM; the scheduler sees only non-padding pages.
+    """
+    if (not isinstance(utilization, (float, int)) or not 0 < utilization <= 1
+            or type(max_request_slots) is not int or max_request_slots <= 0
+            or type(reserved_bytes_per_rank) is not int or reserved_bytes_per_rank <= 0
+            or requested_pages is not None and (type(requested_pages) is not int or requested_pages <= 0)):
+        raise ValueError("invalid post-resident cache budget")
+    if any(group.num_blocks is not None for group in groups):
+        raise ValueError("dynamic cache groups must not fix scheduler block counts")
+    window_pages = groups[0].max_blocks_per_seq
+
+    def plan_for_slots(slots):
+        return plan_decode_cache_pools(
+            layers, groups, max_seq_len=max_seq_len,
+            primary_num_blocks=slots * window_pages,
+            request_slots=slots, abi=abi)
+
+    one, two = plan_for_slots(1), plan_for_slots(2)
+    one_bytes, two_bytes = cache_bytes_per_rank(one), cache_bytes_per_rank(two)
+    slot_bytes = two_bytes - one_bytes
+    fixed_bytes = one_bytes - slot_bytes
+    if slot_bytes <= 0 or fixed_bytes <= 0:
+        raise ValueError("cache shape does not scale linearly with request slots")
+
+    def choose(worker):
+        budgets = []
+        for rank in range(one.buffers[0].shape[0]):
+            free_bytes, total_bytes = worker.device_memory_info(rank)
+            if not 0 <= free_bytes <= total_bytes:
+                raise ValueError("device memory report is inconsistent")
+            used_bytes = total_bytes - free_bytes
+            budgets.append(int(total_bytes * utilization) - used_bytes - reserved_bytes_per_rank)
+        available = min(budgets)
+        if available < fixed_bytes + slot_bytes:
+            raise MemoryError("post-resident HBM cannot hold one V4.1 cache request slot")
+        slots = min(max_request_slots, (available - fixed_bytes) // slot_bytes)
+        if requested_pages is not None:
+            slots = min(slots, requested_pages // window_pages)
+        if slots < 1:
+            raise MemoryError("configured cache pages cannot hold one V4.1 request slot")
+        return slots, plan_for_slots
+
+    return choose
+
+
+def allocate_cache_with_retry(worker, requested_slots, plan_for_slots, state_reset, page_resets):
+    """Release every cache family before retrying a smaller shared slot count."""
+    if type(requested_slots) is not int or requested_slots <= 0:
+        raise ValueError("requested cache slots must be positive")
+    slots = requested_slots
+    while True:
+        try:
+            return DecodeCachePools(worker, plan_for_slots(slots), state_reset, page_resets)
+        except (MemoryError, RuntimeError) as exc:
+            if slots == 1:
+                raise RuntimeError("V4.1 cache allocation failed at the one-slot minimum") from exc
+            slots = max(slots // 2, 1)
+
+
+def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
+                            request_slots, abi) -> DecodeCachePlan:
+    """Match scheduler page capacities to decode_fwd's source-sliced pools.
+
+    ``abi`` is the imported decode_fwd module from the selected lib revision.
+    A single primary block count is returned to the grouped scheduler, which
+    scales each group by its own max_blocks_per_seq. All shapes include the EP
+    rank axis; each rank has a private copy of its DP partition's page IDs.
+    """
+    resolved = validate_cache_groups(tuple(layers), tuple(groups), max_seq_len,
+                                     dp_size=abi.EP_SIZE // abi.TP_SIZE)
+    by_name = {group.name: group for group in groups}
+    window = by_name[resolved.window]
+    if groups[0].name != resolved.window:
+        raise ValueError("window must be the primary scheduler cache group")
+    if (type(primary_num_blocks) is not int or primary_num_blocks <= 0
+            or primary_num_blocks % window.max_blocks_per_seq):
+        raise ValueError("primary cache blocks must contain whole request slots")
+    if type(request_slots) is not int or request_slots <= 0:
+        raise ValueError("request slot capacity must be positive")
+    slots = primary_num_blocks // window.max_blocks_per_seq
+    group_blocks = {}
+    for group in groups:
+        blocks = slots * group.max_blocks_per_seq
+        if group.num_blocks is not None and group.num_blocks != blocks:
+            raise ValueError(f"{group.name} cache capacity conflicts with the scheduler")
+        group_blocks[group.name] = blocks
+    physical_group_blocks = {name: blocks + 1 for name, blocks in group_blocks.items()}
+
+    kv_sources = sum(layer.kv_source == layer.layer_id for layer in layers)
+    c2a_sources = sum(layer.mode == "c2a_full" for layer in layers)
+    index_sources = sum(layer.index_source == layer.layer_id for layer in layers)
+    if (abi.N_LAYERS, abi.KV_SOURCE_COUNT, abi.C2A_SOURCE_COUNT,
+            abi.INDEX_SOURCE_COUNT, abi.BLOCK_SIZE) != (
+                len(layers), kv_sources, c2a_sources, index_sources, 128):
+        raise ValueError("decode cache source axes disagree with the layer schedule")
+    kv_layers = tuple(layer for layer in layers if layer.kv_source == layer.layer_id)
+    index_layers = tuple(layer for layer in layers if layer.index_source == layer.layer_id)
+    group_sources = {
+        resolved.window: {"window": tuple(range(len(layers)))},
+        resolved.c2a: {
+            "compressed": tuple(i for i, layer in enumerate(kv_layers) if layer.mode.startswith("c2a_")),
+            "index": tuple(i for i, layer in enumerate(index_layers) if layer.mode.startswith("c2a_")),
+        },
+        resolved.c1a: {
+            "compressed": tuple(i for i, layer in enumerate(kv_layers) if layer.mode.startswith("c1a_")),
+            "index": tuple(i for i, layer in enumerate(index_layers) if layer.mode.startswith("c1a_")),
+        },
+    }
+    head, index, world = abi.HEAD_DIM, abi.INDEX_DIM, abi.EP_SIZE
+    if (world != 8 or any(type(value) is not int or value <= 0 for value in
+                       (head, index, abi.STATE_CAPACITY, abi.STATE_WIDTH))
+            or head % abi.WINDOW_CACHE_GROUP or head % abi.COMPRESSED_CACHE_GROUP
+            or index % abi.INDEX_CACHE_GROUP):
+        raise ValueError("decode cache dimensions disagree with the V4.1 EP topology")
+    block = abi.BLOCK_SIZE
+    window_pages = physical_group_blocks[resolved.window]
+    # One lib source axis covers both compression families, so its stride must
+    # fit the larger physical page namespace without remapping scheduler IDs.
+    compressed_pages = max(physical_group_blocks[resolved.c2a],
+                           physical_group_blocks[resolved.c1a])
+    buffers = (
+        CacheBufferSpec("window_cache_pool", (world, len(layers) * window_pages, block, 1, head),
+                        torch.float8_e4m3fn),
+        CacheBufferSpec("window_cache_scale_pool", (
+            world, len(layers) * window_pages, block, 1, head // abi.WINDOW_CACHE_GROUP),
+                        torch.bfloat16),
+        CacheBufferSpec("compressed_cache_pool", (
+            world, kv_sources * compressed_pages, block, 1, head // 2), torch.uint8),
+        CacheBufferSpec("compressed_cache_scale_pool", (
+            world, kv_sources * compressed_pages, block, 1, head // abi.COMPRESSED_CACHE_GROUP),
+                        torch.bfloat16),
+        CacheBufferSpec("index_cache_pool", (
+            world, index_sources * compressed_pages, block, 1, index // 2), torch.uint8),
+        CacheBufferSpec("index_cache_scale_pool", (
+            world, index_sources * compressed_pages, block, 1, index // abi.INDEX_CACHE_GROUP),
+                        torch.float8_e8m0fnu),
+        CacheBufferSpec("state_cache_pool", (
+            world, c2a_sources * (request_slots + 1), abi.STATE_CAPACITY, abi.STATE_WIDTH), torch.float32),
+    )
+    return DecodeCachePlan(primary_num_blocks, resolved, group_blocks, physical_group_blocks,
+                           group_sources, buffers, request_slots, request_slots + 1)
+
+
+def make_state_reset_buffer(plan: DecodeCachePlan) -> torch.Tensor:
+    """Create the worker-inherited zero row used when a request slot is freed."""
+    shape = next(spec.shape for spec in plan.buffers if spec.name == "state_cache_pool")
+    return torch.zeros((shape[0], *shape[2:]), dtype=torch.float32).share_memory_()
+
+
+def make_cache_page_reset_buffers(plan: DecodeCachePlan) -> dict[str, torch.Tensor]:
+    """Allocate one pre-fork zero page per cache payload/scale field."""
+    result = {}
+    for spec in plan.buffers:
+        if spec.name == "state_cache_pool":
+            continue
+        page = torch.empty((spec.shape[0], *spec.shape[2:]), dtype=spec.dtype).share_memory_()
+        page.view(torch.uint8).zero_()
+        if spec.name in ("window_cache_scale_pool", "compressed_cache_scale_pool"):
+            page.fill_(1)
+        elif spec.name == "index_cache_scale_pool":
+            page.view(torch.uint8).fill_(127)
+        result[spec.name] = page
+    return result
+
+
+class DecodeCachePools:
+    """Own cache handles; the caller must wait for all launches before close."""
+
+    def __init__(self, worker, plan: DecodeCachePlan, state_reset: torch.Tensor,
+                 page_resets: dict[str, torch.Tensor] | None = None):
+        state_spec = next(spec for spec in plan.buffers if spec.name == "state_cache_pool")
+        if (not isinstance(state_reset, torch.Tensor) or state_reset.device.type != "cpu"
+                or state_reset.dtype != torch.float32 or not state_reset.is_shared()
+                or not state_reset.is_contiguous()
+                or tuple(state_reset.shape) != (state_spec.shape[0], *state_spec.shape[2:])
+                or not bool((state_reset == 0).all())):
+            raise ValueError("state reset rows must be shared zero FP32 buffers created before worker startup")
+        self.worker = worker
+        self.plan = plan
+        self.state_reset = state_reset
+        self.page_resets = page_resets
+        if page_resets is not None:
+            expected = {spec.name for spec in plan.buffers if spec.name != "state_cache_pool"}
+            if set(page_resets) != expected:
+                raise ValueError("cache page reset buffers must cover every cache field")
+            for spec in plan.buffers:
+                if spec.name == "state_cache_pool":
+                    continue
+                value = page_resets[spec.name]
+                if (not isinstance(value, torch.Tensor) or not value.is_shared()
+                        or not value.is_contiguous() or value.dtype != spec.dtype
+                        or tuple(value.shape) != (spec.shape[0], *spec.shape[2:])):
+                    raise ValueError(f"invalid pre-fork reset page for {spec.name}")
+        self.tensors = {}
+        self.source_counts = {}
+        try:
+            for spec in plan.buffers:
+                if spec.name.startswith("window_cache_"):
+                    group = plan.family_groups.window
+                    stride = plan.physical_group_blocks[group]
+                    sources = len(plan.group_sources[group]["window"])
+                elif spec.name.startswith(("compressed_cache_", "index_cache_")):
+                    family = "compressed" if spec.name.startswith("compressed_") else "index"
+                    stride = max(plan.physical_group_blocks[group] for group, families in
+                                 plan.group_sources.items() if family in families)
+                    ids = {slot for families in plan.group_sources.values()
+                           for slot in families.get(family, ())}
+                    sources = len(ids)
+                    if ids != set(range(sources)):
+                        raise ValueError(f"{family} cache source IDs must be contiguous")
+                else:
+                    stride = plan.physical_request_slots
+                    sources = spec.shape[1] // stride
+                if spec.shape[1] != sources * stride:
+                    raise ValueError("cache source axis disagrees with the resident pool")
+                self.source_counts[spec.name] = sources
+                for source in range(sources):
+                    self.tensors[spec.name, source] = alloc_device_buffer(
+                        worker, (spec.shape[0], stride, *spec.shape[2:]), spec.dtype,
+                        stacked=True)
+        except BaseException:
+            self.close()
+            raise
+
+    def view(self, name: str, source: int):
+        """Borrow one layer/producer pool with the same page IDs as decode."""
+        if name not in self.source_counts:
+            raise ValueError(f"unknown V4.1 cache pool: {name}")
+        if type(source) is not int or not 0 <= source < self.source_counts[name]:
+            raise ValueError("cache source is outside the resident pool")
+        return self.tensors[name, source]
+
+    def prefill_views(self, layer, *, kv_sources, index_sources, c2a_sources):
+        """Resolve a layer's physical producer pools for its lib prefill entry."""
+        result = {
+            "window_cache": self.view("window_cache_pool", layer.layer_id),
+            "window_cache_scale": self.view("window_cache_scale_pool", layer.layer_id),
+        }
+        if layer.mode == "swa":
+            return result
+        kv_slot = kv_sources.index(layer.kv_source)
+        index_slot = index_sources.index(layer.index_source)
+        for name in ("compressed_cache", "compressed_cache_scale", "index_cache", "index_cache_scale"):
+            slot = kv_slot if name.startswith("compressed_") else index_slot
+            result[name] = self.view(name + "_pool", slot)
+        if layer.mode == "c2a_full":
+            result["state_cache"] = self.view("state_cache_pool", c2a_sources.index(layer.layer_id))
+        return result
+
+    def reset_state_slot(self, partition: int, slot: int):
+        """Clear the three C2A pending-pair rows for one DP request slot."""
+        world = self.plan.buffers[0].shape[0]
+        if type(partition) is not int or not 0 <= partition < world:
+            raise ValueError("invalid DP partition")
+        if type(slot) is not int or not 0 <= slot < self.plan.physical_request_slots:
+            raise ValueError("invalid compressor state slot")
+        row = self.state_reset[0]
+        row_bytes = row.numel() * row.element_size()
+        source = self.state_reset[partition]
+        for index in range(self.source_counts["state_cache_pool"]):
+            state = self.view("state_cache_pool", index)
+            self.worker.copy_to(
+                state.shards[partition].data_ptr, source.data_ptr(), row_bytes,
+                dst_offset=state.shards[partition].byte_offset + slot * row_bytes,
+                worker_id=partition,
+            )
+
+    def reset_request(self, owner, *, padding=False):
+        """Clear only this request's physical pages and C2A pending state."""
+        if self.page_resets is None:
+            raise ValueError("request reset requires pre-fork cache page buffers")
+        partition = owner.partition
+        if type(partition) is not int or not 0 <= partition < self.plan.buffers[0].shape[0]:
+            raise ValueError("invalid DP partition")
+        if set(owner.pages) != set(self.plan.group_sources):
+            raise ValueError("request page families disagree with the cache plan")
+        if (type(owner.slot) is not int or
+                (padding and owner.slot != self.plan.request_slots) or
+                (not padding and not 0 <= owner.slot < self.plan.request_slots)):
+            raise ValueError("request state slot is outside its cache family")
+        fields = {
+            "window": ("window_cache_pool", "window_cache_scale_pool"),
+            "compressed": ("compressed_cache_pool", "compressed_cache_scale_pool"),
+            "index": ("index_cache_pool", "index_cache_scale_pool"),
+        }
+        specs = {spec.name: spec for spec in self.plan.buffers}
+        for group, pages in owner.pages.items():
+            limit = self.plan.physical_group_blocks[group] if padding else self.plan.group_blocks[group]
+            if any(type(page) is not int or not 0 <= page < limit
+                   for page in pages):
+                raise ValueError("request page is outside its cache family")
+            if padding and tuple(pages) != (self.plan.group_blocks[group],):
+                raise ValueError("padding must use the dedicated cache page")
+            for family, sources in self.plan.group_sources[group].items():
+                for name in fields[family]:
+                    spec = specs[name]
+                    zero = self.page_resets[name]
+                    page_bytes = zero[0].numel() * zero.element_size()
+                    for source in sources:
+                        target = self.view(name, source)
+                        for page in pages:
+                            self.worker.copy_to(
+                                target.shards[partition].data_ptr, zero[partition].data_ptr(), page_bytes,
+                                dst_offset=target.shards[partition].byte_offset + page * page_bytes,
+                                worker_id=partition,
+                            )
+        self.reset_state_slot(partition, owner.slot)
+
+    def reset_padding(self, partition):
+        from types import SimpleNamespace
+
+        owner = SimpleNamespace(
+            partition=partition, slot=self.plan.request_slots,
+            pages={name: (blocks,) for name, blocks in self.plan.group_blocks.items()},
+        )
+        self.reset_request(owner, padding=True)
+
+    def close(self):
+        for tensor in reversed(tuple(self.tensors.values())):
+            self.worker.free_stacked_tensor(tensor)
+        self.tensors.clear()
+
+
+class DecodeFullCachePools(DecodeCachePools):
+    """One packed pool per field, with source views shared by prefill."""
+
+    def __init__(self, worker, plan, state_reset, page_resets):
+        from pypto.runtime import StackedDeviceTensor
+
+        self.worker, self.plan = worker, plan
+        self.state_reset, self.page_resets = state_reset, page_resets
+        self.tensors, self.source_counts, self._full = {}, {}, {}
+        try:
+            for spec in plan.buffers:
+                if spec.name.startswith("window_cache_"):
+                    group = plan.family_groups.window
+                    stride = plan.physical_group_blocks[group]
+                    sources = len(plan.group_sources[group]["window"])
+                elif spec.name.startswith(("compressed_cache_", "index_cache_")):
+                    family = "compressed" if spec.name.startswith("compressed_") else "index"
+                    stride = max(plan.physical_group_blocks[group] for group, families in
+                                 plan.group_sources.items() if family in families)
+                    sources = len({slot for families in plan.group_sources.values()
+                                   for slot in families.get(family, ())})
+                else:
+                    stride = plan.physical_request_slots
+                    sources = spec.shape[1] // stride
+                if spec.shape[1] != sources * stride:
+                    raise ValueError(f"{spec.name} packed cache source axis is invalid")
+                self.source_counts[spec.name] = sources
+                base = alloc_device_buffer(worker, spec.shape, spec.dtype, stacked=True)
+                self._full[spec.name] = base
+                slice_shape = (stride, *spec.shape[2:])
+                slot_bytes = math.prod(slice_shape) * torch.empty((), dtype=spec.dtype).element_size()
+                for source in range(sources):
+                    shards = tuple(worker.view_tensor(shard, slice_shape,
+                                                      byte_offset=source * slot_bytes,
+                                                      worker_id=rank)
+                                   for rank, shard in enumerate(base.shards))
+                    self.tensors[spec.name, source] = StackedDeviceTensor(
+                        shards, (spec.shape[0], *slice_shape), base.worker_ids)
+        except BaseException:
+            self.close()
+            raise
+
+    def full(self, name):
+        return self._full[name]
+
+    def close(self):
+        for tensor in reversed(tuple(self._full.values())):
+            self.worker.free_stacked_tensor(tensor)
+        self._full.clear()
+        self.tensors.clear()
 
 
 # composite
@@ -78,6 +513,7 @@ class CompositeBindings:
     wait: Callable
     close: Callable
     cache_groups: tuple = ()
+    segment_topology: SegmentTopology | None = None
     input_layout: str = "tp_replicated"
     output_layout: str = "tp_replicated"
     decode_backbone: Callable | None = None
@@ -98,8 +534,8 @@ class CompositeBindings:
                 raise MissingCompositeInterface(f"missing composite resource/output operation: {name}")
         if self.input_layout not in ("tp_replicated", "tp_local_token") or self.output_layout != self.input_layout:
             raise MissingCompositeInterface("layer entries must preserve their declared residual/pre_mix layout")
-        if (placement.tp_size, placement.dp_size, placement.ep_size) != (4, 2, 8):
-            raise ValueError("V4.1 serving currently targets TP4/DP2/EP8")
+        if (placement.tp_size, placement.dp_size, placement.ep_size) != (1, 8, 8):
+            raise ValueError("V4.1 serving currently targets TP1/DP8/EP8")
 
 
 def load_composite_bindings(model_dir=None, max_seq_len=None) -> CompositeBindings:
@@ -107,6 +543,44 @@ def load_composite_bindings(model_dir=None, max_seq_len=None) -> CompositeBindin
     if model_dir is None or max_seq_len is None:
         raise ValueError("V4.1 composite bindings require a model directory and context length")
     return make_production_bindings(model_dir, max_seq_len)
+
+
+# decode_padding
+def pad_single_decode(step: ForwardStep, embeddings: torch.Tensor, cache_plan):
+    """Fill idle DP ranks for the collective; the ledger retains the original step."""
+    if not isinstance(step, ForwardStep) or step.phase != "decode":
+        raise ValueError("decode padding requires a decode ForwardStep")
+    if (not isinstance(embeddings, torch.Tensor) or embeddings.device.type != "cpu"
+            or embeddings.dtype != torch.bfloat16 or embeddings.ndim != 2
+            or embeddings.shape[0] != len(step.token_ids)):
+        raise ValueError("decode padding requires one packed BF16 embedding per token")
+    dp_size = cache_plan.buffers[0].shape[0]
+    counts = tuple(sum(len(request.token_ids) for request in step.requests
+                       if request.partition == partition) for partition in range(dp_size))
+    idle_partitions = tuple(partition for partition, count in enumerate(counts) if count == 0)
+    if not idle_partitions:
+        return step, embeddings, ()
+    if (len(cache_plan.group_blocks) != 3 or
+            set(cache_plan.group_blocks) != set(cache_plan.group_sources) or
+            any(cache_plan.physical_group_blocks.get(group, 0) <= blocks
+                for group, blocks in cache_plan.group_blocks.items()) or
+            cache_plan.physical_request_slots <= cache_plan.request_slots):
+        raise ValueError("decode filler requires all three reserved cache families")
+    fillers = []
+    existing_ids = {request.request_id for request in step.requests}
+    for partition in idle_partitions:
+        name = f"__v41_decode_padding_{partition}__"
+        while name in existing_ids:
+            name += "_"
+        existing_ids.add(name)
+        fillers.append(RequestSlice(
+            request_id=name, partition=partition, state_slot=cache_plan.request_slots,
+            start=0, token_ids=(step.requests[0].token_ids[0],), prompt_length=1,
+            pages=MappingProxyType({group: (blocks,) for group, blocks in cache_plan.group_blocks.items()}),
+        ))
+    padded = ForwardStep(step.phase, (*step.requests, *fillers), step.epoch)
+    filler_embeddings = embeddings[:1].expand(len(fillers), -1)
+    return padded, torch.cat((embeddings, filler_embeddings), dim=0), idle_partitions
 
 
 # input_preparation
@@ -188,16 +662,16 @@ def lookup_token_embeddings(
 
 
 # metadata
-_MAX_REQUESTS_PER_DP = 32
+_MAX_REQUESTS_PER_DP = 12
 _MAX_PREFILL_TOKENS_PER_DP = 4096
 
 
-def _validate_dp_capacity(partitions, token_counts, *, phase):
-    requests = [0, 0]
-    tokens = [0, 0]
+def _validate_dp_capacity(partitions, token_counts, *, phase, dp_size):
+    requests = [0] * dp_size
+    tokens = [0] * dp_size
     for partition, count in zip(partitions, token_counts):
-        if type(partition) is not int or not 0 <= partition < 2:
-            raise ValueError("requests require an explicit DP cache partition in [0, 2)")
+        if type(partition) is not int or not 0 <= partition < dp_size:
+            raise ValueError(f"requests require an explicit DP cache partition in [0, {dp_size})")
         requests[partition] += 1
         tokens[partition] += count
     if any(count > _MAX_REQUESTS_PER_DP for count in requests):
@@ -217,8 +691,9 @@ def validate_page_tables(rows, partitions, ends, groups):
         raise MissingCompositeInterface("V4.1 requires explicit grouped cache specifications")
     if len({group.name for group in groups}) != len(groups):
         raise ValueError("cache group names must be unique")
-    if any(group.num_partitions != 2 for group in groups):
-        raise ValueError("V4.1 cache groups require two DP partitions")
+    dp_size = groups[0].num_partitions
+    if any(group.num_partitions != dp_size for group in groups):
+        raise ValueError("V4.1 cache groups require the same DP partition count")
     if any(group.sliding_window is not None for group in groups):
         raise MissingCompositeInterface("rolling cache page lowering requires a verified composite contract")
     if len(rows) != len(partitions) or len(rows) != len(ends):
@@ -226,8 +701,8 @@ def validate_page_tables(rows, partitions, ends, groups):
     required = {group.name for group in groups}
     owners, result = set(), []
     for pages, partition, end in zip(rows, partitions, ends):
-        if type(partition) is not int or not 0 <= partition < 2:
-            raise ValueError("requests require an explicit DP cache partition in [0, 2)")
+        if type(partition) is not int or not 0 <= partition < dp_size:
+            raise ValueError(f"requests require an explicit DP cache partition in [0, {dp_size})")
         if type(end) is not int or end <= 0:
             raise ValueError("cache request extent must be a positive integer")
         if not isinstance(pages, Mapping) or set(pages) != required:
@@ -303,7 +778,8 @@ def prefill_requests(batch, config, runtime, groups):
         cursor += size
     if cursor != len(token_ids):
         raise ValueError("prefill chunk spans leave unclaimed packed tokens")
-    _validate_dp_capacity(batch.cache_partitions, batch.chunk_lens, phase="prefill")
+    _validate_dp_capacity(batch.cache_partitions, batch.chunk_lens, phase="prefill",
+                          dp_size=groups[0].num_partitions)
     pages = validate_page_tables(
         batch.block_ids_by_group, batch.cache_partitions, batch.seq_lens, groups,
     )
@@ -337,7 +813,8 @@ def decode_requests(batch, config, runtime, groups):
         raise ValueError("decode sequence length exceeds model capacity")
     if len(batch.cache_partitions) != count or len(batch.block_ids_by_group) != count:
         raise ValueError("decode requires one partition and grouped page table per request")
-    _validate_dp_capacity(batch.cache_partitions, (1 for _ in range(count)), phase="decode")
+    _validate_dp_capacity(batch.cache_partitions, (1 for _ in range(count)), phase="decode",
+                          dp_size=groups[0].num_partitions)
     pages = validate_page_tables(batch.block_ids_by_group, batch.cache_partitions, ends, groups)
     return [(key, partition, end - 1, token, table)
             for key, partition, end, token, table in zip(
@@ -361,16 +838,16 @@ MOE_ARGS = (
 
 @dataclass(frozen=True)
 class SegmentTopology:
-    tp: int = 4
-    dp: int = 2
+    tp: int = 1
+    dp: int = 8
     local_capacity: int = 16
 
     @classmethod
-    def for_decode(cls, *, tp: int = 4, dp: int = 2):
-        """Match lib's padded local MoE extent for a full decode batch."""
+    def for_decode(cls, *, tp: int = 1, dp: int = 8):
+        """Match the current lib's 12-request, six-row decode extent."""
         if type(tp) is not int or tp not in (1, 2, 4, 8):
             raise ValueError("unsupported decode TP size")
-        decode_tokens = 32 * (5 + 1)
+        decode_tokens = 12 * 6
         row_tile = 16
         local_rows = (decode_tokens + tp - 1) // tp
         return cls(tp=tp, dp=dp, local_capacity=(local_rows + row_tile - 1) // row_tile * row_tile)
@@ -415,9 +892,12 @@ def load_segment_modules(lib_root, topology):
     expected = root / "models/deepseek_v4_1_flash/config.py"
     if existing is not None and Path(existing.__file__).resolve() != expected:
         raise RuntimeError("V41 lib from another checkout is already imported; use a fresh worker")
-    old_argv, old_path = sys.argv[:], sys.path[:]
+    old_argv = sys.argv[:]
     try:
-        sys.path.insert(0, str(root))
+        # The lib's model modules import sibling files by their top-level names.
+        for path in (root, root / "models/deepseek_v4_1_flash"):
+            if str(path) not in sys.path:
+                sys.path.insert(0, str(path))
         sys.argv = [old_argv[0], "--tp", str(topology.tp), "--ep", str(topology.world)]
         config = importlib.import_module(package + ".config")
         if Path(config.__file__).resolve() != expected:
@@ -432,7 +912,7 @@ def load_segment_modules(lib_root, topology):
             raise ValueError("cannot run serving with lib test-only MoE bypasses")
         return attention, moe
     finally:
-        sys.argv, sys.path = old_argv, old_path
+        sys.argv = old_argv
 
 
 def compile_segment(compiler, lib_root, topology):
@@ -720,6 +1200,100 @@ def prepare_compressed_metadata(
                               tuple(counts))
 
 
+# decode_backbone
+def compile_decode_fwd(compiler, lib_root, topology):
+    """Compile the complete 40-layer backbone from the selected lib revision."""
+    import pypto.language as pl
+
+    load_segment_modules(lib_root, topology)
+    module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
+    entry = module.l3_decode_fwd
+    annotation = inspect.signature(entry._func).parameters["attention_num_tokens"].annotation
+    shape = tuple(getattr(annotation, "shape", ()))
+    if shape == (topology.world,):
+        program = compiler.compile("v41_decode_fwd", entry)
+        counts_are_tensor = True
+    elif not shape:
+        program = compiler.compile("v41_decode_fwd", entry, attention_num_tokens=pl.RUNTIME)
+        counts_are_tensor = False
+    else:
+        raise ValueError(f"unsupported decode attention_num_tokens shape: {shape}")
+    return program, tuple(entry.param_names), counts_are_tensor
+
+
+class DecodeForwardSegment:
+    """Bind one full-backbone dispatch to resident weights, caches and metadata."""
+
+    _METADATA = {
+        "base_rope_cos": "rope_cos", "base_rope_sin": "rope_sin",
+        "compressed_token_rope_cos": "compressed_rope_cos",
+        "compressed_token_rope_sin": "compressed_rope_sin",
+        "c2a_rope_cos": "c2a_compressed_rope_cos",
+        "c2a_rope_sin": "c2a_compressed_rope_sin",
+        "request_ids": "c2a_request_ids",
+        "token_to_req_indices": "c2a_request_ids",
+        "position_ids": "c2a_position_ids",
+        "c2a_index_block_table": "c2a_index_block_table",
+        "c1a_index_block_table": "c1a_index_block_table",
+        "query_start_loc": "c2a_query_start_loc",
+        "state_block_table": "c2a_state_block_table",
+    }
+
+    def __init__(self, worker, program, param_names, run_config, topology,
+                 counts_are_tensor,
+                 weights, cache, metadata):
+        self.worker, self.program = worker, program
+        self.param_names = tuple(param_names)
+        self.run_config, self.topology = run_config, topology
+        self.counts_are_tensor = counts_are_tensor
+        self.metadata = metadata
+        arguments = {name: weights.full(name) for name in weights.layout_names}
+        arguments.update({name: cache.full(name) for name in cache._full})
+        arguments.update({name: metadata.fields[source]
+                          for name, source in self._METADATA.items()})
+        arguments.update({name: metadata.fields[name] for name in (
+            "window_slots", "window_indices", "c2a_compressed_lens",
+            "c1a_compressed_lens", "c2a_compressed_slots", "c1a_compressed_slots",
+        )})
+        arguments["moe_num_tokens"] = metadata.fields["moe_counts"]
+        if counts_are_tensor:
+            if topology.tp != 1:
+                raise ValueError("decode attention counts share MoE rows only at TP1")
+            arguments["attention_num_tokens"] = metadata.fields["moe_counts"]
+        missing = set(param_names) - set(arguments) - {
+            "x_hc", "pre_mix", "attention_num_tokens"}
+        extra = set(arguments) - set(param_names)
+        if missing or extra:
+            raise ValueError(f"full decode ABI mismatch: missing={sorted(missing)} extra={sorted(extra)}")
+        self.arguments = arguments
+        self.failed = False
+
+    def run(self, state, *, group_counts):
+        if self.failed:
+            raise RuntimeError("full decode failed; close the worker before retrying")
+        if state.layout != "tp_local_token":
+            raise ValueError("full decode requires TP-local state")
+        if len(group_counts) != self.topology.dp or len(set(group_counts)) != 1 or group_counts[0] <= 0:
+            raise ValueError("full decode requires equal nonempty token rows on all DP ranks")
+        bound = dict(self.arguments, x_hc=state.residual, pre_mix=state.pre_mix)
+        if not self.counts_are_tensor:
+            bound["attention_num_tokens"] = ctypes.c_int32(group_counts[0])
+        if not getattr(self.worker, "_persistent", False) or not hasattr(
+                self.worker, "_reset_persistent_windows"):
+            raise RuntimeError("full decode requires a persistent worker with window reset")
+        previous_reset = self.worker._reset_persistent_windows
+        self.worker._reset_persistent_windows = True
+        try:
+            self.worker.run(self.program.compiled,
+                            *(bound[name] for name in self.param_names), config=self.run_config)
+        except BaseException:
+            self.failed = True
+            raise
+        finally:
+            self.worker._reset_persistent_windows = previous_reset
+        return state
+
+
 # npu_runner
 class V41ModelRunner:
     """Own one collective session; missing entries fail before resource creation.
@@ -738,7 +1312,8 @@ class V41ModelRunner:
         bindings.require(plan.layers, plan.placement)
         if len(plan.layers) == 40:
             self.cache_groups = validate_cache_groups(
-                plan.layers, bindings.cache_groups, runtime.max_seq_len)
+                plan.layers, bindings.cache_groups, runtime.max_seq_len,
+                dp_size=plan.placement.dp_size)
         else:
             self.cache_groups = None
         self.runtime = runtime
@@ -786,7 +1361,8 @@ class V41ModelRunner:
         self.preflight()
         if self.ledger is None:
             self.ledger = RequestLedger(max_requests=self.runtime.max_batch_size,
-                                        max_seq_len=self.runtime.max_seq_len)
+                                        max_seq_len=self.runtime.max_seq_len,
+                                        partitions=self.plan.placement.dp_size)
         return self.ledger
 
     def _reset_request(self, key, owner):
@@ -999,7 +1575,7 @@ def bind_prefill_producers(plans, arguments):
 def compile_prefill_segments(compiler, lib_root, topology, modes):
     """Compile existing composite entries, sharing one packed-FP4 MoE program.
 
-    C1A must use prefill_c1a_sp, not the older replicated-residual wrappers.
+    C1A uses the SP program exposed by the current prefill_c1a_full module.
     No model operators are composed by this serving module.
     """
     import pypto.language as pl
@@ -1016,8 +1592,8 @@ def compile_prefill_segments(compiler, lib_root, topology, modes):
             module = importlib.import_module("models.deepseek_v4_1_flash.prefill_" + mode)
             entry = module.make_hc_program(topology.capacity, topology.world, epochs=1)
         else:
-            module = importlib.import_module("models.deepseek_v4_1_flash.prefill_c1a_sp")
-            entry = module.make_program(mode.removeprefix("c1a_"), topology.world, epochs=1)
+            module = importlib.import_module("models.deepseek_v4_1_flash.prefill_c1a_full")
+            entry = module.make_c1a_sp_program(mode.removeprefix("c1a_"), topology.world, epochs=1)
         if tuple(entry.param_names) != tuple(PREFILL_ARGUMENTS[mode]):
             raise ValueError(f"{mode} prefill parameter order disagrees with the selected lib")
         attention[mode] = compiler.compile("v41_prefill_" + mode, entry, attention_epoch=pl.RUNTIME)
@@ -1283,6 +1859,149 @@ def prepare_swa_window_metadata(
     )
 
 
+# final_output
+@dataclass(frozen=True)
+class FinalOutputRows:
+    indices: torch.Tensor
+    locations: tuple[tuple[int, int], ...]
+
+
+def prepare_final_output_rows(inputs: SegmentInputs, indices: torch.Tensor, *,
+                              local_capacity: int) -> FinalOutputRows:
+    """Stage final-token rows into a pre-fork shared buffer in request order."""
+    if not isinstance(inputs, SegmentInputs) or type(local_capacity) is not int or local_capacity <= 0:
+        raise ValueError("final output requires valid packed inputs and rank capacities")
+    if (not isinstance(indices, torch.Tensor) or indices.device.type != "cpu"
+            or indices.dtype != torch.int32 or indices.ndim != 2
+            or min(indices.shape) <= 0 or not indices.is_contiguous() or not indices.is_shared()):
+        raise ValueError("LM-head row indices must be a pre-fork shared CPU INT32 matrix")
+    world, max_logit_rows = indices.shape
+    if tuple(inputs.row_indices.shape) != (world, local_capacity):
+        raise ValueError("final output row map differs from the layer-state layout")
+    counts = [0] * world
+    locations = []
+    selected = set()
+    for rank, row in inputs.request_last_rows:
+        if (type(rank) is not int or not 0 <= rank < world or type(row) is not int
+                or not 0 <= row < local_capacity or inputs.row_indices[rank, row] < 0):
+            raise ValueError("request final row is absent from the packed layer state")
+        if (rank, row) in selected:
+            raise ValueError("two requests cannot select the same final token row")
+        selected.add((rank, row))
+        slot = counts[rank]
+        if slot >= max_logit_rows:
+            raise ValueError("request final rows exceed the lib LM-head capacity on one rank")
+        counts[rank] += 1
+        locations.append((rank, slot))
+    indices.fill_(-1)
+    for (rank, row), (_, slot) in zip(inputs.request_last_rows, locations):
+        indices[rank, slot] = row
+    return FinalOutputRows(indices, tuple(locations))
+
+
+def collect_final_logits(logits: torch.Tensor, rows: FinalOutputRows) -> torch.Tensor:
+    """Return owned CPU logits in request order after output completion."""
+    if (not isinstance(logits, torch.Tensor) or logits.device.type != "cpu"
+            or logits.ndim != 3 or logits.shape[:2] != rows.indices.shape
+            or logits.dtype != torch.float32):
+        raise ValueError("lib output must be CPU FP32 [rank, logit_row, vocabulary]")
+    if not rows.locations:
+        raise ValueError("final output requires at least one request")
+    result = torch.stack([logits[rank, slot] for rank, slot in rows.locations]).clone()
+    if not bool(torch.isfinite(result).all()):
+        raise ValueError("lib output contains non-finite request logits")
+    return result
+
+
+def make_final_output_program(lib_root, topology):
+    load_segment_modules(lib_root, topology)
+    previous_argv = sys.argv[:]
+    try:
+        sys.argv = [previous_argv[0], "--tp", str(topology.tp), "--dp", str(topology.dp)]
+        lm_head = importlib.import_module("models.deepseek_v4_1_flash.lm_head")
+    finally:
+        sys.argv = previous_argv
+    if hasattr(lm_head, "l3_final_output"):
+        if (lm_head.TP_SIZE, lm_head.DP_SIZE, lm_head.WORLD_SIZE) != (
+                topology.tp, topology.dp, topology.world):
+            raise ValueError("V4.1 final output was imported for a different topology")
+        return lm_head.l3_final_output
+    from . import final_output as module
+    return module.make_final_output_program(topology.tp, topology.dp)
+
+
+def compile_final_output(compiler, lib_root, topology):
+    import pypto.language as pl
+
+    entry = make_final_output_program(lib_root, topology)
+    param_names = tuple(entry.param_names)
+    if "done_epoch" in param_names:
+        program = compiler.compile("v41_final_output", entry, done_epoch=pl.RUNTIME)
+    else:
+        program = compiler.compile("v41_final_output", entry)
+    return program, param_names
+
+
+class FinalOutput:
+    """Dispatch final logits under the selected lib communication contract."""
+
+    def __init__(self, worker, program, param_names, run_config):
+        self.worker = worker
+        self.program = program
+        self.param_names = tuple(param_names)
+        self.run_config = run_config
+        self.epoch = 0
+        self.failed = False
+        legacy = {"x_hc", "pre_mix", "norm_weight", "head_weight", "logit_row_indices",
+                  "normed", "logits", "sampled_ids", "done_epoch"}
+        current = {"x_hc", "pre_mix", "final_norm_weight", "lm_head_weight",
+                   "logit_row_indices", "logits", "sampled_ids"}
+        names = set(self.param_names)
+        if names not in (legacy, current) or len(self.param_names) != len(names):
+            raise ValueError("final output ABI differs from the lib composite")
+        self.fresh_windows = names == current
+
+    def run(self, state: LayerState, arguments):
+        if self.failed:
+            raise RuntimeError("output dispatch failed; close the worker before retrying")
+        if state.layout != "tp_local_token":
+            raise ValueError("final output requires TP-local residual and pre_mix")
+        reserved = {"x_hc", "pre_mix"}
+        if not self.fresh_windows:
+            reserved.add("done_epoch")
+        if reserved & arguments.keys():
+            raise ValueError("final state and epoch must come from this dispatch")
+        missing = set(self.param_names) - reserved - arguments.keys()
+        if missing:
+            raise ValueError("missing output ABI arguments: " + ", ".join(sorted(missing)))
+        if not self.fresh_windows and self.epoch >= (2**31 - 1) // 16:
+            raise OverflowError("output completion epoch exhausted; recreate worker")
+        reset_windows = self.fresh_windows or self.epoch == 128
+        next_epoch = 1 if reset_windows else self.epoch + 1
+        bound = dict(arguments, x_hc=state.residual, pre_mix=state.pre_mix)
+        if not self.fresh_windows:
+            bound["done_epoch"] = ctypes.c_int32(next_epoch)
+        if reset_windows:
+            if not getattr(self.worker, "_persistent", False) or not hasattr(
+                self.worker, "_reset_persistent_windows"
+            ):
+                raise RuntimeError("final output window reset requires a persistent PyPTO worker")
+            previous_reset = self.worker._reset_persistent_windows
+            self.worker._reset_persistent_windows = True
+        try:
+            self.worker.run(self.program.compiled, *(bound[name] for name in self.param_names),
+                            config=self.run_config)
+        except BaseException:
+            self.failed = True
+            raise
+        finally:
+            if reset_windows:
+                self.worker._reset_persistent_windows = previous_reset
+        if not self.fresh_windows:
+            self.epoch = next_epoch
+        return arguments["logits"], arguments["sampled_ids"]
+
+
 # input_resources
 @dataclass(frozen=True)
 class InputHostResources:
@@ -1381,8 +2100,6 @@ class PrefillLayerResources:
             return value
 
         try:
-            # A layer's Attention and MoE outputs must differ from each other
-            # and from the preceding MoE output. Three slots suffice for all layers.
             states = [(allocate((world, local, 4, 5120), torch.float32),
                        allocate((world, local, 4), torch.float32)) for _ in range(3)]
             attention_hidden = allocate((world, tokens, 5120), torch.bfloat16)
@@ -1577,3 +2294,523 @@ class PrefillMetadataResources:
             result["compressed_rope_cos"] = self.fields["compressed_rope_cos"]
             result["compressed_rope_sin"] = self.fields["compressed_rope_sin"]
         return result
+
+
+# final_output_resources
+@dataclass(frozen=True)
+class FinalOutputHostResources:
+    norm_weight: torch.Tensor
+    head_weight: torch.Tensor
+    logit_row_indices: torch.Tensor
+    logits: torch.Tensor
+    sampled_ids: torch.Tensor
+
+    @property
+    def inherited_host_tensors(self):
+        return self.norm_weight, self.head_weight
+
+    @property
+    def all_host_tensors(self):
+        return (self.norm_weight, self.head_weight, self.logit_row_indices,
+                self.logits, self.sampled_ids)
+
+
+def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
+                                     max_logit_rows: int = 16, chunk_rows: int = 64,
+                                     max_host_bytes: int = 16 << 30) -> FinalOutputHostResources:
+    """Load one TP vocabulary shard at a time before the worker forks."""
+    if not isinstance(topology, SegmentTopology) or (topology.tp, topology.dp) != (1, 8):
+        raise ValueError("V4.1 final output requires TP1/DP8 placement")
+    if any(type(value) is not int or value <= 0 for value in
+           (max_logit_rows, chunk_rows, max_host_bytes)):
+        raise ValueError("final output capacities and memory budget must be positive")
+    loader = V41WeightLoader(model_dir, tp_size=topology.tp, tp_rank=0,
+                             ep_size=topology.world, ep_rank=0)
+    vocab, hidden = loader.config.vocab_size, loader.config.hidden_size
+    if vocab % topology.tp:
+        raise ValueError("LM-head vocabulary must divide TP size")
+    shard_rows = vocab // topology.tp
+    sampled_pad = 8
+    required_bytes = (topology.world * shard_rows * hidden * 2
+                      + topology.world * hidden * 2
+                      + topology.world * max_logit_rows * vocab * 4
+                      + topology.world * max_logit_rows * (1 + sampled_pad) * 4)
+    if required_bytes > max_host_bytes:
+        raise ValueError(f"final output host buffers require {required_bytes} bytes")
+
+    norm = torch.empty((topology.world, hidden), dtype=torch.bfloat16).share_memory_()
+    head = torch.empty((topology.world, shard_rows, hidden), dtype=torch.bfloat16).share_memory_()
+    indices = torch.full((topology.world, max_logit_rows), -1, dtype=torch.int32).share_memory_()
+    logits = torch.zeros((topology.world, max_logit_rows, vocab), dtype=torch.float32).share_memory_()
+    sampled = torch.full((topology.world, max_logit_rows, sampled_pad), -1,
+                         dtype=torch.int32).share_memory_()
+
+    norm_value = loader.load("norm.weight").weight
+    if norm_value.dtype != torch.bfloat16 or tuple(norm_value.shape) != (hidden,):
+        raise ValueError("checkpoint final Norm weight disagrees with the lib output ABI")
+    norm.copy_(norm_value.expand_as(norm))
+    for tp_rank in range(topology.tp):
+        rank_loader = (loader if tp_rank == 0 else V41WeightLoader(
+            model_dir, tp_size=topology.tp, tp_rank=tp_rank,
+            ep_size=topology.world, ep_rank=tp_rank))
+        for start in range(0, shard_rows, chunk_rows):
+            stop = min(start + chunk_rows, shard_rows)
+            value = rank_loader.load_rows("head.weight", start, stop).weight
+            if value.dtype != torch.bfloat16 or tuple(value.shape) != (stop - start, hidden):
+                raise ValueError("checkpoint LM-head shard disagrees with the lib output ABI")
+            head[tp_rank, start:stop].copy_(value)
+    for dp_rank in range(1, topology.dp):
+        for tp_rank in range(topology.tp):
+            head[dp_rank * topology.tp + tp_rank].copy_(head[tp_rank])
+    return FinalOutputHostResources(norm, head, indices, logits, sampled)
+
+
+class FinalOutputRuntime:
+    """Keep output weights resident and stage only request rows per dispatch.
+
+    The host resources must exist before the shared DistributedWorker forks.
+    The caller owns and closes the worker after this runtime releases its tensors.
+    """
+
+    def __init__(self, worker, program, param_names, run_config, topology: SegmentTopology,
+                 host: FinalOutputHostResources, *, prefill_local_capacity: int | None = None):
+        if not isinstance(host, FinalOutputHostResources) or not isinstance(topology, SegmentTopology):
+            raise ValueError("final output requires host resources and a segment topology")
+        world, local = topology.world, topology.local_capacity
+        if any(not tensor.is_shared() for tensor in host.all_host_tensors):
+            raise ValueError("final output host buffers must be shared before worker creation")
+        if (host.norm_weight.dtype != torch.bfloat16 or host.norm_weight.shape != (world, host.head_weight.shape[-1])
+                or host.head_weight.dtype != torch.bfloat16 or host.head_weight.shape[0] != world
+                or host.logit_row_indices.dtype != torch.int32 or host.logit_row_indices.shape != (world, 16)
+                or host.logits.dtype != torch.float32
+                or host.logits.shape != (world, 16, host.head_weight.shape[1] * topology.tp)
+                or host.sampled_ids.dtype != torch.int32 or host.sampled_ids.shape != (world, 16, 8)):
+            raise ValueError("final output host buffers disagree with the lib TP1/DP8 ABI")
+        self.worker, self.host, self.topology = worker, host, topology
+        if (prefill_local_capacity is not None and
+                (type(prefill_local_capacity) is not int or not 0 < prefill_local_capacity <= 1024)):
+            raise ValueError("prefill output capacity must fit the M0 boundary")
+        self.dispatcher = FinalOutput(worker, program, param_names, run_config)
+        self._resident = []
+        try:
+            self.norm_weight = worker.alloc_stacked_tensor(host.norm_weight)
+            self._resident.append(self.norm_weight)
+            self.head_weight = worker.alloc_stacked_tensor(host.head_weight)
+            self._resident.append(self.head_weight)
+            self._normed_by_capacity = {}
+            if not self.dispatcher.fresh_windows:
+                normed = alloc_device_buffer(
+                    worker, (world, local, host.head_weight.shape[-1]), torch.bfloat16, stacked=True,
+                )
+                self._resident.append(normed)
+                self._normed_by_capacity[local] = normed
+                if prefill_local_capacity is not None and prefill_local_capacity != local:
+                    prefill_normed = alloc_device_buffer(
+                        worker, (world, prefill_local_capacity, host.head_weight.shape[-1]),
+                        torch.bfloat16, stacked=True)
+                    self._resident.append(prefill_normed)
+                    self._normed_by_capacity[prefill_local_capacity] = prefill_normed
+        except BaseException:
+            self.close()
+            raise
+
+    def run(self, state, inputs):
+        local = inputs.row_indices.shape[1]
+        normed = self._normed_by_capacity.get(local)
+        if not self.dispatcher.fresh_windows and normed is None:
+            raise ValueError("final output capacity was not preallocated before worker dispatch")
+        rows = prepare_final_output_rows(
+            inputs, self.host.logit_row_indices, local_capacity=local,
+        )
+        self.host.logits.zero_()
+        self.host.sampled_ids.fill_(-1)
+        arguments = {
+            "logit_row_indices": self.host.logit_row_indices,
+            "logits": self.host.logits,
+            "sampled_ids": self.host.sampled_ids,
+        }
+        if self.dispatcher.fresh_windows:
+            arguments.update(final_norm_weight=self.norm_weight, lm_head_weight=self.head_weight)
+        else:
+            arguments.update(norm_weight=self.norm_weight, head_weight=self.head_weight, normed=normed)
+        self.dispatcher.run(state, arguments)
+        return collect_final_logits(self.host.logits, rows)
+
+    def close(self):
+        for tensor in reversed(self._resident):
+            self.worker.free_stacked_tensor(tensor)
+        self._resident.clear()
+
+
+# resident_resources
+class V41ResidentResources:
+    """Own resident buffers and their shared host mappings until worker close.
+
+    This is the resource lifetime for a production binding, not an executable
+    binding by itself: the caller still has to lower every prefill/decode ABI
+    argument and dispatch the compiled layer programs.
+    """
+
+    def __init__(self, programs, run_config, *, weight_bank, weight_param_names,
+                 cache_plan, state_reset, page_resets, input_host, final_host,
+                 prefill_host, final_program, final_param_names, topology,
+                 decode_input_host=None, decode_host=None, worker_factory=make_segment_worker):
+        weight_bank.finish(weight_param_names)
+        if decode_host is not None and (decode_input_host is None or
+                decode_host.topology != decode_input_host.topology):
+            raise ValueError("decode metadata and input must share one TP-local topology")
+        inherited = (input_host.inherited_host_tensors
+                     + (() if decode_input_host is None else decode_input_host.inherited_host_tensors)
+                     + prefill_host.inherited_host_tensors
+                     + (() if decode_host is None else decode_host.inherited_host_tensors)
+                     + final_host.all_host_tensors
+                     + (state_reset, *page_resets.values()))
+        if any(not tensor.is_shared() for tensor in inherited):
+            raise ValueError("all inherited V4.1 host buffers must be shared before worker creation")
+        if not getattr(weight_bank, "prepacked", False) and any(
+                not tensor.is_shared() for tensor in weight_bank.tensors.values()):
+            raise ValueError("all inherited V4.1 host buffers must be shared before worker creation")
+        if final_program not in programs:
+            raise ValueError("final composite must be registered on the shared worker")
+
+        self.worker = worker_factory(programs, run_config,
+                                     tuple(weight_bank.tensors.values()) + inherited)
+        self.host_resources = (weight_bank, input_host, decode_input_host, prefill_host, decode_host,
+                               final_host, state_reset, page_resets)
+        self.prefill_host = prefill_host
+        self.decode_host = decode_host
+        self._owned = []
+        self._step = None
+        self._inputs = None
+        self._group_counts = None
+        self._prefill = None
+        self._decode_fwd = None
+        self.closed = False
+        try:
+            self.weights = self._own(ResidentFullDecodeWeights(
+                self.worker, weight_bank, weight_param_names))
+            self.input = self._own(InputStateRuntime(self.worker, input_host))
+            self.decode_input = (None if decode_input_host is None else
+                                 self._own(InputStateRuntime(self.worker, decode_input_host)))
+            self.final = self._own(FinalOutputRuntime(
+                self.worker, final_program, final_param_names, run_config, topology,
+                final_host, prefill_local_capacity=prefill_host.topology.local_capacity))
+            if callable(cache_plan):
+                slots, plan_for_slots = cache_plan(self.worker)
+                cache = allocate_cache_with_retry(
+                    self.worker, slots, plan_for_slots, state_reset, page_resets)
+            else:
+                cache = DecodeFullCachePools(self.worker, cache_plan, state_reset, page_resets)
+            self.cache = self._own(cache)
+            if decode_host is not None:
+                plan = cache.plan
+                if decode_host.max_requests < plan.physical_request_slots:
+                    raise ValueError("decode metadata must reserve the filler state slot")
+                if decode_host.window_pages < plan.physical_group_blocks[plan.family_groups.window]:
+                    raise ValueError("decode window metadata must cover the filler page")
+                for family in ("c2a", "c1a"):
+                    group = getattr(plan.family_groups, family)
+                    if decode_host.compressed_pages[family] < plan.physical_group_blocks[group]:
+                        raise ValueError(f"decode {family} metadata must cover the filler page")
+        except BaseException:
+            self.close()
+            raise
+
+    def _own(self, resource):
+        self._owned.append(resource)
+        return resource
+
+    def begin_step(self, embeddings, step):
+        if self.closed or self._step is not None:
+            raise RuntimeError("V4.1 worker is closed or a step is already active")
+        dispatch_step = step
+        if step.phase == "decode":
+            dispatch_step, embeddings, padding_partitions = pad_single_decode(
+                step, embeddings, self.cache.plan)
+            for partition in padding_partitions:
+                self.cache.reset_padding(partition)
+        host = self.prefill_host if step.phase == "prefill" else self.decode_host
+        counts = host.stage(dispatch_step) if host is not None else None
+        input_runtime = self.decode_input if step.phase == "decode" else self.input
+        if input_runtime is None:
+            raise ValueError("decode requires its own TP-local input capacity")
+        state, inputs = input_runtime.stage(embeddings, dispatch_step)
+        if dispatch_step is not step:
+            inputs = replace(inputs, request_last_rows=inputs.request_last_rows[:len(step.requests)])
+        self._step, self._inputs = step, inputs
+        self._group_counts = counts
+        return state
+
+    def prefill_arguments(self, mode, step):
+        if self.closed or step is not self._step or step.phase != "prefill":
+            raise ValueError("prefill arguments require the active prefill step")
+        return self.prefill_host.arguments(mode), self._group_counts
+
+    def bind_prefill(self, plans, *, kv_sources, index_sources, c2a_sources,
+                     max_seq_len, index_topk=512):
+        """Complete per-layer arguments using this worker's resident resources."""
+        if self.closed or self._prefill is not None or self._step is not None:
+            raise RuntimeError("prefill must be bound once before a request step")
+        self._prefill = self._own(PrefillLayerResources(
+            self.worker, self.prefill_host.topology, plans, self.weights, self.cache,
+            self.prefill_host, kv_sources=kv_sources, index_sources=index_sources,
+            c2a_sources=c2a_sources, max_seq_len=max_seq_len, index_topk=index_topk))
+        return self._prefill
+
+    def run_prefill(self, segment, state, step):
+        if (self.closed or self._prefill is None or step is not self._step
+                or step.phase != "prefill" or segment.worker is not self.worker):
+            raise ValueError("prefill dispatch requires the active step and shared worker")
+        return segment.run_chain(
+            state, self._prefill.plans, self._prefill.attention, self._prefill.moe,
+            group_counts=self._group_counts)
+
+    def bind_decode_fwd(self, program, param_names, run_config, counts_are_tensor):
+        if (self.closed or self._decode_fwd is not None or self._step is not None
+                or self.decode_host is None):
+            raise RuntimeError("full decode requires an idle worker and decode metadata")
+        self._decode_fwd = DecodeForwardSegment(
+            self.worker, program, param_names, run_config, self.decode_host.topology,
+            counts_are_tensor,
+            self.weights, self.cache, self.decode_host)
+        return self._decode_fwd
+
+    def run_decode_fwd(self, state, step):
+        if (self.closed or step is not self._step or step.phase != "decode"
+                or self._decode_fwd is None):
+            raise ValueError("full decode requires the active decode step")
+        return self._decode_fwd.run(state, group_counts=self._group_counts)
+
+    def finish_step(self, state, step):
+        if self.closed or step is not self._step:
+            raise ValueError("final output must use the active request step")
+        try:
+            return self.final.run(state, self._inputs)
+        finally:
+            self._step = self._inputs = self._group_counts = None
+
+    def reset_request(self, owner):
+        self._step = self._inputs = self._group_counts = None
+        self.cache.reset_request(owner)
+
+    def close(self):
+        if self.closed:
+            return
+        self._step = self._inputs = self._group_counts = None
+        try:
+            for resource in reversed(self._owned):
+                resource.close()
+        finally:
+            self.worker.close()
+            self.closed = True
+            self._owned.clear()
+
+
+# production_binding
+_MODES = ("swa", "c2a_full", "c2a_reuse", "c1a_full", "c1a_reindex", "c1a_reuse")
+_LOG = logging.getLogger(__name__)
+
+
+def _lib_root():
+    configured = os.environ.get("PYPTO_LIB_ROOT")
+    root = Path(configured) if configured else Path.cwd() / "pypto-lib"
+    root = root.resolve()
+    if not (root / "models/deepseek_v4_1_flash/decode_fwd.py").is_file():
+        raise MissingCompositeInterface(
+            f"V4.1 decode_fwd is absent under {root}; set PYPTO_LIB_ROOT "
+            "to a lib checkout containing the complete decode entry")
+    return root
+
+
+def selected_decode_topology(lib_root=None):
+    """Reject a lib whose import-time decode extent differs from this adapter."""
+    root = _lib_root() if lib_root is None else Path(lib_root).resolve()
+    config = root / "models/deepseek_v4_1_flash/config.py"
+    try:
+        module = ast.parse(config.read_text(encoding="utf-8"), filename=str(config))
+    except (OSError, SyntaxError) as exc:
+        raise MissingCompositeInterface(f"cannot read V4.1 lib decode config: {config}") from exc
+    values = {}
+    for statement in module.body:
+        if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+            continue
+        target = statement.targets[0]
+        if not isinstance(target, ast.Name) or target.id not in (
+                "MAX_BATCH_PER_DP", "DSPARK_SPEC_TOKENS", "DECODE_ROWS_PER_REQUEST"):
+            continue
+        if target.id in values:
+            raise MissingCompositeInterface(f"duplicate V4.1 lib decode config: {target.id}")
+        values[target.id] = statement.value
+    batch = values.get("MAX_BATCH_PER_DP")
+    spec = values.get("DSPARK_SPEC_TOKENS")
+    rows = values.get("DECODE_ROWS_PER_REQUEST")
+    if (not isinstance(batch, ast.Constant) or type(batch.value) is not int or batch.value != 12
+            or not isinstance(spec, ast.Constant) or type(spec.value) is not int or spec.value != 5
+            or not isinstance(rows, ast.BinOp) or not isinstance(rows.op, ast.Add)
+            or not isinstance(rows.left, ast.Name) or rows.left.id != "DSPARK_SPEC_TOKENS"
+            or not isinstance(rows.right, ast.Constant) or rows.right.value != 1):
+        raise MissingCompositeInterface("V4.1 serving requires the lib's 12-request, six-row decode ABI")
+    return SegmentTopology.for_decode(tp=1, dp=8)
+
+
+def _revision(root):
+    return subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], text=True,
+    ).strip()
+
+
+def _sources(layers):
+    return (
+        tuple(layer.layer_id for layer in layers if layer.kv_source == layer.layer_id),
+        tuple(layer.layer_id for layer in layers if layer.index_source == layer.layer_id),
+        tuple(layer.layer_id for layer in layers if layer.mode == "c2a_full"),
+    )
+
+
+def _check_runtime_binaries(platform):
+    from simpler_setup.runtime_builder import RuntimeBuilder
+
+    builder = RuntimeBuilder(platform=platform)
+    for runtime in ("host_build_graph", "tensormap_and_ringbuffer"):
+        builder.get_binaries(runtime)
+
+
+def make_production_bindings(model_dir, max_seq_len):
+    model_dir = Path(model_dir).resolve()
+    raw = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+    layers = plan_layers(raw)
+    groups = build_cache_groups(layers, max_seq_len, dp_size=8)
+    root = _lib_root()
+    revision = _revision(root)
+    topology = selected_decode_topology(root)
+
+    def allocate(plan, device_ids, runtime, options):
+        from pypto_serving.model.common.compiler.compiler import KernelCompiler
+        from pypto_serving.model.common.executor.utils import build_pypto_run_config
+
+        if Path(plan.weights.model_dir).resolve() != model_dir or tuple(plan.layers) != layers:
+            raise ValueError("V4.1 binding and execution plan refer to different checkpoints")
+        if runtime.max_seq_len != max_seq_len or runtime.kv_cache_groups != groups:
+            raise ValueError("V4.1 scheduler and resident cache contracts differ")
+        if len(device_ids) != 8 or options.platform != "a5":
+            raise ValueError("V4.1 production binding requires eight A5 devices")
+        _check_runtime_binaries(options.platform)
+        run_config = replace(
+            build_pypto_run_config(
+                platform=options.platform,
+                device_ids=device_ids,
+                pypto_build_dir=options.pypto_build_dir,
+            ),
+            ring_heap=2 * 1024 * 1024 * 1024,
+        )
+        compiler = KernelCompiler(run_config=run_config)
+        attention, moe = compile_prefill_segments(compiler, root, topology, _MODES)
+        decode, decode_names, decode_counts_are_tensor = compile_decode_fwd(
+            compiler, root, topology)
+        final, final_names = compile_final_output(compiler, root, topology)
+        abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
+        kv_sources, index_sources, c2a_sources = _sources(layers)
+        layout = DecodeWeightLayout.from_lib(abi)
+        if (layout.layers, layout.kv_sources, layout.index_sources,
+                layout.c2a_sources, layout.world) != (
+                    len(layers), len(kv_sources), len(index_sources), len(c2a_sources), 8):
+            raise ValueError("V4.1 checkpoint source axes disagree with the selected lib")
+        DecodeWeightBank.validate_abi(decode_names)
+
+        bank_started = time.perf_counter()
+        bank = load_prepacked_bank(model_dir, layout, decode_names)
+        if bank is None:
+            bank = DecodeWeightBank(layout)
+            append_seconds = 0.0
+            layer_started = time.perf_counter()
+            for item in iter_decode_weight_slices(model_dir, topology):
+                append_started = time.perf_counter()
+                bank.append(item)
+                append_seconds += time.perf_counter() - append_started
+                if item.name == "hc_attn_fn":
+                    now = time.perf_counter()
+                    _LOG.info("V4.1 checkpoint layer %d/%d loaded into shared weight bank (%.2fs)",
+                              item.slot + 1, layout.layers, now - layer_started)
+                    layer_started = now
+            bank.finish(decode_names)
+            _LOG.info("V4.1 checkpoint staging %.2fs (bank copies %.2fs)",
+                      time.perf_counter() - bank_started, append_seconds)
+        _LOG.info("V4.1 shared weight bank ready: %.1f GiB",
+                  bank.allocated_bytes / (1 << 30))
+
+        rope = importlib.import_module("models.deepseek_v4_1_flash.rope_tables")
+        swa_tables = rope.precompute_rope_tables(max_seq_len, False)
+        compressed_tables = rope.precompute_rope_tables(max_seq_len, True)
+        cache_plan = plan_decode_cache_pools(
+            layers, groups, max_seq_len=max_seq_len,
+            primary_num_blocks=groups[0].max_blocks_per_seq,
+            request_slots=1, abi=abi,
+        )
+        if (runtime.total_kv_pages is not None and
+                runtime.total_kv_pages < cache_plan.primary_num_blocks):
+            raise ValueError("configured cache pages cannot hold one V4.1 request")
+        resets = make_cache_page_reset_buffers(cache_plan)
+        state_reset = make_state_reset_buffer(cache_plan)
+        family = cache_plan.family_groups
+        host_kwargs = dict(
+            max_seq_len=max_seq_len,
+            max_requests=cache_plan.physical_request_slots,
+            window_pages=cache_plan.physical_group_blocks[family.window],
+            c2a_pages=cache_plan.physical_group_blocks[family.c2a],
+            c1a_pages=cache_plan.physical_group_blocks[family.c1a],
+            rope_tables=swa_tables,
+            compressed_rope_tables=compressed_tables,
+        )
+        prefill_host = PrefillMetadataResources(topology, **host_kwargs)
+        decode_host = PrefillMetadataResources(topology, **host_kwargs)
+        input_host = make_input_host_resources(topology, plan.weights.config.hidden_size)
+        decode_input_host = make_input_host_resources(topology, plan.weights.config.hidden_size)
+        final_host = load_final_output_host_resources(model_dir, topology)
+        programs = (*attention.values(), moe, decode, final)
+        resident_started = time.perf_counter()
+        resident = V41ResidentResources(
+            programs, run_config, weight_bank=bank, weight_param_names=decode_names,
+            cache_plan=cache_plan, state_reset=state_reset, page_resets=resets,
+            input_host=input_host, decode_input_host=decode_input_host,
+            prefill_host=prefill_host, decode_host=decode_host,
+            final_host=final_host, final_program=final, final_param_names=final_names,
+            topology=topology,
+        )
+        _LOG.info("V4.1 resident upload and allocation %.2fs",
+                  time.perf_counter() - resident_started)
+        try:
+            resident.bind_prefill(
+                layers, kv_sources=kv_sources, index_sources=index_sources,
+                c2a_sources=c2a_sources, max_seq_len=max_seq_len,
+            )
+            resident.bind_decode_fwd(
+                decode, decode_names, run_config, decode_counts_are_tensor)
+            resident.prefill_segment = PrefillSegment(
+                resident.worker, attention, moe, topology,
+                prefill_host.fields["attention_counts"], prefill_host.fields["moe_counts"],
+                run_config,
+            )
+        except BaseException:
+            resident.close()
+            raise
+        return resident, cache_plan.primary_num_blocks
+
+    return CompositeBindings(
+        revision=revision,
+        entries={},
+        initialize=lambda embeddings, step, resources: resources.begin_step(embeddings, step),
+        output=lambda state, step, resources: resources.finish_step(state, step),
+        allocate=allocate,
+        prepare_weights=lambda plans, layer, resources: None,
+        reset_request=lambda resources, key, owner: resources.reset_request(owner),
+        wait=lambda resources: None,
+        close=lambda resources: resources.close(),
+        cache_groups=groups,
+        segment_topology=topology,
+        input_layout="tp_local_token",
+        output_layout="tp_local_token",
+        prefill_backbone=lambda state, step, resources, plans: resources.run_prefill(
+            resources.prefill_segment, state, step),
+        decode_backbone=lambda state, step, resources, plans: resources.run_decode_fwd(
+            state, step),
+    )
