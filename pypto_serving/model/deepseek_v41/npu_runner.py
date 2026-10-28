@@ -1263,6 +1263,53 @@ def compile_decode_fwd(compiler, lib_root, topology):
     return program, tuple(entry.param_names), counts_are_tensor
 
 
+def compile_decode_fwd_dspark(compiler, lib_root, topology):
+    """Compile the V4.1 DSpark stage programs into the shared worker.
+
+    The DSpark entry is intentionally kept as a set of host composites.  The
+    serving layer owns dispatch state and buffers; the lib owns the ordering
+    and device-side implementation of each stage.
+    """
+    import pypto.language as pl
+
+    if topology.tp != 1:
+        raise MissingCompositeInterface("V4.1 DSpark currently requires TP1")
+    load_segment_modules(lib_root, topology)
+    module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd_dspark")
+    entries = {
+        "prepare_target": module.l3_prepare_target,
+        "prepare_target_decode": module.l3_prepare_target_decode,
+        "copy_target_hidden": module.l3_copy_target_hidden,
+    }
+    state = importlib.import_module("models.deepseek_v4_1_flash.dspark_state")
+    entries.update({name.removeprefix("l3_"): getattr(state, name) for name in (
+        "l3_bootstrap_inputs", "l3_publish_bootstrap", "l3_accept_target",
+        "l3_commit_drafts", "l3_prepare_drafter_geometry",
+        "l3_prepare_prefill_drafter_geometry")})
+    target_sample = importlib.import_module("models.deepseek_v4_1_flash.dspark_target_sample")
+    for chunk in range(5):
+        entries[f"sample_target_chunk_{chunk}"] = target_sample.l3_sample_target_chunk
+    entries["merge_target_chunks"] = target_sample.l3_merge_target_chunks
+    entries["dspark_drafter"] = importlib.import_module(
+        "models.deepseek_v4_1_flash.dspark_drafter").l3_dspark_drafter
+    entries["markov_sample"] = importlib.import_module(
+        "models.deepseek_v4_1_flash.dspark_markov").l3_markov_sample_from_hidden
+    programs = {}
+    for name, entry in entries.items():
+        kwargs = {}
+        params = set(entry.param_names)
+        if "attention_epoch" in params:
+            kwargs["attention_epoch"] = pl.RUNTIME
+        if "moe_epoch" in params:
+            kwargs["moe_epoch"] = pl.RUNTIME
+        if "logits_epoch" in params:
+            kwargs["logits_epoch"] = pl.RUNTIME
+        if name.startswith("sample_target_chunk_"):
+            kwargs["chunk"] = int(name.rsplit("_", 1)[1])
+        programs[name] = compiler.compile("v41_dspark_" + name, entry, **kwargs)
+    return programs, {name: tuple(entry.param_names) for name, entry in entries.items()}
+
+
 class DecodeForwardSegment:
     """Bind one full-backbone dispatch to resident weights, caches and metadata."""
 
@@ -2738,7 +2785,8 @@ class V41ResidentResources:
                  cache_plan, state_reset, page_resets, input_host, final_host,
                  prefill_host, final_program, final_param_names, topology,
                  decode_input_host=None, decode_host=None, worker_factory=make_segment_worker,
-                 prefill_program=None, prefill_param_names=None):
+                 prefill_program=None, prefill_param_names=None,
+                 dspark_programs=None, dspark_param_names=None):
         weight_bank.finish(weight_param_names)
         if decode_host is not None and (decode_input_host is None or
                 decode_host.topology != decode_input_host.topology):
@@ -2759,6 +2807,7 @@ class V41ResidentResources:
 
         self.worker = worker_factory(programs, run_config,
                                      tuple(weight_bank.tensors.values()) + inherited)
+        self.run_config = run_config
         self.host_resources = (weight_bank, input_host, decode_input_host, prefill_host, decode_host,
                                final_host, state_reset, page_resets)
         self.prefill_host = prefill_host
@@ -2775,6 +2824,8 @@ class V41ResidentResources:
         self._weight_bank = weight_bank
         self._weight_param_names = tuple(weight_param_names)
         self._prefill_binding = (prefill_program, prefill_param_names, run_config, topology)
+        self.dspark_programs = dict(dspark_programs or {})
+        self.dspark_param_names = dict(dspark_param_names or {})
         self.weights = None
         self.closed = False
         try:
@@ -2913,6 +2964,31 @@ class V41ResidentResources:
             raise ValueError("full decode requires the active decode step")
         return self._decode_fwd.run(state, group_counts=self._group_counts)
 
+    def dispatch_dspark(self, stage, arguments):
+        """Dispatch one compiled DSpark composite with an exact ABI check.
+
+        The request scheduler supplies the resident tensors and state for a
+        stage.  Keeping this narrow boundary lets the lib's
+        ``decode_fwd_dspark`` orchestrator remain the owner of stage ordering;
+        serving does not rebuild the drafter or Markov graph from small ops.
+        """
+        if self.closed:
+            raise RuntimeError("cannot dispatch DSpark on a closed worker")
+        try:
+            program = self.dspark_programs[stage]
+            param_names = self.dspark_param_names[stage]
+        except KeyError as exc:
+            raise MissingCompositeInterface(f"DSpark stage is not compiled: {stage}") from exc
+        supplied = set(arguments)
+        required = set(param_names)
+        if supplied != required:
+            raise ValueError(
+                f"DSpark stage {stage} ABI mismatch: "
+                f"missing={sorted(required - supplied)} extra={sorted(supplied - required)}"
+            )
+        self.worker.run(program.compiled,
+                        *(arguments[name] for name in param_names), config=self.run_config)
+
     def finish_step(self, state, step):
         if self.closed or step is not self._step:
             raise ValueError("final output must use the active request step")
@@ -3049,6 +3125,8 @@ def make_production_bindings(model_dir, max_seq_len, *, tokenizer=None, engram_l
         prefill, prefill_names = compile_prefill_fwd(compiler, root, topology)
         decode, decode_names, decode_counts_are_tensor = compile_decode_fwd(
             compiler, root, topology)
+        dspark_programs, dspark_param_names = compile_decode_fwd_dspark(
+            compiler, root, topology)
         final, final_names = compile_final_output(compiler, root, topology)
         abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
         engram = None
@@ -3126,7 +3204,7 @@ def make_production_bindings(model_dir, max_seq_len, *, tokenizer=None, engram_l
         final_host = load_final_output_host_resources(model_dir, topology)
         prefill_host = PrefillMetadataResources(
             topology, **host_kwargs, full_hidden_size=plan.weights.config.hidden_size)
-        programs = (prefill, decode, final)
+        programs = (prefill, decode, final, *dspark_programs.values())
         resident_started = time.perf_counter()
         resident = V41ResidentResources(
             programs, run_config, weight_bank=bank, weight_param_names=decode_names,
@@ -3135,6 +3213,7 @@ def make_production_bindings(model_dir, max_seq_len, *, tokenizer=None, engram_l
             prefill_host=prefill_host, decode_host=decode_host,
             final_host=final_host, final_program=final, final_param_names=final_names,
             topology=topology, prefill_program=prefill, prefill_param_names=prefill_names,
+            dspark_programs=dspark_programs, dspark_param_names=dspark_param_names,
         )
         resident.engram = engram
         _LOG.info("V4.1 resident upload and allocation %.2fs",
