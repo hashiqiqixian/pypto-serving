@@ -3040,7 +3040,7 @@ def _lib_root():
     return root
 
 
-def selected_decode_topology(lib_root=None):
+def selected_decode_topology(lib_root=None, *, dp_size=None):
     """Reject a lib whose import-time decode extent differs from this adapter."""
     root = _lib_root() if lib_root is None else Path(lib_root).resolve()
     config = root / "models/deepseek_v4_1_flash/config.py"
@@ -3068,7 +3068,11 @@ def selected_decode_topology(lib_root=None):
             or not isinstance(rows.left, ast.Name) or rows.left.id != "DSPARK_SPEC_TOKENS"
             or not isinstance(rows.right, ast.Constant) or rows.right.value != 1):
         raise MissingCompositeInterface("V4.1 serving requires the lib's 12-request, six-row decode ABI")
-    return SegmentTopology.for_decode(tp=1, dp=8)
+    if dp_size is None:
+        dp_size = int(os.environ.get("PYPTO_DSV41_DP_SIZE", "8"))
+    if dp_size not in (4, 8):
+        raise ValueError("V4.1 DSpark serving supports DP4/EP4 or DP8/EP8")
+    return SegmentTopology.for_decode(tp=1, dp=dp_size)
 
 
 def _revision(root):
@@ -3097,10 +3101,13 @@ def make_production_bindings(model_dir, max_seq_len, *, tokenizer=None, engram_l
     model_dir = Path(model_dir).resolve()
     raw = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     layers = plan_layers(raw)
-    groups = build_cache_groups(layers, max_seq_len, dp_size=8)
+    dp_size = int(os.environ.get("PYPTO_DSV41_DP_SIZE", "8"))
+    if dp_size not in (4, 8):
+        raise ValueError("PYPTO_DSV41_DP_SIZE must be 4 or 8")
+    groups = build_cache_groups(layers, max_seq_len, dp_size=dp_size)
     root = _lib_root()
     revision = _revision(root)
-    topology = selected_decode_topology(root)
+    topology = selected_decode_topology(root, dp_size=dp_size)
 
     def allocate(plan, device_ids, runtime, options):
         from pypto_serving.model.common.compiler.compiler import KernelCompiler
@@ -3110,8 +3117,8 @@ def make_production_bindings(model_dir, max_seq_len, *, tokenizer=None, engram_l
             raise ValueError("V4.1 binding and execution plan refer to different checkpoints")
         if runtime.max_seq_len != max_seq_len or runtime.kv_cache_groups != groups:
             raise ValueError("V4.1 scheduler and resident cache contracts differ")
-        if len(device_ids) != 8 or options.platform != "a5":
-            raise ValueError("V4.1 production binding requires eight A5 devices")
+        if len(device_ids) != topology.dp or options.platform != "a5":
+            raise ValueError(f"V4.1 production binding requires {topology.dp} A5 devices")
         _check_runtime_binaries(options.platform)
         run_config = replace(
             build_pypto_run_config(
@@ -3147,7 +3154,7 @@ def make_production_bindings(model_dir, max_seq_len, *, tokenizer=None, engram_l
         layout = DecodeWeightLayout.from_lib(abi)
         if (layout.layers, layout.kv_sources, layout.index_sources,
                 layout.c2a_sources, layout.world) != (
-                    len(layers), len(kv_sources), len(index_sources), len(c2a_sources), 8):
+                    len(layers), len(kv_sources), len(index_sources), len(c2a_sources), topology.world):
             raise ValueError("V4.1 checkpoint source axes disagree with the selected lib")
         DecodeWeightBank.validate_abi(decode_names)
 

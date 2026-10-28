@@ -139,9 +139,17 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
             raise MissingCompositeInterface("V4.1 requires explicit grouped cache layouts and capacities")
         if record.runtime.kv_cache_groups != bindings.cache_groups:
             raise ValueError("scheduler and composite cache group contracts differ")
+        rank_count = len(self.device_ids)
+        if rank_count not in (4, 8):
+            raise ValueError("V4.1 DSpark serving requires 4 or 8 devices")
+        if bindings.segment_topology.dp != rank_count:
+            raise ValueError(
+                "V4.1 DSpark topology mismatch: set PYPTO_DSV41_DP_SIZE "
+                f"to {rank_count} before creating bindings"
+            )
         plan = V41ExecutionPlan(
             record.runtime_model.extra["model_dir"],
-            RankPlacement(0, tp_size=1, dp_size=8, ep_size=8),
+            RankPlacement(0, tp_size=1, dp_size=rank_count, ep_size=rank_count),
         )
         runner = V41ModelRunner(
             plan, bindings, device_ids=self.device_ids, runtime=record.runtime,
