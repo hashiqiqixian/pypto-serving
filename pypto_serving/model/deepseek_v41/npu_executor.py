@@ -133,7 +133,8 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         if model_id in self.runners:
             raise ValueError("model already registered")
         bindings = self.bindings or load_composite_bindings(
-            record.runtime_model.extra["model_dir"], record.runtime.max_seq_len)
+            record.runtime_model.extra["model_dir"], record.runtime.max_seq_len,
+            tokenizer=record.tokenizer)
         if not bindings.cache_groups:
             raise MissingCompositeInterface("V4.1 requires explicit grouped cache layouts and capacities")
         if record.runtime.kv_cache_groups != bindings.cache_groups:

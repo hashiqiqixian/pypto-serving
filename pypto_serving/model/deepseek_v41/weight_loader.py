@@ -578,6 +578,28 @@ class DecodeWeightSlice:
     value: torch.Tensor
 
 
+class RowAddressedCheckpoint:
+    """Read only selected rows from the large Engram embedding tables."""
+
+    def __init__(self, store):
+        self.store = store
+
+    def tensor_rows(self, name, rows):
+        rows = torch.as_tensor(rows, dtype=torch.int64)
+        if rows.ndim < 1:
+            raise ValueError("Engram row indices must have at least one dimension")
+        reader_path = self.store.path_for(name)
+        values = []
+        with self.store._safe_open_fn(reader_path, self.store.device) as reader:
+            source = reader.get_slice(name)
+            shape = tuple(source.get_shape())
+            if len(shape) != 2 or bool((rows < 0).any()) or bool((rows >= shape[0]).any()):
+                raise ValueError(f"Engram row indices are outside {name}")
+            for row in rows.reshape(-1).tolist():
+                values.append(source[int(row)])
+        return torch.stack(values).reshape(*rows.shape, shape[1])
+
+
 def bind_decode_layer_weights(layer, attention, moe, *, kv_sources, index_sources, c2a_sources):
     """Map one loaded layer to the lib's layer/source axes without copying data."""
     if not attention or not moe or "mxfp4_pair_lut" not in moe:

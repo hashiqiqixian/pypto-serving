@@ -48,6 +48,7 @@ from .weight_loader import (
     RankPlacement,
     ResidentDecodeWeights,
     ResidentFullDecodeWeights,
+    RowAddressedCheckpoint,
     V41ExecutionPlan,
     V41WeightLoader,
     iter_decode_weight_slices,
@@ -577,11 +578,11 @@ class CompositeBindings:
             raise ValueError("V4.1 serving currently targets TP1/DP8/EP8")
 
 
-def load_composite_bindings(model_dir=None, max_seq_len=None) -> CompositeBindings:
+def load_composite_bindings(model_dir=None, max_seq_len=None, tokenizer=None) -> CompositeBindings:
     """Resolve the model-specific contract without opening a device."""
     if model_dir is None or max_seq_len is None:
         raise ValueError("V4.1 composite bindings require a model directory and context length")
-    return make_production_bindings(model_dir, max_seq_len)
+    return make_production_bindings(model_dir, max_seq_len, tokenizer=tokenizer)
 
 
 # decode_padding
@@ -2923,11 +2924,15 @@ class V41ResidentResources:
     def reset_request(self, owner):
         self._step = self._inputs = self._group_counts = self._output_rows = None
         self.cache.reset_request(owner)
+        if getattr(self, "engram", None) is not None:
+            self.engram.history.pop(owner, None)
 
     def close(self):
         if self.closed:
             return
         self._step = self._inputs = self._group_counts = self._output_rows = None
+        if getattr(self, "engram", None) is not None:
+            self.engram.history.clear()
         try:
             if self._prefill_fwd is not None:
                 self._prefill_fwd.close()
@@ -3012,7 +3017,7 @@ def _check_runtime_binaries(platform):
         builder.get_binaries(runtime)
 
 
-def make_production_bindings(model_dir, max_seq_len, *, engram_lookup_fn=None):
+def make_production_bindings(model_dir, max_seq_len, *, tokenizer=None, engram_lookup_fn=None):
     model_dir = Path(model_dir).resolve()
     raw = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     layers = plan_layers(raw)
@@ -3046,6 +3051,20 @@ def make_production_bindings(model_dir, max_seq_len, *, engram_lookup_fn=None):
             compiler, root, topology)
         final, final_names = compile_final_output(compiler, root, topology)
         abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
+        engram = None
+        if getattr(abi, "ENGRAM_K", None) is not None:
+            if tokenizer is None:
+                raise MissingCompositeInterface(
+                    "V4.1 Engram-enabled lib requires the serving tokenizer")
+            engram_module = importlib.import_module("models.deepseek_v4_1_flash.engram")
+            engram_loader = V41WeightLoader(
+                model_dir, tp_size=topology.tp, tp_rank=0,
+                ep_size=topology.world, ep_rank=0, max_load_bytes=512 << 20,
+            )
+            tokenizer_impl = getattr(tokenizer, "tokenizer", tokenizer)
+            engram = engram_module.HostEngram(
+                RowAddressedCheckpoint(engram_loader.store), tokenizer_impl)
+            engram_lookup_fn = engram.lookup
         kv_sources, index_sources, c2a_sources = _sources(layers)
         layout = DecodeWeightLayout.from_lib(abi)
         if (layout.layers, layout.kv_sources, layout.index_sources,
@@ -3117,6 +3136,7 @@ def make_production_bindings(model_dir, max_seq_len, *, engram_lookup_fn=None):
             final_host=final_host, final_program=final, final_param_names=final_names,
             topology=topology, prefill_program=prefill, prefill_param_names=prefill_names,
         )
+        resident.engram = engram
         _LOG.info("V4.1 resident upload and allocation %.2fs",
                   time.perf_counter() - resident_started)
         try:
