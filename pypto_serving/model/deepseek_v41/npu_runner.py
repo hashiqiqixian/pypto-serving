@@ -2257,13 +2257,13 @@ def make_production_bindings(model_dir, max_seq_len, *, dp_size=8):
             bank = DecodeWeightBank(layout)
             append_seconds = 0.0
             layer_started = time.perf_counter()
-            parallel_experts = topology.dp == 4
+            parallel_experts = topology.dp in (4, 8)
             previous_threads = torch.get_num_threads()
             if parallel_experts and previous_threads < 8:
                 torch.set_num_threads(8)
             try:
                 for item in iter_decode_weight_slices(
-                        model_dir, topology, parallel_experts=parallel_experts):
+                        model_dir, topology, parallel_experts=parallel_experts, bank=bank):
                     append_started = time.perf_counter()
                     bank.append(item)
                     append_seconds += time.perf_counter() - append_started
