@@ -644,6 +644,25 @@ def iter_decode_weight_slices(model_dir, topology, *, max_bundle_bytes=32 << 30)
             layer, attention, moe, kv_sources=kv_sources, index_sources=index_sources,
             c2a_sources=c2a_sources,
         )
+    # Engram projections are replicated on every EP rank.  The embedding
+    # tables are intentionally not loaded here; lookup rows are request data.
+    engram_layers = tuple(text.get("engram_layer_ids", ()))
+    for slot, layer_id in enumerate(engram_layers):
+        wkv = []
+        scales = []
+        for loader in loaders:
+            bundle = loader.load(f"layers.{layer_id}.engram.wkv.weight")
+            if bundle.scale is None:
+                raise ValueError("Engram WKV requires native FP8 payload and scale")
+            wkv.append(bundle.weight)
+            scales.append(bundle.scale)
+        q = loaders[0].load(f"layers.{layer_id}.engram.q_weight").weight.float()
+        k = loaders[0].load(f"layers.{layer_id}.engram.k_weight").weight.float()
+        gate = (q * k).contiguous()
+        yield DecodeWeightSlice("engram_wkv", slot, stack_bytes(wkv))
+        yield DecodeWeightSlice("engram_wkv_scale", slot, stack_bytes(scales))
+        yield DecodeWeightSlice("engram_weight", slot,
+                                gate.unsqueeze(0).expand(topology.world, -1, -1).contiguous())
     # decode_fwd reserves one key/norm slot per index source, although only KV
     # producers have these checkpoint tensors. The trailing four slots are not
     # read by the current graph; initialize them deterministically nonetheless.
@@ -672,9 +691,10 @@ _FLAT_KV = frozenset({"compressor_norm_weight"})
 _FLAT_INDEX = frozenset({"index_wk", "index_norm_weight", "index_wq_b_scale"})
 _AXIS_INDEX = frozenset({"index_wq_b", "index_weights_proj"})
 _AXIS_C2A = frozenset({"c2a_compressor_wkv", "c2a_compressor_wgate"})
+_AXIS_ENGRAM = frozenset({"engram_wkv", "engram_wkv_scale", "engram_weight"})
 _SINGLE = frozenset({"c1a_compressor_wkv", "mxfp4_pair_lut"})
 _ALL = (_FLAT_LAYER | _AXIS_LAYER | _FLAT_KV | _FLAT_INDEX |
-        _AXIS_INDEX | _AXIS_C2A | _SINGLE)
+        _AXIS_INDEX | _AXIS_C2A | _AXIS_ENGRAM | _SINGLE)
 _LAYER_ABI_ALIASES = {
     "c2a_compressor_wkv": "compressor_wkv",
     "c2a_compressor_wgate": "compressor_wgate",
@@ -735,6 +755,8 @@ class DecodeWeightLayout:
             return self.index_sources
         if name in _AXIS_C2A:
             return self.c2a_sources
+        if name in _AXIS_ENGRAM:
+            return 2
         if name in _SINGLE:
             return 1
         raise ValueError(f"unknown decode weight ABI field: {name}")

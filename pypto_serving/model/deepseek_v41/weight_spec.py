@@ -224,4 +224,17 @@ def backbone_weight_specs(config: Mapping[str, Any]) -> dict[str, TensorSpec]:
             if layer in kv_sources:
                 add(prefix + ".wk.weight", (index_dim, head_dim), "BF16")
                 add(prefix + ".k_norm.weight", (index_dim,), "BF16")
+    # Engram projection weights are shared across EP ranks. Large lookup
+    # tables are deliberately excluded; they remain row-addressed host data.
+    engram_layers = tuple(text.get("engram_layer_ids", ()))
+    if engram_layers:
+        engram_heads = positive("engram_n_heads")
+        engram_head_dim = positive("engram_head_dim")
+        engram_k = (positive("engram_max_ngram_size") - 1) * engram_heads * engram_head_dim
+        engram_out = (hc + 1) * dim
+        for layer in engram_layers:
+            prefix = f"layers.{layer}.engram"
+            dense(prefix + ".wkv", engram_out, engram_k)
+            add(prefix + ".q_weight", (hc, dim), "BF16")
+            add(prefix + ".k_weight", (hc, dim), "BF16")
     return specs

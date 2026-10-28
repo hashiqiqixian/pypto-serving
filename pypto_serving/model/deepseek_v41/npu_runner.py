@@ -1273,6 +1273,8 @@ class DecodeForwardSegment:
         "c1a_index_block_table": "c1a_index_block_table",
         "query_start_loc": "c2a_query_start_loc",
         "state_block_table": "c2a_state_block_table",
+        "engram_lookup": "engram_lookup",
+        "dspark_target_hidden": "dspark_target_hidden",
     }
 
     def __init__(self, worker, program, param_names, run_config, topology,
@@ -2221,7 +2223,8 @@ class PrefillMetadataResources:
 
     def __init__(self, topology, *, max_seq_len, max_requests, window_pages,
                  c2a_pages, c1a_pages, rope_tables, compressed_rope_tables,
-                 full_hidden_size=None):
+                 full_hidden_size=None, engram_width=None, dspark_hidden_size=None,
+                 engram_lookup_fn=None):
         if any(type(value) is not int or value <= 0 for value in
                (max_seq_len, max_requests, window_pages, c2a_pages, c1a_pages)):
             raise ValueError("prefill metadata capacities must be positive integers")
@@ -2239,6 +2242,15 @@ class PrefillMetadataResources:
         self.full_hidden_size = full_hidden_size
         if full_hidden_size is not None and (type(full_hidden_size) is not int or full_hidden_size <= 0):
             raise ValueError("full prefill hidden size must be positive")
+        for value, name in ((engram_width, "engram width"),
+                            (dspark_hidden_size, "DSpark hidden size")):
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ValueError(f"{name} must be positive")
+        self.engram_width = engram_width
+        self.dspark_hidden_size = dspark_hidden_size
+        if engram_lookup_fn is not None and not callable(engram_lookup_fn):
+            raise TypeError("Engram lookup provider must be callable")
+        self.engram_lookup_fn = engram_lookup_fn
 
         def shared(name, shape, dtype, fill=0):
             value = torch.empty(shape, dtype=dtype).share_memory_()
@@ -2293,6 +2305,14 @@ class PrefillMetadataResources:
             shared("full_token_requests", (world, 2, tokens), torch.int32, -1)
             shared("full_query_starts", (world, 2, max_requests + 1), torch.int32)
             shared("full_logit_rows", (world, 16), torch.int32, -1)
+        if engram_width is not None:
+            # Host rows are populated from the request's Engram history before
+            # dispatch. The table itself remains checkpoint-backed and lazy.
+            shared("engram_lookup", (world, 2, tokens, engram_width), torch.bfloat16)
+        if dspark_hidden_size is not None:
+            # The target hidden is an output of the complete backbone and is
+            # retained for the following DSpark drafter dispatch.
+            shared("dspark_target_hidden", (world, tokens, dspark_hidden_size), torch.bfloat16)
 
     @property
     def inherited_host_tensors(self):
@@ -2345,6 +2365,25 @@ class PrefillMetadataResources:
             else:
                 self.fields["compressed_rope_cos"].copy_(rows[0])
                 self.fields["compressed_rope_sin"].copy_(rows[1])
+        if self.engram_width is not None:
+            lookup = self.fields["engram_lookup"]
+            lookup.zero_()
+            if self.engram_lookup_fn is None:
+                raise MissingCompositeInterface(
+                    "V4.1 Engram-enabled lib requires a request lookup provider")
+            offsets = [0] * self.topology.world
+            for request in step.requests:
+                count = len(request.token_ids)
+                offset = offsets[request.partition]
+                rows = self.engram_lookup_fn(
+                    torch.tensor(request.token_ids, dtype=torch.int64), count,
+                    request.start, request.request_id)
+                if (not isinstance(rows, torch.Tensor) or rows.device.type != "cpu"
+                        or rows.dtype != torch.bfloat16
+                        or tuple(rows.shape) != (2, count, self.engram_width)):
+                    raise ValueError("Engram lookup provider returned an invalid host shape")
+                lookup[request.partition, :, offset:offset + count].copy_(rows)
+                offsets[request.partition] += count
         return swa.group_counts
 
     def stage_full(self, step, embeddings):
@@ -2409,6 +2448,9 @@ class PrefillMetadataResources:
             "c1a_compressed_slots": "c1a_compressed_slots",
             "state_block_table": "c2a_state_block_table",
         }
+        for name in ("engram_lookup", "dspark_target_hidden"):
+            if name in f:
+                names[name] = name
         return {name: f[source] for name, source in names.items()}
 
     def arguments(self, mode):
@@ -2970,7 +3012,7 @@ def _check_runtime_binaries(platform):
         builder.get_binaries(runtime)
 
 
-def make_production_bindings(model_dir, max_seq_len):
+def make_production_bindings(model_dir, max_seq_len, *, engram_lookup_fn=None):
     model_dir = Path(model_dir).resolve()
     raw = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     layers = plan_layers(raw)
@@ -3055,6 +3097,9 @@ def make_production_bindings(model_dir, max_seq_len):
             c1a_pages=cache_plan.physical_group_blocks[family.c1a],
             rope_tables=swa_tables,
             compressed_rope_tables=compressed_tables,
+            engram_width=getattr(abi, "ENGRAM_K", None),
+            dspark_hidden_size=getattr(abi, "DSPARK_MAIN_IN", None),
+            engram_lookup_fn=engram_lookup_fn,
         )
         decode_host = PrefillMetadataResources(topology, **host_kwargs)
         input_host = make_input_host_resources(topology, plan.weights.config.hidden_size)
