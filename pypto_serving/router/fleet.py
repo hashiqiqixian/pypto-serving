@@ -155,6 +155,10 @@ class FleetManager:
         # shutting down -- a replacement must not outlive stop_all().
         self._restarts: dict[str, _Restarts] = {}
         self._replacing: dict[str, bool] = {}
+        # Slots whose launch command is in flight. Written before the launch,
+        # so there is no instant in which a process can exist without a list
+        # naming it: _owned only gains the replica once the launch has returned.
+        self._launching: dict[str, Slot] = {}
         # The task running each replacement, so stop_all() can wait for it.
         # _owned cannot stand in for this: a replacement between its stop and
         # its launch has already been removed from it.
@@ -178,7 +182,9 @@ class FleetManager:
             "unconfirmed": {
                 name: held.reason for name, held in sorted(self._unconfirmed.items())
             },
-            # Being refilled right now, and given up on after too many tries.
+            # Launch command in flight, being refilled right now, and given up
+            # on after too many tries.
+            "launching": sorted(self._launching),
             "replacing": sorted(self._replacing),
             "abandoned": sorted(
                 name for name, record in self._restarts.items() if record.given_up
@@ -202,9 +208,24 @@ class FleetManager:
 
     async def _launch_on(self, slot: Slot) -> ReplicaSpec:
         """Start a replica on a slot that is already reserved."""
-        launched = await self._pool.launch(slot)  # releases the slot if it fails
+        self._launching[slot.name] = slot
+        try:
+            launched = await self._pool.launch(slot)  # releases the slot if it fails
+        except asyncio.CancelledError:
+            # The entry deliberately stays. launch() has already handed the slot
+            # back, but the process it was starting may exist, and the sweep in
+            # stop_all is now the only thing that knows the slot at all. Take it
+            # again so nothing is told the devices are free in the meantime.
+            self._pool.reserve(slot.name)
+            raise
+        except Exception:
+            self._launching.pop(slot.name, None)
+            raise
         self._adopt_instance(slot, launched.spec, ready=False)
         self._write_state()
+        # Nothing awaits between the launch returning and _owned gaining the
+        # replica, so dropping the entry here cannot reopen the window.
+        self._launching.pop(slot.name, None)
         return launched.spec
 
     def _adopt_instance(self, slot: Slot, spec: ReplicaSpec, *, ready: bool) -> _Instance:
@@ -497,6 +518,11 @@ class FleetManager:
                 await self._drain(name)
             state = self._registry.remove(name)
             spec = state.spec if state is not None else instance.spec
+            # None is "the stop matched no process", which for a replica that
+            # has already died is the truthful answer and not a failure. Paired
+            # with the silence _wait_gone checks for, it is as good as a kill:
+            # treating it as unknown would strand the slot of every replica that
+            # crashed outright -- and refilling those is what this is for.
             signalled = await self._pool.signal_stop(instance.slot)
             # Only now is the device really free. Releasing the slot on the
             # signal alone would let the next launch bind a port the old replica
@@ -506,7 +532,7 @@ class FleetManager:
             self._registry.remove(name)
             logger.exception("retiring replica %s failed", name)
             signalled = gone = False
-        return self._finish_retirement(instance, signalled=signalled, gone=gone)
+        return self._finish_retirement(instance, signalled=signalled is not False, gone=gone)
 
     def _finish_retirement(self, instance: _Instance, *, signalled: bool, gone: bool) -> bool:
         name = instance.name
@@ -625,6 +651,31 @@ class FleetManager:
         if pending:
             logger.info("waiting for %d replacement(s) still in flight", len(pending))
             await asyncio.gather(*pending, return_exceptions=True)
+        # Last resort, and normally empty: a launch whose task did not come back
+        # to tidy up after itself. The slot is named here but in no instance, so
+        # the loop above could not have stopped it.
+        await self._sweep_launching()
+
+    async def _sweep_launching(self) -> None:
+        """Stop whatever is on a slot whose launch never finished.
+
+        The process may not exist -- the launch command may not have got that
+        far -- and that is the case worth getting right: the default stop is
+        pkill matching on the command line, which finds a replica from the
+        instant it execs rather than from the moment it binds its port. So
+        "matched nothing" here means nothing is running, and the slot is free
+        rather than in an unknown state.
+        """
+        for name, slot in list(self._launching.items()):
+            self._launching.pop(name, None)
+            logger.warning("slot %s was still launching at shutdown; stopping it", name)
+            signalled = await self._pool.signal_stop(slot)
+            gone = await self._wait_gone(slot.replica_spec())
+            if signalled is not False and gone:
+                self._pool.release(name)
+            else:
+                self._unconfirmed[name] = _Reserved(slot, STOP_UNCONFIRMED)
+            self._write_state()
 
     # --- crash recovery ---------------------------------------------------
 

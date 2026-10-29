@@ -545,7 +545,7 @@ def test_get_replicas_reports_the_fleet_and_what_is_left():
     assert payload["replicas"][0]["owned"] is True
     assert payload["capacity"] == {
         "owned": 1, "ceiling": 3, "free_slots": ["node02-d0", "node02-d1"],
-        "unconfirmed": {}, "replacing": [], "abandoned": [],
+        "unconfirmed": {}, "launching": [], "replacing": [], "abandoned": [],
     }
 
 

@@ -20,12 +20,14 @@ when the router decides a replica is dead, and what it does about it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 
 import pytest
 
 from pypto_serving.router.config import RouterConfig
 from pypto_serving.router.fleet import MAX_RESTARTS
+from pypto_serving.router.launcher import LaunchError
 from tests.unit.router.test_launcher import (
     _AdminRequest,
     _fleet,
@@ -443,3 +445,76 @@ def test_probes_do_not_share_the_proxy_connection_pool():
     assert len(built) == 2, "the probe pool has to be a second client, not the proxy's"
     assert router.probe_client is not router.client
     assert router.health._client is router.probe_client
+
+
+# --- a stop that finds nothing to kill ---
+
+class _StopFinds(_FakeTransport):
+    """A stop command that reports an outcome instead of killing anything.
+
+    ``exit_code=1`` is pkill's "no process matched"; ``None`` is a command that
+    could not be run at all, which is a different answer.
+    """
+
+    def __init__(self, exit_code: int | None) -> None:
+        super().__init__()
+        self._exit_code = exit_code
+
+    async def run(self, host, argv, env, *, detach=False, log_path=None):
+        await super().run(host, argv, env, detach=detach, log_path=log_path)
+        if any("pkill" in arg for arg in argv):
+            raise LaunchError("stop reported no match", exit_code=self._exit_code)
+
+
+def test_a_stop_that_matches_no_process_still_frees_the_slot():
+    """A replica that crashed outright is not there for pkill to kill.
+
+    pkill matches on the command line, so it finds a replica from the instant
+    it execs rather than from the moment it binds a port: nothing matched
+    therefore means nothing is running. Reading it as an unknown state strands
+    the devices of every replica that died completely -- which is precisely the
+    case the replacement path exists to handle.
+    """
+    async def scenario(exit_code):
+        fleet, _registry, _ = _fleet(transport=_StopFinds(exit_code))
+        spec = await fleet.launch_one()
+        return await fleet.stop(spec.name), fleet.capacity()
+
+    stopped, capacity = asyncio.run(scenario(1))
+    assert stopped is True
+    assert capacity["unconfirmed"] == {}
+    assert "local-d0" in capacity["free_slots"], "the slot was stranded"
+
+    stopped, capacity = asyncio.run(scenario(None))
+    assert stopped is False, "a stop command that could not run says nothing"
+    assert "local-d0" in capacity["unconfirmed"]
+
+
+def test_a_launch_cancelled_in_flight_is_stopped_at_shutdown():
+    """The launch records the slot before starting anything.
+
+    Cancellation inside the launch is the one path that reaches neither the
+    post-launch check nor _owned, so without the record the shutdown has
+    nothing left to name the slot by -- and HostPool.launch has already
+    reported it free.
+    """
+    async def scenario():
+        transport = _HoldsALaunch(hold=1)
+        fleet, _registry, _ = _fleet(transport=transport)
+        launching = asyncio.create_task(fleet.launch_one())
+        assert await _until(transport.inside.is_set), "the launch never started"
+        launching.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await launching
+        orphaned = fleet.owned_names == () and fleet.capacity()["launching"] == ["local-d0"]
+        free_meanwhile = [s for s in fleet.capacity()["free_slots"] if s == "local-d0"]
+
+        await fleet.stop_all()
+        return orphaned, free_meanwhile, _launches(transport), _stops(transport), fleet.capacity()
+
+    orphaned, free_meanwhile, launches, stops, capacity = asyncio.run(scenario())
+    assert orphaned, "the cancelled launch left no record of its slot"
+    assert free_meanwhile == [], "the slot was advertised free with a process possibly on it"
+    assert launches == 1
+    assert stops == 1, "shutdown left the launched process alone"
+    assert "local-d0" in capacity["free_slots"], "the slot never came back"
