@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from threading import Condition
 
 import torch
 
@@ -506,6 +507,72 @@ def _load_routed_projection(loader, layer_id, rank, ep_size, name):
                 merge_expert_scales([b.scale for b in bundles]), held_bytes)
 
 
+class _ByteBudget:
+    """Bound temporary bytes held by concurrently loading projections."""
+
+    def __init__(self, capacity):
+        if type(capacity) is not int or capacity <= 0:
+            raise ValueError("byte budget must be positive")
+        self.capacity = capacity
+        self._used = 0
+        self._condition = Condition()
+
+    def acquire(self, amount):
+        if type(amount) is not int or amount <= 0:
+            raise ValueError("reserved bytes must be positive")
+        if amount > self.capacity:
+            raise ValueError(
+                f"routed projection requires {amount} bytes; budget={self.capacity}")
+        with self._condition:
+            while self._used + amount > self.capacity:
+                self._condition.wait()
+            self._used += amount
+
+    def release(self, amount):
+        if type(amount) is not int or amount <= 0:
+            raise ValueError("released bytes must be positive")
+        with self._condition:
+            if amount > self._used:
+                raise ValueError("released bytes exceed reserved budget")
+            self._used -= amount
+            self._condition.notify_all()
+
+
+def peak_rss_bytes():
+    """Return the process high-water RSS where procfs exposes it."""
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _routed_projection_reservation(loader, layer_id, rank, ep_size, name):
+    """Estimate the raw, packed and scale buffers held by one projection task."""
+    count = loader.text["n_routed_experts"] // ep_size
+    source_bytes = 0
+    for expert in range(rank * count, (rank + 1) * count):
+        weight_name = f"layers.{layer_id}.ffn.experts.{expert}.{name}.weight"
+        ranges = loader._ranges(weight_name)
+        spec = loader.specs[weight_name]
+        source_bytes += math.prod(part.stop - part.start for part in ranges) * _BYTES[spec.dtype]
+        if spec.dtype in ("F8_E4M3", "I8"):
+            n_part, k_part = ranges
+            divisor = 16 if spec.dtype == "I8" else 32
+            scale_name = weight_name.removesuffix(".weight") + ".scale"
+            scale_ranges = (
+                n_part if spec.dtype == "I8" else slice(n_part.start // 32, n_part.stop // 32),
+                slice(k_part.start // divisor, k_part.stop // divisor),
+            )
+            scale_spec = loader.specs[scale_name]
+            source_bytes += math.prod(part.stop - part.start for part in scale_ranges) * _BYTES[scale_spec.dtype]
+    # Match the existing conservative layer check: source bundles plus packed
+    # weight and merged scale can be live at the same time in one task.
+    return max(1, 3 * source_bytes)
+
+
 def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_only,
                         include_moe=True, loaders=None, parallel_experts=False):
     if type(max_bundle_bytes) is not int or max_bundle_bytes <= 0:
@@ -513,6 +580,7 @@ def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_
     attention, moe = [], []
     shared_bundles = {}
     held_bytes = 0
+    routed_retained_bytes = 0
     if loaders is None:
         loaders = tuple(V41WeightLoader(
             model_dir, tp_size=topology.tp, tp_rank=rank % topology.tp,
@@ -536,11 +604,23 @@ def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_
     routed = None
     if parallel_experts:
         routed = [({}, 0) for _ in range(topology.world)]
-        jobs = ((loaders[rank], layer_id, rank, topology.world, name)
-                for rank in range(topology.world) for name in ("w1", "w2", "w3"))
+        jobs = tuple((loaders[rank], layer_id, rank, topology.world, name,
+                      _routed_projection_reservation(
+                          loaders[rank], layer_id, rank, topology.world, name))
+                     for rank in range(topology.world) for name in ("w1", "w2", "w3"))
+        budget = _ByteBudget(max_bundle_bytes)
+        routed_retained_bytes = sum(job[-1] // 3 for job in jobs)
+
+        def load_routed(job):
+            loader, selected_layer, rank, ep_size, name, reservation = job
+            budget.acquire(reservation)
+            try:
+                return _load_routed_projection(loader, selected_layer, rank, ep_size, name)
+            finally:
+                budget.release(reservation)
+
         with ThreadPoolExecutor(max_workers=min(8, topology.world * 3)) as executor:
-            for rank, name, weight, scale, held in executor.map(
-                    lambda args: _load_routed_projection(*args), jobs):
+            for rank, name, weight, scale, held in executor.map(load_routed, jobs):
                 fields, prior = routed[rank]
                 fields["routed_" + name] = weight
                 fields["routed_" + name + "_scale"] = scale
@@ -560,6 +640,8 @@ def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_
                 held_bytes += sum(t.numel() * t.element_size() for t in (bundle.weight, bundle.scale)
                                   if t is not None)
                 if 3 * held_bytes > max_bundle_bytes:
+                    raise ValueError("stacked layer weight budget exceeded")
+                if routed_retained_bytes + 3 * held_bytes > max_bundle_bytes:
                     raise ValueError("stacked layer weight budget exceeded")
                 return bundle
 
