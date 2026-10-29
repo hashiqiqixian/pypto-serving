@@ -547,3 +547,55 @@ def test_the_upstream_client_states_its_pool_limits_and_its_pool_timeout():
         assert config.max_connections != 100, "100 is the default we are replacing"
     finally:
         asyncio.run(client.aclose())
+
+
+# --- a replacement whose launch command fails ---
+
+class _LaunchRefused(_FakeTransport):
+    """Lets the first launch through, then refuses the next ``refuse`` of them."""
+
+    def __init__(self, refuse: int) -> None:
+        super().__init__()
+        self._refuse = refuse
+        self._launches = 0
+
+    async def run(self, host, argv, env, *, detach=False, log_path=None):
+        if detach:
+            self._launches += 1
+            if 1 < self._launches <= 1 + self._refuse:
+                raise LaunchError("launch refused", exit_code=1)
+        await super().run(host, argv, env, detach=detach, log_path=log_path)
+
+
+def test_a_replacement_whose_launch_command_fails_is_retried():
+    """A launch that never ran is the transient the backoff exists for.
+
+    Stopping at the first failure leaves the slot free, the fleet one replica
+    short and nothing watching it, well before the restart limit it documents.
+    A launch that succeeds and never reports ready is deliberately not retried
+    -- that is the launch timeout's job, and it means a bad configuration.
+    """
+    async def scenario(refuse, done):
+        fleet, registry, transport = _fleet(transport=_LaunchRefused(refuse), replace_after=0.05)
+        spec = await fleet.launch_one()
+        await _promote(registry, fleet, spec.name)
+        await _die(registry, spec.name)
+        # Waiting on "replacing is empty" would pass before the replacement has
+        # even begun; each case waits for its own end state instead.
+        reached = await _until(lambda: done(fleet, transport), timeout=5.0)
+        return reached, fleet.owned_names, fleet.capacity(), _launches(transport)
+
+    reached, owned, capacity, _ = asyncio.run(
+        scenario(MAX_RESTARTS - 1, lambda fleet, transport: _launches(transport) == 2)
+    )
+    assert reached, "the replacement gave up on a transient launch failure"
+    assert owned == ("local-d0",)
+    assert capacity["abandoned"] == []
+
+    reached, owned, capacity, launches = asyncio.run(
+        scenario(MAX_RESTARTS, lambda fleet, _t: fleet.capacity()["abandoned"] == ["local-d0"])
+    )
+    assert reached, "every attempt failed and the slot was never reported"
+    assert owned == (), "nothing should be running after every attempt failed"
+    assert launches == 1, "no replacement ever started, so none should be recorded"
+    assert "local-d0" in capacity["free_slots"], "the slot stays usable once it is fixed"

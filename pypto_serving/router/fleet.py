@@ -375,33 +375,48 @@ class FleetManager:
                 # human has to free it. Launching onto it could put a second
                 # process on cards the first may still hold.
                 return
-            if self._closing or not self._replacing.get(name):
-                return
-            record = self._restarts.setdefault(name, _Restarts())
-            record.count += 1
-            if record.count > MAX_RESTARTS:
-                record.given_up = True
-                logger.error(
-                    "slot %s has lost %d replicas in a row; not launching another. The slot "
-                    "is free, so POST /replicas or a restart will use it again once whatever "
-                    "is wrong with it is fixed; %s holds the last one's output",
-                    name, MAX_RESTARTS, instance.slot.log_path,
-                )
-                return
-            slot = self._pool.reserve(name)
-            if slot is None:
-                logger.warning(
-                    "slot %s was taken while its replacement was being prepared", name
-                )
-                return
-            # Reserved before the wait, so the slot is honestly accounted for --
-            # out of free_slots and reported as replacing -- rather than looking
-            # available to a concurrent launch for the whole backoff.
-            await self._wait_backoff(self._backoff(record.count))
-            if self._closing or not self._replacing.get(name):
-                self._pool.release(name)
-                return
-            spec = await self._launch_on(slot)
+            while True:
+                if self._closing or not self._replacing.get(name):
+                    return
+                record = self._restarts.setdefault(name, _Restarts())
+                record.count += 1
+                if record.count > MAX_RESTARTS:
+                    record.given_up = True
+                    logger.error(
+                        "slot %s has lost %d replicas in a row; not launching another. The slot "
+                        "is free, so POST /replicas or a restart will use it again once whatever "
+                        "is wrong with it is fixed; %s holds the last one's output",
+                        name, MAX_RESTARTS, instance.slot.log_path,
+                    )
+                    return
+                slot = self._pool.reserve(name)
+                if slot is None:
+                    logger.warning(
+                        "slot %s was taken while its replacement was being prepared", name
+                    )
+                    return
+                # Reserved before the wait, so the slot is honestly accounted
+                # for -- out of free_slots and reported as replacing -- rather
+                # than looking available to a concurrent launch for the whole
+                # backoff.
+                await self._wait_backoff(self._backoff(record.count))
+                if self._closing or not self._replacing.get(name):
+                    self._pool.release(name)
+                    return
+                try:
+                    spec = await self._launch_on(slot)
+                except Exception:  # noqa: BLE001 - the next attempt is the answer
+                    # The launch command itself failed, so nothing was started
+                    # and HostPool.launch has already handed the slot back.
+                    # This is exactly the transient the per-slot counter and
+                    # backoff exist for; giving up here leaves the fleet short
+                    # with nothing watching the slot, well before the documented
+                    # limit. A launch that succeeds and never reports ready is a
+                    # different case and stays unretried: that is phase (i)'s
+                    # job, and relaunching a bad checkpoint is a crash loop.
+                    logger.exception("launching a replacement for %s failed", name)
+                    continue
+                break
             if self._closing or not self._replacing.get(name):
                 # Both can arrive while the launch is in flight, and neither
                 # can be seen from outside: stop_all() snapshots _owned before
