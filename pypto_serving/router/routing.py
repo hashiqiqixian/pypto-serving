@@ -46,6 +46,25 @@ UNHEALTHY_THRESHOLD = 2
 DEFAULT_MAX_SESSIONS = 100_000
 
 
+def is_router_side_failure(exc: BaseException) -> bool:
+    """Did the request fail inside the router rather than at the replica?
+
+    httpx raises PoolTimeout when *our* connection pool has no free slot, which
+    happens when the router is busy and says nothing about the replica at the
+    other end. Every other transport error -- refused, reset, read timeout --
+    is evidence about the replica and is meant to count.
+
+    The distinction matters because a demotion is no longer only a pause in
+    rotation: a replica that stays unroutable long enough is now stopped and
+    replaced, at the price of a model load. Router congestion must not buy that.
+    """
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover - the router cannot run without it
+        return False
+    return isinstance(exc, httpx.PoolTimeout)
+
+
 class NoReplicaAvailable(RuntimeError):
     """Raised when every replica in the table is unroutable."""
 
@@ -385,6 +404,16 @@ class HealthMonitor:
             )
             healthy = response.status_code == 200
         except Exception as exc:  # noqa: BLE001 - refused and timeout both mean unroutable
+            if is_router_side_failure(exc):
+                # The probe never left the router, so this cycle saw nothing.
+                # Leaving failures and readiness untouched keeps a busy router
+                # from demoting -- and, with replacement on, reloading -- a
+                # fleet of replicas that are all perfectly healthy.
+                logger.warning(
+                    "health probe of %s could not be sent: %s; leaving its state alone",
+                    state.name, exc,
+                )
+                return
             logger.debug("health probe of %s failed: %s", state.name, exc)
 
         if healthy:

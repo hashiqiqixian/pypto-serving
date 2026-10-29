@@ -40,12 +40,25 @@ from pypto_serving.router.config import (
 from pypto_serving.router.fleet import FleetManager, PoolExhausted
 from pypto_serving.router.launcher import LaunchError
 from pypto_serving.router.proxy import SESSION_HEADER, ReplicaProxy
-from pypto_serving.router.routing import HealthMonitor, ReplicaRegistry, SessionDirectory
+from pypto_serving.router.routing import (
+    HealthMonitor,
+    ReplicaRegistry,
+    SessionDirectory,
+    is_router_side_failure,
+)
 
 logger = logging.getLogger(__name__)
 
 # Preferred over --admin-token: argv is world-readable on the router host.
 ADMIN_TOKEN_ENV = "PYPTO_ROUTER_ADMIN_TOKEN"
+
+
+class ProbeNotSent(RuntimeError):
+    """A probe that failed in the router, before it could reach the replica.
+
+    Separate from a silent endpoint on purpose: silence is evidence about the
+    replica, this is evidence about us.
+    """
 
 try:
     from fastapi import FastAPI, Request
@@ -82,8 +95,15 @@ class ServingRouter:
         self.sessions = SessionDirectory(config.session_ttl_seconds)
         self.registry = ReplicaRegistry(config, self.sessions)
         self.client = client_factory(config)
+        # A second client, so probes have a connection pool of their own. They
+        # share the proxy's otherwise, and a coding agent's long streams can
+        # hold every slot in it: the probes then fail for want of a connection
+        # and the fleet reads that as replicas dying. One pool makes router
+        # congestion indistinguishable from a dead backend, for every replica
+        # at once, because the pool is what they have in common.
+        self.probe_client = client_factory(config)
         self.proxy = ReplicaProxy(self.registry, self.client)
-        self.health = HealthMonitor(config, self.registry, self.sessions, self.client)
+        self.health = HealthMonitor(config, self.registry, self.sessions, self.probe_client)
         self._admin_token = admin_token
         fleet_kwargs = {
             "state_path": state_path,
@@ -136,23 +156,36 @@ class ServingRouter:
         finally:
             await self.fleet.stop_all()
             await self.health.stop()
-            close = getattr(self.client, "aclose", None)
-            if close is not None:
-                await close()
+            for client in (self.client, self.probe_client):
+                close = getattr(client, "aclose", None)
+                if close is not None:
+                    await close()
 
     async def _health_status(self, spec) -> int | None:
-        """The replica's /health status, or None if nothing answered."""
+        """The replica's /health status, or None if nothing answered.
+
+        Raises ProbeNotSent when the request never left the router, which is a
+        third answer: not "200", not "silent", but "we did not get to ask".
+        """
         try:
-            response = await self.client.get(
+            response = await self.probe_client.get(
                 f"{spec.base_url}/health", timeout=self.config.connect_timeout_seconds
             )
-        except Exception:  # noqa: BLE001 - unreachable is the answer, not an error
+        except Exception as exc:  # noqa: BLE001 - unreachable is the answer, not an error
+            if is_router_side_failure(exc):
+                raise ProbeNotSent(str(exc)) from exc
             return None
         return response.status_code
 
     async def _probe_replica(self, spec) -> bool:
         """Is a replica *serving* at this address? Readiness, so 200 only."""
-        return (await self._health_status(spec)) == 200
+        try:
+            return (await self._health_status(spec)) == 200
+        except ProbeNotSent:
+            # Not ready, because we cannot say it is. This probe decides
+            # whether to adopt or to keep waiting, and both are recoverable --
+            # unlike the liveness answer below, which frees devices.
+            return False
 
     async def _endpoint_answers(self, spec) -> bool:
         """Is *anything* still answering at this address? Any status counts.
@@ -163,7 +196,14 @@ class ServingRouter:
         Reading that as readiness is correct; reading it as an exit is how those
         devices get handed to the next launch.
         """
-        return (await self._health_status(spec)) is not None
+        try:
+            return (await self._health_status(spec)) is not None
+        except ProbeNotSent:
+            # Our own pool, not the replica's silence. The caller treats False
+            # as "the process is gone" and relaunches onto its cards, so a
+            # router that is merely busy would put a second serving process on
+            # a device group the first one still holds. Assume it is there.
+            return True
 
     def _authorized(self, request: Request) -> bool:
         if self._admin_token is None:

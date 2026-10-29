@@ -22,11 +22,15 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
+from pypto_serving.router.config import RouterConfig
 from pypto_serving.router.fleet import MAX_RESTARTS
 from tests.unit.router.test_launcher import (
     _AdminRequest,
     _fleet,
     _FakeTransport,
+    _hosts,
     _router_with_pool,
 )
 
@@ -378,3 +382,64 @@ def test_shutdown_waits_for_a_replacement_that_is_still_launching():
     assert owned == ()
     assert launches == 2
     assert stops == launches, "the router exited leaving a process it had started"
+
+
+# --- what must not be mistaken for a dead replica ---
+
+
+def test_a_full_connection_pool_is_not_an_exited_process():
+    """The liveness probe decides whether a slot's devices are free.
+
+    httpx raises PoolTimeout when the *router* has no free connection, which a
+    coding agent's long streams can cause on a perfectly healthy fleet. Reading
+    it as silence relaunches onto cards the old process still holds.
+    """
+    httpx = pytest.importorskip("httpx")
+    router, _transport = _router_with_pool()
+    slot = router.fleet.pool.free_slots()[0]
+
+    class _Client:
+        def __init__(self, failure) -> None:
+            self.failure = failure
+
+        async def get(self, url, timeout=None):
+            raise self.failure
+
+    router.probe_client = _Client(httpx.PoolTimeout("no free connection"))
+    assert asyncio.run(router._endpoint_answers(slot.replica_spec())) is True
+
+    router.probe_client = _Client(httpx.ConnectError("connection refused"))
+    assert asyncio.run(router._endpoint_answers(slot.replica_spec())) is False, (
+        "a refused connection is still evidence the endpoint is gone"
+    )
+
+
+def test_probes_do_not_share_the_proxy_connection_pool():
+    """Two clients, so proxied traffic cannot starve the probes.
+
+    With one pool the two are the same resource, and saturating it looks
+    exactly like every replica dying at the same moment.
+    """
+    from pypto_serving.router.app import ServingRouter
+
+    built = []
+
+    class _Client:
+        async def get(self, url, timeout=None):
+            raise AssertionError("no upstream in this test")
+
+        async def aclose(self):
+            pass
+
+    def factory(_config):
+        built.append(_Client())
+        return built[-1]
+
+    router = ServingRouter(
+        RouterConfig(hosts=_hosts(), initial_replicas=0, health_interval_seconds=0.01),
+        client_factory=factory,
+        transport_factory=lambda _host: _FakeTransport(),
+    )
+    assert len(built) == 2, "the probe pool has to be a second client, not the proxy's"
+    assert router.probe_client is not router.client
+    assert router.health._client is router.probe_client
