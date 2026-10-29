@@ -155,6 +155,10 @@ class FleetManager:
         # shutting down -- a replacement must not outlive stop_all().
         self._restarts: dict[str, _Restarts] = {}
         self._replacing: dict[str, bool] = {}
+        # The task running each replacement, so stop_all() can wait for it.
+        # _owned cannot stand in for this: a replacement between its stop and
+        # its launch has already been removed from it.
+        self._replacements: dict[str, asyncio.Task] = {}
         self._closing = False
 
     @property
@@ -341,6 +345,9 @@ class FleetManager:
         """
         name = instance.name
         self._replacing[name] = True
+        task = asyncio.current_task()
+        if task is not None:
+            self._replacements[name] = task
         try:
             if not await self.stop(name, drain=True):
                 # The stop could not be confirmed, so the slot is reserved and a
@@ -369,7 +376,7 @@ class FleetManager:
             # Reserved before the wait, so the slot is honestly accounted for --
             # out of free_slots and reported as replacing -- rather than looking
             # available to a concurrent launch for the whole backoff.
-            await asyncio.sleep(self._backoff(record.count))
+            await self._wait_backoff(self._backoff(record.count))
             if self._closing or not self._replacing.get(name):
                 self._pool.release(name)
                 return
@@ -390,9 +397,23 @@ class FleetManager:
             logger.exception("replacing replica %s failed", name)
         finally:
             self._replacing.pop(name, None)
+            self._replacements.pop(name, None)
 
     def _backoff(self, attempt: int) -> float:
         return min(RESTART_BACKOFF_CAP_SECONDS, self._restart_backoff * 2 ** (attempt - 1))
+
+    async def _wait_backoff(self, seconds: float) -> None:
+        """Sleep out the backoff, but come back early once we are shutting down.
+
+        stop_all() waits for a replacement in flight rather than cancelling it,
+        so an uninterruptible sleep here would hold the whole shutdown open for
+        as long as the cap allows -- five minutes at the top of the curve.
+        """
+        step = max(0.05, min(0.25, seconds))
+        waited = 0.0
+        while waited < seconds and not self._closing:
+            await asyncio.sleep(step)
+            waited += step
 
     def cancel_replacement(self, name: str) -> bool:
         """Call off a replacement that has not launched yet.
@@ -591,11 +612,19 @@ class FleetManager:
         # no longer in _owned, so the snapshot below cannot see it and the
         # lifespan would exit leaving a fresh process holding a card.
         self._closing = True
+        # Waited for, not cancelled. HostPool.launch hands the slot back on
+        # CancelledError, so a replacement cancelled inside its launch leaves
+        # the process it had just spawned with its slot reported free and
+        # nothing owning it -- the exact leak _closing was added to prevent.
+        # Left to run, each one sees _closing and retires whatever it started.
+        pending = [task for task in self._replacements.values() if not task.done()]
         names = list(self._owned)
-        if not names:
-            return
-        logger.info("stopping %d replica(s) this router launched", len(names))
-        await asyncio.gather(*(self.stop(name) for name in names), return_exceptions=True)
+        if names:
+            logger.info("stopping %d replica(s) this router launched", len(names))
+            await asyncio.gather(*(self.stop(name) for name in names), return_exceptions=True)
+        if pending:
+            logger.info("waiting for %d replacement(s) still in flight", len(pending))
+            await asyncio.gather(*pending, return_exceptions=True)
 
     # --- crash recovery ---------------------------------------------------
 

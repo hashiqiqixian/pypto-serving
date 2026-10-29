@@ -323,3 +323,58 @@ def test_the_backoff_grows_and_is_capped():
     assert delays[:3] == [10.0, 20.0, 40.0]
     assert delays == sorted(delays), "the backoff has to grow"
     assert max(delays) <= 300.0, "and stop growing"
+
+
+# --- a replacement that is still launching ---
+
+class _HoldsALaunch(_FakeTransport):
+    """Records a launch, then stays inside run() until it is released.
+
+    The window a real launch has and a fake one normally does not: the process
+    is already spawned, and the call that spawned it has not returned yet.
+    """
+
+    def __init__(self, hold: int) -> None:
+        super().__init__()
+        self._hold = hold
+        self._launched = 0
+        self.inside = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self, host, argv, env, *, detach=False, log_path=None):
+        await super().run(host, argv, env, detach=detach, log_path=log_path)
+        if any("pypto_serving.cli" in arg for arg in argv):
+            self._launched += 1
+            if self._launched == self._hold:
+                self.inside.set()
+                await self.release.wait()
+
+
+def test_shutdown_waits_for_a_replacement_that_is_still_launching():
+    """A replacement mid-launch is in neither _owned nor the registry.
+
+    stop_all() snapshots _owned, so it cannot see one, and letting the loop
+    teardown cancel it is worse than waiting: HostPool.launch hands the slot
+    back on CancelledError, so the process it had just spawned would be left
+    behind with its slot reported free and nothing owning it.
+    """
+    async def scenario():
+        transport = _HoldsALaunch(hold=2)
+        fleet, registry, _ = _fleet(transport=transport, replace_after=0.05)
+        spec = await fleet.launch_one()
+        await _promote(registry, fleet, spec.name)
+        await _die(registry, spec.name)
+        assert await _until(transport.inside.is_set), "the replacement never launched"
+
+        stopping = asyncio.create_task(fleet.stop_all())
+        await asyncio.sleep(0.1)
+        still_running = not stopping.done()
+        transport.release.set()
+        await asyncio.wait_for(stopping, timeout=5.0)
+        return still_running, fleet.owned_names, _launches(transport), _stops(transport)
+
+    waited, owned, launches, stops = asyncio.run(scenario())
+    assert waited, "stop_all() returned while a replacement was still launching"
+    assert owned == ()
+    assert launches == 2
+    assert stops == launches, "the router exited leaving a process it had started"
