@@ -77,10 +77,25 @@ def default_client_factory(config: RouterConfig):
         raise ImportError("The serving router requires httpx. Install with: pip install httpx") from e
 
     # No read timeout: decode is slow by design and a token can be seconds away.
+    #
+    # pool is set explicitly because it otherwise inherits request_timeout: a
+    # request with no free connection would then wait an hour for one rather
+    # than failing, which is not a wait any client is asking for.
     timeout = httpx.Timeout(
-        config.request_timeout_seconds, connect=config.connect_timeout_seconds, read=None
+        config.request_timeout_seconds,
+        connect=config.connect_timeout_seconds,
+        read=None,
+        pool=config.connect_timeout_seconds,
     )
-    return httpx.AsyncClient(timeout=timeout, follow_redirects=False)
+    # Explicit, rather than httpx's default of 100. This is the ceiling on
+    # concurrent upstream requests, and a deployment whose clients hold long
+    # streams -- a coding agent does -- reaches it with far fewer users than
+    # the number suggests.
+    limits = httpx.Limits(
+        max_connections=config.max_connections,
+        max_keepalive_connections=config.max_keepalive_connections,
+    )
+    return httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=False)
 
 
 class ServingRouter:

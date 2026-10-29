@@ -518,3 +518,32 @@ def test_a_launch_cancelled_in_flight_is_stopped_at_shutdown():
     assert launches == 1
     assert stops == 1, "shutdown left the launched process alone"
     assert "local-d0" in capacity["free_slots"], "the slot never came back"
+
+
+def test_the_upstream_client_states_its_pool_limits_and_its_pool_timeout():
+    """Both were inherited rather than chosen, and both are load-bearing.
+
+    The connection ceiling is the ceiling on concurrent upstream requests, and
+    httpx's default of 100 is reached with far fewer clients than that once
+    they hold streams open. The pool timeout otherwise inherits
+    request_timeout, so a request with no free connection waits an hour for
+    one instead of failing.
+    """
+    httpx = pytest.importorskip("httpx")
+    from pypto_serving.router.app import default_client_factory
+
+    config = RouterConfig(
+        hosts=_hosts(), request_timeout_seconds=3600.0, connect_timeout_seconds=5.0
+    )
+    client = default_client_factory(config)
+    try:
+        assert client.timeout.pool == config.connect_timeout_seconds
+        assert client.timeout.read is None, "decode is slow by design"
+        # Private, but httpx offers no way to read the limits back, and an
+        # unverifiable claim about them is the thing worth catching.
+        pool = client._transport._pool
+        assert pool._max_connections == config.max_connections
+        assert pool._max_keepalive_connections == config.max_keepalive_connections
+        assert config.max_connections != 100, "100 is the default we are replacing"
+    finally:
+        asyncio.run(client.aclose())

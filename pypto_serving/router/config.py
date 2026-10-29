@@ -31,6 +31,12 @@ DEFAULT_HEALTH_INTERVAL_SECONDS = 5.0
 # the whole exchange instead.
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 3600.0
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
+
+# The ceiling on upstream connections the router holds at once, which is the
+# ceiling on concurrent requests. httpx defaults this to 100 and that number is
+# easy to reach with long streams, so it is stated here rather than inherited.
+DEFAULT_MAX_CONNECTIONS = 512
+DEFAULT_MAX_KEEPALIVE_CONNECTIONS = 64
 # A model load is minutes, not seconds, and the spread is wide: Qwen3-14B
 # reports ready in ~130s with a warm kernel cache, DeepSeek V4 on eight cards in
 # ~370s as measured here. Older measurements of DeepSeek on a different
@@ -180,6 +186,8 @@ class RouterConfig:
     health_interval_seconds: float = DEFAULT_HEALTH_INTERVAL_SECONDS
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
     connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS
+    max_connections: int = DEFAULT_MAX_CONNECTIONS
+    max_keepalive_connections: int = DEFAULT_MAX_KEEPALIVE_CONNECTIONS
     launch_timeout_seconds: float = DEFAULT_LAUNCH_TIMEOUT_SECONDS
     drain_timeout_seconds: float = DEFAULT_DRAIN_TIMEOUT_SECONDS
     # Zero by default: a config with only static replicas launches nothing.
@@ -258,6 +266,10 @@ class RouterConfig:
         # request timeout aborts a proxied upload rather than its response read.
         if self.request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
+        if self.max_connections < 1:
+            raise ValueError("max_connections must be at least 1")
+        if not 0 <= self.max_keepalive_connections <= self.max_connections:
+            raise ValueError("max_keepalive_connections must be between 0 and max_connections")
         if self.connect_timeout_seconds <= 0:
             raise ValueError("connect_timeout_seconds must be positive")
         if self.launch_timeout_seconds <= 0:
