@@ -3196,8 +3196,10 @@ class V41ResidentResources:
         """Run the lib-owned orchestration against resident compiled stages."""
         if not isinstance(lowered, DSparkLoweredInputs):
             raise TypeError("DSpark orchestration requires lowered serving inputs")
-        if not lowered.workspace:
-            raise MissingCompositeInterface("V4.1 DSpark workspace lowering is empty")
+        try:
+            lowered.validate(phase=phase)
+        except (TypeError, ValueError) as exc:
+            raise MissingCompositeInterface(str(exc)) from exc
         required_mappings = (
             ("draft_model", lowered.draft_model),
             ("markov_model", lowered.markov_model),

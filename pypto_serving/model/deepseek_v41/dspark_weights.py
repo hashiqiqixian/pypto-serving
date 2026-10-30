@@ -195,7 +195,9 @@ class V41DSparkPackedWeights:
         return self.tensors[name]
 
     @classmethod
-    def stack_ranks(cls, values: Sequence["V41DSparkPackedWeights"]) -> "V41DSparkPackedWeights":
+    def stack_ranks(
+        cls, values: Sequence["V41DSparkPackedWeights"]
+    ) -> "V41DSparkPackedWeights":
         """Stack matching per-rank payloads on a new leading EP axis."""
         ranks = tuple(values)
         if not ranks:

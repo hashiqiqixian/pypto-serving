@@ -188,6 +188,39 @@ def test_dspark_batch_hook_validates_complete_lowered_bundle():
         })
 
 
+def test_dspark_lowered_inputs_reject_incomplete_decode_workspace():
+    lowered = DSparkLoweredInputs(
+        state={"slot_ids": object(), "generations": object(), "tokens": object(), "meta": object()},
+        workspace={"input_ids": object()},
+        target_model={"embedding_weight": object()},
+        draft_model={"draft": object()},
+        markov_model={"markov": object()},
+        cache_tables={"draft": object()},
+        rope_tables={"draft_cos": object(), "draft_sin": object()},
+    )
+    with pytest.raises(ValueError, match="workspace is missing"):
+        lowered.validate(phase="decode")
+
+
+def test_dspark_lowered_inputs_require_target_model_for_decode():
+    lowered = DSparkLoweredInputs(
+        state={name: object() for name in ("slot_ids", "generations", "tokens", "meta")},
+        workspace={name: object() for name in (
+            "prompt_lengths", "position_limits", "sampled_rows", "prefill_sampled_ids",
+            "next_prefill_tokens", "first_query_positions", "prefill_positions",
+            "prefill_request_ids", "prefill_counts", "context_slots", "context_rope_cos",
+            "context_rope_sin", "query_rope_cos", "query_rope_sin", "prefill_target_hidden",
+            "zero_sampled", "zero_last_sampled", "draft_head_hidden", "draft_ids",
+            "confidences",
+        )},
+        target_model={}, draft_model={"draft": object()}, markov_model={"markov": object()},
+        cache_tables={"draft": object()},
+        rope_tables={"draft_cos": object(), "draft_sin": object()},
+    )
+    with pytest.raises(ValueError, match="target model mapping"):
+        lowered.validate(phase="decode")
+
+
 def test_dspark_record_bootstrap_updates_state_without_redispatch():
     dispatch = _DispatchLog()
     runtime = V41DSparkRuntime(dispatch, max_seq_len=128)
