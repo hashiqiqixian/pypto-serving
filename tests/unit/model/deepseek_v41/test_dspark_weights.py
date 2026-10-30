@@ -17,7 +17,9 @@ import pytest
 import torch
 
 from pypto_serving.model.deepseek_v41.dspark_weights import (
+    DSPARK_EXPERT_SOURCE_TO_ABI,
     DSPARK_HEAD_SOURCE_TO_ABI,
+    DSPARK_LAYER_SOURCE_TO_ABI,
     V41DSparkWeightContract,
     dspark_v41_layer_weight_names,
     dspark_v41_required_weight_names,
@@ -137,3 +139,85 @@ def test_v41_drafter_weight_contract_matches_lib_abi():
         "final_norm_weight", "lm_head_weight", "markov_w1", "markov_w2",
         "confidence_weight", "draft_ids", "confidences", "logits_epoch",
     } <= {arg.arg for arg in markov.args.args}
+
+
+def _layer_contract(*, bad_suffix=None):
+    text = {
+        "n_routed_experts": 2,
+        "hidden_size": 64,
+        "num_attention_heads": 4,
+        "head_dim": 8,
+        "q_lora_rank": 16,
+        "o_lora_rank": 4,
+        "o_groups": 2,
+        "moe_intermediate_size": 96,
+        "hc_mult": 1,
+    }
+    names = dspark_v41_layer_weight_names(0, text["n_routed_experts"])
+
+    def shape(suffix):
+        hidden, heads, head_dim = text["hidden_size"], text["num_attention_heads"], text["head_dim"]
+        q_lora, o_lora, groups = text["q_lora_rank"], text["o_lora_rank"], text["o_groups"]
+        inter, hc = text["moe_intermediate_size"], text["hc_mult"]
+        q_width, o_width = heads * head_dim, heads * head_dim // groups
+        ceil32 = lambda value: (value + 31) // 32
+        return {
+            "attn_norm.weight": (hidden,), "ffn_norm.weight": (hidden,),
+            "attn.wq_a.weight": (q_lora, hidden), "attn.wq_a.scale": (ceil32(q_lora), ceil32(hidden)),
+            "attn.wq_b.weight": (q_width, q_lora), "attn.wq_b.scale": (ceil32(q_width), ceil32(q_lora)),
+            "attn.wkv.weight": (head_dim, hidden), "attn.wkv.scale": (ceil32(head_dim), ceil32(hidden)),
+            "attn.q_norm.weight": (q_lora,), "attn.kv_norm.weight": (head_dim,),
+            "attn.attn_sink": (heads,), "attn.wo_a.weight": (groups * o_lora, o_width),
+            "attn.wo_a.scale": (ceil32(groups * o_lora), ceil32(o_width)),
+            "attn.wo_b.weight": (hidden, groups * o_lora),
+            "attn.wo_b.scale": (ceil32(hidden), ceil32(groups * o_lora)),
+            "hc_attn_fn": ((2 + hc) * hc, hc * hidden), "hc_attn_scale": (3,),
+            "hc_attn_base": ((2 + hc) * hc,), "hc_ffn_fn": ((2 + hc) * hc, hc * hidden),
+            "hc_ffn_scale": (3,), "hc_ffn_base": ((2 + hc) * hc,),
+            "ffn.gate.weight": (2, hidden), "ffn.gate.bias": (2,),
+            "ffn.shared_experts.w1.weight": (inter, hidden),
+            "ffn.shared_experts.w1.scale": (ceil32(inter), ceil32(hidden)),
+            "ffn.shared_experts.w2.weight": (hidden, inter),
+            "ffn.shared_experts.w2.scale": (ceil32(hidden), ceil32(inter)),
+            "ffn.shared_experts.w3.weight": (inter, hidden),
+            "ffn.shared_experts.w3.scale": (ceil32(inter), ceil32(hidden)),
+        }[suffix]
+
+    class Store:
+        def require(self, values):
+            missing = set(values) - set(names)
+            if missing:
+                raise KeyError(sorted(missing)[0])
+
+        def load_many(self, values):
+            result = {}
+            for name in values:
+                suffix = name.removeprefix("mtp.0.")
+                if suffix.startswith("ffn.experts."):
+                    suffix = suffix.split(".", 3)[-1]
+                    expert_shape = {
+                        "w1.weight": (96, 32), "w1.scale": (96, 2),
+                        "w2.weight": (64, 48), "w2.scale": (64, 3),
+                        "w3.weight": (96, 32), "w3.scale": (96, 2),
+                    }[suffix]
+                    result[name] = torch.zeros(expert_shape)
+                else:
+                    actual = (1, 1) if suffix == bad_suffix else shape(suffix)
+                    result[name] = torch.zeros(actual)
+            return result
+
+    loader = SimpleNamespace(store=Store(), text=text)
+    return V41DSparkWeightContract(loader)
+
+
+def test_load_layer_abi_maps_source_names_and_preserves_expert_indices():
+    layer = _layer_contract().load_layer_abi(0)
+    assert set(layer.tensors) == set(DSPARK_LAYER_SOURCE_TO_ABI.values())
+    assert layer.tensors["wq_a"].shape == (16, 64)
+    assert set(layer.routed_experts) == set(DSPARK_EXPERT_SOURCE_TO_ABI.values())
+    assert layer.routed_experts["routed_w2"][1].shape == (64, 48)
+
+
+def test_load_layer_abi_rejects_source_layout_mismatch():
+    with pytest.raises(ValueError, match="attn.wq_a.weight"):
+        _layer_contract(bad_suffix="attn.wq_a.weight").load_layer_abi(0)
