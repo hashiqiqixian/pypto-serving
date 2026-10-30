@@ -44,6 +44,8 @@ from .task_args import (
 from .dspark_runtime import (
     DECODE_STAGE_ORDER,
     PREFILL_STAGE_ORDER,
+    DSPARK_ROWS_PER_REQUEST,
+    DSPARK_SPECULATIVE_TOKENS,
     DSparkDecodeDispatch,
     DSparkLoweredInputs,
     DSparkPrefillDispatch,
@@ -3184,11 +3186,17 @@ class V41ResidentResources:
 
     @staticmethod
     def _dspark_output_row(value, *, rank, row, kind):
+        vector_output = kind in ("accepted_ids", "draft_ids")
         if value.ndim == 1:
+            # Single-request lowering may expose a token vector directly.
+            if vector_output:
+                if row != 0:
+                    raise ValueError(f"DSpark {kind} row is outside the output")
+                return value
             if row >= value.shape[0]:
                 raise ValueError(f"DSpark {kind} row is outside the output")
             return value[row]
-        if kind in ("accepted_ids", "draft_ids") and value.ndim == 2:
+        if vector_output and value.ndim == 2:
             if row >= value.shape[0]:
                 raise ValueError(f"DSpark {kind} row is outside the output")
             return value[row]
@@ -3197,6 +3205,14 @@ class V41ResidentResources:
                 raise ValueError(f"DSpark {kind} rank/row is outside the output")
             return value[rank, row]
         raise ValueError("DSpark output tensor must have at least one dimension")
+
+    @staticmethod
+    def _validate_dspark_token_row(value, *, kind, minimum):
+        if getattr(value, "ndim", None) != 1 or value.shape[0] < minimum:
+            raise ValueError(
+                f"DSpark {kind} output must be a token vector with at least "
+                f"{minimum} entries"
+            )
 
     def _dspark_request_rows(self, lowered, count):
         ranks = lowered.request_ranks
@@ -3210,7 +3226,9 @@ class V41ResidentResources:
         if explicit is not None:
             if len(explicit) != count:
                 raise ValueError("DSpark request_rows must match request order")
-            rows = tuple(int(row) for row in explicit)
+            if any(type(row) is not int or row < 0 for row in explicit):
+                raise ValueError("DSpark request_rows must be nonnegative integers")
+            rows = tuple(explicit)
         else:
             next_row = {}
             rows = []
@@ -3235,6 +3253,8 @@ class V41ResidentResources:
             rank, row = self._dspark_request_rows(lowered, 1)
             draft_ids = self._dspark_output_row(
                 draft_ids, rank=rank[0], row=row[0], kind="draft_ids")
+            self._validate_dspark_token_row(
+                draft_ids, kind="draft_ids", minimum=DSPARK_SPECULATIVE_TOKENS)
             state = self.dspark.record_bootstrap(
                 request_id, slot=slot, generation=generation,
                 prompt_length=prompt_length, anchor=anchor,
@@ -3275,11 +3295,15 @@ class V41ResidentResources:
                     raise ValueError(f"DSpark accepted count for {request_id!r} is outside [1, 6]")
                 ids = self._dspark_output_row(
                     accepted_tensor, rank=rank, row=row, kind="accepted_ids")
+                self._validate_dspark_token_row(
+                    ids, kind="accepted_ids", minimum=DSPARK_ROWS_PER_REQUEST)
                 token_ids = [int(token) for token in ids[:count].tolist()]
                 sampled_token = int(self._dspark_output_row(
                     sampled_tensor, rank=rank, row=row, kind="last_sampled"))
                 draft_row = self._dspark_output_row(
                     drafts_tensor, rank=rank, row=row, kind="draft_ids")
+                self._validate_dspark_token_row(
+                    draft_row, kind="draft_ids", minimum=DSPARK_SPECULATIVE_TOKENS)
                 draft = [int(token) for token in draft_row[:5].tolist()]
                 self.dspark.states.get(request_id).validate_accept(count, sampled_token)
                 accepted.append(token_ids)
