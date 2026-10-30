@@ -48,6 +48,7 @@ from .dspark_runtime import (
     DSPARK_SPECULATIVE_TOKENS,
     DSparkDecodeDispatch,
     DSparkLoweredInputs,
+    DSparkLoweringProvider,
     DSparkPrefillDispatch,
     V41DSparkRuntime,
 )
@@ -596,11 +597,24 @@ class CompositeBindings:
             raise ValueError("V4.1 serving requires TP1 with matching DP/EP size 4 or 8")
 
 
-def load_composite_bindings(model_dir=None, max_seq_len=None, tokenizer=None, *, dp_size=None) -> CompositeBindings:
+def load_composite_bindings(
+    model_dir=None,
+    max_seq_len=None,
+    tokenizer=None,
+    *,
+    dp_size=None,
+    dspark_lowering_provider=None,
+) -> CompositeBindings:
     """Resolve the model-specific contract without opening a device."""
     if model_dir is None or max_seq_len is None:
         raise ValueError("V4.1 composite bindings require a model directory and context length")
-    return make_production_bindings(model_dir, max_seq_len, tokenizer=tokenizer, dp_size=dp_size)
+    return make_production_bindings(
+        model_dir,
+        max_seq_len,
+        tokenizer=tokenizer,
+        dp_size=dp_size,
+        dspark_lowering_provider=dspark_lowering_provider,
+    )
 
 
 # decode_padding
@@ -1612,6 +1626,15 @@ class V41ModelRunner:
             lowered=lowered,
         )
 
+    def lower_dspark_prefill_batch(self, model, batch, *, request_ids, sampled_token_ids):
+        """Lower a terminal prefill batch through the resident provider."""
+        if self.resources is None:
+            raise MissingCompositeInterface("V4.1 DSpark resources are not initialized")
+        return self.resources.lower_dspark_prefill(
+            model=model, batch=batch, request_ids=request_ids,
+            sampled_token_ids=sampled_token_ids,
+        )
+
     def run_dspark_decode(self, request_ids, *, stages, accepted_counts=None,
                           last_sampled=None, draft_ids=None, lowered=None,
                           request_ranks=None):
@@ -1626,25 +1649,37 @@ class V41ModelRunner:
             lowered=lowered, request_ranks=request_ranks,
         )
 
+    def lower_dspark_decode_batch(self, model, batch):
+        """Lower one decode batch through the resident provider."""
+        if self.resources is None:
+            raise MissingCompositeInterface("V4.1 DSpark resources are not initialized")
+        return self.resources.lower_dspark_decode(model=model, batch=batch)
+
     def run_dspark_prefill_batch(self, batch):
-        """Consume the typed DSpark prefill hook carried by a serving batch."""
+        """Consume the typed DSpark prefill payload from a serving batch."""
         dispatch = DSparkPrefillDispatch.from_batch(batch)
         return self.run_dspark_prefill(
-            dispatch.request_id, slot=dispatch.slot, generation=dispatch.generation,
-            prompt_length=dispatch.prompt_length, anchor=dispatch.anchor,
-            stages=dispatch.stages, lowered=dispatch.lowered,
+            dispatch.request_id,
+            slot=dispatch.slot,
+            generation=dispatch.generation,
+            prompt_length=dispatch.prompt_length,
+            anchor=dispatch.anchor,
+            stages=dispatch.stages,
+            lowered=dispatch.lowered,
         )
 
     def run_dspark_decode_batch(self, batch):
-        """Consume the typed DSpark decode hook carried by a serving batch."""
+        """Consume the typed DSpark decode payload from a serving batch."""
         dispatch = DSparkDecodeDispatch.from_batch(batch)
         return self.run_dspark_decode(
-            dispatch.request_ids, stages=dispatch.stages,
+            dispatch.request_ids,
+            stages=dispatch.stages,
             accepted_counts=dispatch.accepted_counts,
-            last_sampled=dispatch.last_sampled, draft_ids=dispatch.draft_ids,
-            lowered=dispatch.lowered, request_ranks=dispatch.request_ranks,
+            last_sampled=dispatch.last_sampled,
+            draft_ids=dispatch.draft_ids,
+            lowered=dispatch.lowered,
+            request_ranks=dispatch.request_ranks,
         )
-
 
 # prefill_segment
 _WEIGHTS = (
@@ -2892,7 +2927,7 @@ class V41ResidentResources:
                  decode_input_host=None, decode_host=None, worker_factory=make_segment_worker,
                  prefill_program=None, prefill_param_names=None,
                  dspark_programs=None, dspark_param_names=None, max_seq_len=None,
-                 dspark_weight_contract=None):
+                 dspark_weight_contract=None, dspark_lowering_provider=None):
         weight_bank.finish(weight_param_names)
         if decode_host is not None and (decode_input_host is None or
                 decode_host.topology != decode_input_host.topology):
@@ -2940,6 +2975,13 @@ class V41ResidentResources:
             self.dspark = None
         self.weights = None
         self.dspark_weight_contract = dspark_weight_contract
+        if dspark_lowering_provider is not None and not (
+                hasattr(dspark_lowering_provider, "lower_prefill")
+                and hasattr(dspark_lowering_provider, "lower_decode")):
+            raise TypeError(
+                "V4.1 DSpark lowering provider must expose lower_prefill and lower_decode"
+            )
+        self.dspark_lowering_provider: DSparkLoweringProvider | None = dspark_lowering_provider
         self.failed = False
         self.closed = False
         try:
@@ -2979,6 +3021,53 @@ class V41ResidentResources:
     def _own(self, resource):
         self._owned.append(resource)
         return resource
+
+    def lower_dspark_prefill(self, *, model, batch, request_ids, sampled_token_ids):
+        """Lower a terminal prefill batch through the serving-owned provider."""
+        provider = self.dspark_lowering_provider
+        if provider is None:
+            raise MissingCompositeInterface(
+                "V4.1 DSpark prefill lowering provider is not configured; "
+                "serving must bind target hidden, state, cache, workspace and outputs"
+            )
+        dispatch = provider.lower_prefill(
+            model=model, batch=batch, request_ids=tuple(request_ids),
+            sampled_token_ids=tuple(int(token) for token in sampled_token_ids),
+        )
+        if not isinstance(dispatch, DSparkPrefillDispatch):
+            if isinstance(dispatch, Mapping):
+                dispatch = DSparkPrefillDispatch.from_batch(
+                    type("DSparkBatch", (), {"dspark_stages": dispatch})()
+                )
+            else:
+                raise TypeError("DSpark prefill lowering provider must return DSparkPrefillDispatch")
+        if dispatch.lowered is None:
+            raise MissingCompositeInterface(
+                "V4.1 DSpark prefill lowering provider returned no complete lowered inputs"
+            )
+        return dispatch
+
+    def lower_dspark_decode(self, *, model, batch):
+        """Lower one decode batch through the serving-owned provider."""
+        provider = self.dspark_lowering_provider
+        if provider is None:
+            raise MissingCompositeInterface(
+                "V4.1 DSpark decode lowering provider is not configured; "
+                "serving must bind target/draft/Markov state and outputs"
+            )
+        dispatch = provider.lower_decode(model=model, batch=batch)
+        if not isinstance(dispatch, DSparkDecodeDispatch):
+            if isinstance(dispatch, Mapping):
+                dispatch = DSparkDecodeDispatch.from_batch(
+                    type("DSparkBatch", (), {"dspark_stages": dispatch})()
+                )
+            else:
+                raise TypeError("DSpark decode lowering provider must return DSparkDecodeDispatch")
+        if dispatch.lowered is None:
+            raise MissingCompositeInterface(
+                "V4.1 DSpark decode lowering provider returned no complete lowered inputs"
+            )
+        return dispatch
 
     def _activate_prefill(self):
         if self._prefill_fwd is not None:
@@ -3448,8 +3537,15 @@ def _check_runtime_binaries(platform):
         builder.get_binaries(runtime)
 
 
-def make_production_bindings(model_dir, max_seq_len, *, tokenizer=None, engram_lookup_fn=None,
-                             dp_size=None):
+def make_production_bindings(
+    model_dir,
+    max_seq_len,
+    *,
+    tokenizer=None,
+    engram_lookup_fn=None,
+    dp_size=None,
+    dspark_lowering_provider=None,
+):
     model_dir = Path(model_dir).resolve()
     raw = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     layers = plan_layers(raw)
@@ -3621,6 +3717,7 @@ def make_production_bindings(model_dir, max_seq_len, *, tokenizer=None, engram_l
             dspark_programs=dspark_programs, dspark_param_names=dspark_param_names,
             max_seq_len=max_seq_len,
             dspark_weight_contract=dspark_weight_contract,
+            dspark_lowering_provider=dspark_lowering_provider,
         )
         resident.engram = engram
         _LOG.info("V4.1 resident upload and allocation %.2fs",
