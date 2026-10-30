@@ -41,6 +41,33 @@ DECODE_STAGE_ORDER = (
     "commit_drafts",
 )
 
+# These names are the serving-to-lib handoff, rather than an implementation
+# detail of any one runner.  Keep the contract explicit so a provider cannot
+# accidentally dispatch a stage with only a subset of the six-row buffers.
+_STATE_KEYS = ("slot_ids", "generations", "tokens", "meta")
+_PREFILL_WORKSPACE_KEYS = (
+    "prompt_lengths", "position_limits", "sampled_rows", "prefill_sampled_ids",
+    "next_prefill_tokens", "first_query_positions", "prefill_positions",
+    "prefill_request_ids", "prefill_counts", "context_slots", "context_rope_cos",
+    "context_rope_sin", "query_rope_cos", "query_rope_sin", "prefill_target_hidden",
+    "zero_sampled", "zero_last_sampled", "draft_head_hidden", "draft_ids",
+    "confidences",
+)
+_DECODE_WORKSPACE_KEYS = (
+    "input_ids", "target_positions", "active_widths", "x_hc", "pre_mix",
+    "position_ids", "request_ids", "window_slots", "window_indices", "c2a_slots",
+    "c1a_slots", "query_starts", "target_hidden_padded", "target_hidden",
+    "target_sampled_ids", "accepted_ids", "accepted_counts", "context_valid",
+    "context_positions", "num_sampled", "last_sampled", "anchor_ids",
+    "first_query_positions", "context_slots", "context_rope_cos", "context_rope_sin",
+    "query_rope_cos", "query_rope_sin", "draft_head_hidden", "draft_ids",
+    "confidences", "zero_prefill_tokens", "committed",
+    "chunk_0", "chunk_1", "chunk_2", "chunk_3", "chunk_4",
+)
+_PREFILL_CACHE_KEYS = ("draft",)
+_DECODE_CACHE_KEYS = ("target_window", "target_c2a", "target_c1a", "draft")
+_ROPE_KEYS = ("draft_cos", "draft_sin")
+
 PREFILL_STAGE_ORDER = (
     "bootstrap_inputs",
     "prepare_prefill_drafter_geometry",
@@ -123,6 +150,47 @@ class DSparkLoweredInputs:
         values["outputs"] = outputs
         values["request_ranks"] = value.get("request_ranks")
         return cls(**values)
+
+    def validate(self, *, phase: str) -> None:
+        """Validate the complete serving/lib resource handoff before dispatch.
+
+        This checks names and container shape only.  Tensor dtype, topology and
+        device ownership remain the responsibility of the compiled lib ABI and
+        the resident resource allocator.  In particular, this method never
+        creates a placeholder tensor for a missing binding.
+        """
+        if phase not in ("prefill", "decode"):
+            raise ValueError("DSpark phase must be 'prefill' or 'decode'")
+
+        def has_field(container, name):
+            if isinstance(container, Mapping):
+                return name in container
+            return hasattr(container, name)
+
+        missing_state = [name for name in _STATE_KEYS if not has_field(self.state, name)]
+        if missing_state:
+            raise ValueError("DSpark state is missing: " + ", ".join(missing_state))
+        workspace_keys = _PREFILL_WORKSPACE_KEYS if phase == "prefill" else _DECODE_WORKSPACE_KEYS
+        missing_workspace = [name for name in workspace_keys if name not in self.workspace]
+        if missing_workspace:
+            raise ValueError(
+                f"DSpark {phase} workspace is missing: " + ", ".join(missing_workspace)
+            )
+        cache_keys = _PREFILL_CACHE_KEYS if phase == "prefill" else _DECODE_CACHE_KEYS
+        missing_cache = [name for name in cache_keys if name not in self.cache_tables]
+        if missing_cache:
+            raise ValueError(
+                f"DSpark {phase} cache tables are missing: " + ", ".join(missing_cache)
+            )
+        missing_rope = [name for name in _ROPE_KEYS if name not in self.rope_tables]
+        if missing_rope:
+            raise ValueError("DSpark rope tables are missing: " + ", ".join(missing_rope))
+        if phase == "decode" and not self.target_model:
+            raise ValueError("DSpark decode target model mapping is empty")
+        if not self.draft_model:
+            raise ValueError("DSpark draft model mapping is empty")
+        if not self.markov_model:
+            raise ValueError("DSpark Markov model mapping is empty")
 
 
 def coerce_dspark_lowered(value: Any) -> DSparkLoweredInputs:
