@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -80,9 +81,27 @@ class DeepSeekV41DirectoryLoader(SafetensorsDirectoryLoader):
             raise ValueError("V4.1 cache pages require 128 physical rows")
         layers = plan_layers(raw)
         if runtime.kv_cache_groups:
-            validate_cache_groups(layers, runtime.kv_cache_groups, runtime.max_seq_len)
+            dp_size = runtime.kv_cache_groups[0].num_partitions
+            validate_cache_groups(
+                layers, runtime.kv_cache_groups, runtime.max_seq_len, dp_size=dp_size,
+            )
         elif len(layers) == 40:
-            runtime = replace(runtime, kv_cache_groups=build_cache_groups(layers, runtime.max_seq_len))
+            # Direct executor users may omit grouped cache specs. Keep that
+            # path consistent with the CLI-selected DP topology instead of
+            # silently constructing an eight-partition runtime for DP4.
+            configured_dp = os.environ.get("PYPTO_DSV41_DP_SIZE", "8")
+            try:
+                dp_size = int(configured_dp)
+            except ValueError as exc:
+                raise ValueError("PYPTO_DSV41_DP_SIZE must be 4 or 8") from exc
+            if dp_size not in (4, 8):
+                raise ValueError("PYPTO_DSV41_DP_SIZE must be 4 or 8")
+            runtime = replace(
+                runtime,
+                kv_cache_groups=build_cache_groups(
+                    layers, runtime.max_seq_len, dp_size=dp_size,
+                ),
+            )
         if len(layers) == 40:
             capacity = SegmentTopology.for_decode().capacity
             runtime = replace(
@@ -132,9 +151,11 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
     def register_model(self, model_id, record):
         if model_id in self.runners:
             raise ValueError("model already registered")
+        dp_size = (record.runtime.kv_cache_groups[0].num_partitions
+                   if record.runtime.kv_cache_groups else None)
         bindings = self.bindings or load_composite_bindings(
             record.runtime_model.extra["model_dir"], record.runtime.max_seq_len,
-            tokenizer=record.tokenizer)
+            tokenizer=record.tokenizer, dp_size=dp_size)
         if not bindings.cache_groups:
             raise MissingCompositeInterface("V4.1 requires explicit grouped cache layouts and capacities")
         if record.runtime.kv_cache_groups != bindings.cache_groups:

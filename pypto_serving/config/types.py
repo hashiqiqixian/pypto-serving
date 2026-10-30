@@ -309,6 +309,9 @@ class PrefillBatch:
     cache_partitions: list[int | None] = field(default_factory=list)
     # Opaque request-local generation constraints, interpreted only by capable runners.
     constraint_states: dict[str, object] = field(default_factory=dict)
+    # Optional serving-owned DSpark stage arguments.  The V4.1 adapter accepts
+    # only already-bound lib composite arguments; it never rebuilds operators.
+    dspark_stages: object | None = None
 
 
 @dataclass
@@ -347,6 +350,9 @@ class DecodeBatch:
     # its embedding (shape ``[B, hidden]``). Left ``None`` for single-token decoders.
     prev_token_ids: torch.Tensor | None = None
     prev_hidden_states: torch.Tensor | None = None
+    # Optional serving-owned DSpark stage arguments for one complete target ->
+    # accept -> drafter -> Markov -> commit round.
+    dspark_stages: object | None = None
 
 
 @dataclass

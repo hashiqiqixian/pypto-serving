@@ -197,7 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Speculative decoding configuration as JSON. DeepSeek V4 supports "
             "method='mtp' with a positive num_speculative_tokens, and "
-            "method='dspark' with num_speculative_tokens 0 (target-only serving)."
+            "method='dspark' with its model-specific fixed draft width."
         ),
     )
 
@@ -348,7 +348,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
     """Resolve the V4.1 worker boundary before starting any device resources.
 
     Like DSpark placement, TP/DP are internal to one overlapped EP worker.
-    The scheduler uses eight cache partitions instead of creating DP replicas.
+    The scheduler uses one cache partition per configured DP/EP rank instead of creating DP replicas.
     """
     from pypto_serving.config.types import KVCacheGroupSpec
     from pypto_serving.model.deepseek_v41.npu_runner import (
@@ -359,13 +359,26 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
     from pypto_serving.serving.engine.async_engine import EngineConfig
 
     text = V41TextConfig.from_dict(raw)
-    if getattr(args, "speculative_config", None) is not None or getattr(args, "num_speculative_tokens", 0):
-        raise ValueError("V4.1 text serving does not support DSpark or MTP")
+    speculative = getattr(args, "speculative_config", None)
+    legacy_speculative = getattr(args, "num_speculative_tokens", None)
+    if legacy_speculative not in (None, 0):
+        raise ValueError("V4.1 requires --speculative-config with method='dspark'")
+    if speculative is None:
+        dspark_tokens = 0
+    else:
+        if speculative.get("method") != "dspark":
+            raise ValueError("V4.1 --speculative-config requires method='dspark'")
+        dspark_tokens = speculative.get("num_speculative_tokens")
+        if type(dspark_tokens) is not int or dspark_tokens != 5:
+            raise ValueError("V4.1 DSpark requires num_speculative_tokens=5")
     if args.platform != "a5":
         raise ValueError("V4.1 M0 serving requires --platform a5")
     topology = (args.tensor_parallel_size, args.data_parallel_size, args.expert_parallel_size)
-    if topology != (1, 8, 8) or len(devices) != 8:
-        raise ValueError("V4.1 serving requires --tp 1 --dp 8 --ep 8 and exactly eight device IDs")
+    if (args.tensor_parallel_size != 1 or args.data_parallel_size != args.expert_parallel_size
+            or args.data_parallel_size not in (4, 8)
+            or len(devices) != args.data_parallel_size):
+        raise ValueError("V4.1 serving requires TP1 with matching DP/EP size 4 or 8")
+    dp_size = args.data_parallel_size
     if args.block_size != 128:
         raise ValueError("V4.1 serving requires --block-size 128")
     if not 0 < args.max_model_len <= text.max_position_embeddings:
@@ -374,22 +387,22 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         raise ValueError("V4.1 batch and token capacities must be positive")
 
     parallel = ParallelConfig(
-        data_parallel_size=1, tensor_parallel_size=1, expert_parallel_size=8,
+        data_parallel_size=1, tensor_parallel_size=1, expert_parallel_size=dp_size,
         enable_expert_parallel=True, placement_mode="overlapped", devices=devices,
         data_parallel_routing=args.data_parallel_routing,
     )
     # This resolver intentionally raises while the lib adapter is missing.
     # No default generic KV layout may be substituted for the V4.1 pools.
-    bindings = load_composite_bindings(model_dir, args.max_model_len)
-    bindings.require(plan_layers(raw), RankPlacement(0, tp_size=1, dp_size=8, ep_size=8))
+    bindings = load_composite_bindings(model_dir, args.max_model_len, dp_size=dp_size)
+    bindings.require(plan_layers(raw), RankPlacement(0, tp_size=1, dp_size=dp_size, ep_size=dp_size))
     if bindings.segment_topology is None:
         raise MissingCompositeInterface("V4.1 bindings must declare the selected lib decode capacity")
     step_tokens = min(args.max_num_batched_tokens, bindings.segment_topology.capacity)
     groups = tuple(bindings.cache_groups)
     if not groups or any(not isinstance(group, KVCacheGroupSpec) for group in groups):
         raise MissingCompositeInterface("V4.1 bindings must provide concrete grouped cache specifications")
-    if any(group.num_partitions != 8 for group in groups):
-        raise ValueError("V4.1 cache groups must use eight logical DP partitions")
+    if any(group.num_partitions != dp_size for group in groups):
+        raise ValueError(f"V4.1 cache groups must use {dp_size} logical DP partitions")
     if len({group.name for group in groups}) != len(groups):
         raise ValueError("V4.1 cache group names must be unique")
     runtime = dataclasses.replace(
@@ -398,6 +411,8 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         max_num_batched_tokens=step_tokens,
         max_prefill_tokens_per_request=step_tokens,
         requires_homogeneous_prefill_decode=True,
+        supports_chunked_prefill_with_speculation=not bool(dspark_tokens),
+        num_speculative_tokens=dspark_tokens,
     )
     return EngineConfig(
         model_id=args.served_model_name or Path(model_dir).name,
