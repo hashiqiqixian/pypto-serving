@@ -135,9 +135,14 @@ def dspark_v41_layer_weight_names(layer: int, n_routed_experts: int) -> tuple[st
     """Return one draft layer's raw names for bounded, per-layer staging."""
     if type(layer) is not int or layer not in DSPARK_DRAFT_LAYERS:
         raise ValueError("DSpark draft layer must be one of 0, 1 or 2")
-    all_names = dspark_v41_required_weight_names(n_routed_experts)
     prefix = f"mtp.{layer}."
-    return tuple(name for name in all_names if name.startswith(prefix))
+    names = [f"{prefix}{suffix}" for suffix in _LAYER_SUFFIXES]
+    names.extend(
+        f"{prefix}ffn.experts.{expert}.{suffix}"
+        for expert in range(n_routed_experts)
+        for suffix in DSPARK_EXPERT_SOURCE_TO_ABI
+    )
+    return tuple(names)
 
 
 def _ceil_div(value: int, divisor: int) -> int:

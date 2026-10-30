@@ -69,6 +69,7 @@ def test_layer_names_are_bounded_to_one_mtp_layer():
     names = dspark_v41_layer_weight_names(1, 2)
     assert names
     assert all(name.startswith("mtp.1.") for name in names)
+    assert not any(name.endswith("main_proj.weight") for name in names)
     with pytest.raises(ValueError, match="one of 0, 1 or 2"):
         dspark_v41_layer_weight_names(3, 2)
 
