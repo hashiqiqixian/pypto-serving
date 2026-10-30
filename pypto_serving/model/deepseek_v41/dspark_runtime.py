@@ -56,6 +56,25 @@ class DSparkDispatch(Protocol):
     def dispatch_dspark(self, stage: str, arguments: Mapping[str, Any]) -> None: ...
 
 
+class DSparkLoweringProvider(Protocol):
+    """Serving-owned lowering boundary for complete DSpark ABI payloads.
+
+    The provider allocates and binds all state, cache, workspace, weight and
+    output mappings required by the lib composite.  It must not return a
+    partially populated stage list: the runner validates the returned typed
+    dispatch before invoking the lib orchestrator.
+    """
+
+    def lower_prefill(
+        self, *, model: Any, batch: Any, request_ids: Sequence[str],
+        sampled_token_ids: Sequence[int],
+    ) -> "DSparkPrefillDispatch": ...
+
+    def lower_decode(
+        self, *, model: Any, batch: Any,
+    ) -> "DSparkDecodeDispatch": ...
+
+
 @dataclass(frozen=True)
 class DSparkLoweredInputs:
     """Complete argument bundle for one lib-owned DSpark orchestration.

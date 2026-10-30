@@ -1084,7 +1084,6 @@ class WorkerProcess:
             args={"batch_size": len(scheduled), "request_ids": [pr.request_id for pr in scheduled]},
         ):
             batch = self._make_prefill_batch(scheduled, runtime_model)
-            self._require_v41_dspark_stages(runtime_model, batch, phase="prefill")
             allow_device_greedy_sampling = batch.allow_device_greedy_sampling
             allow_device_topk_sampling = batch.allow_device_topk_sampling
             if prefill_slot is not None and getattr(self.executor, "supports_async_prefill_reclaim", False):
@@ -1137,7 +1136,22 @@ class WorkerProcess:
                     completed_token_ids,
                     completed_sampling_params,
                 )
-                if batch.dspark_stages is not None:
+                if (isinstance(getattr(runtime_model, "extra", None), dict)
+                        and runtime_model.extra.get("family") == "deepseek_v41"
+                        and getattr(runtime_model.runtime, "num_speculative_tokens", 0) == 5):
+                    lower = getattr(self.executor, "lower_dspark_prefill_batch", None)
+                    if not callable(lower):
+                        self._require_v41_dspark_stages(runtime_model, batch, phase="prefill")
+                    if len(completed_request_ids) != 1:
+                        raise RuntimeError(
+                            "V4.1 DSpark prefill lowering currently requires one terminal request"
+                        )
+                    batch.dspark_stages = lower(
+                        runtime_model,
+                        batch,
+                        request_ids=completed_request_ids,
+                        sampled_token_ids=completed_token_ids,
+                    )
                     self.executor.run_dspark_prefill_batch(batch)
 
     def _resolve_decode_token(self, dr: DecodeRequest) -> int:
@@ -1308,6 +1322,13 @@ class WorkerProcess:
                 allow_device_greedy_sampling=allow_device_greedy_sampling,
                 allow_device_topk_sampling=allow_device_topk_sampling,
             )
+            if (isinstance(getattr(runtime_model, "extra", None), dict)
+                    and runtime_model.extra.get("family") == "deepseek_v41"
+                    and getattr(runtime_model.runtime, "num_speculative_tokens", 0) == 5):
+                lower = getattr(self.executor, "lower_dspark_decode_batch", None)
+                if not callable(lower):
+                    self._require_v41_dspark_stages(runtime_model, batch, phase="decode")
+                batch.dspark_stages = lower(runtime_model, batch)
             self._require_v41_dspark_stages(runtime_model, batch, phase="decode")
             if prepared_decode is None:
                 started_ns = self._decode_metrics.start() if self._decode_metrics else 0

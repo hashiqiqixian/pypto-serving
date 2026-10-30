@@ -173,6 +173,22 @@ class ModelExecutor(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} does not support DSpark prefill")
 
+    def lower_dspark_prefill_batch(
+        self,
+        model: RuntimeModel,
+        batch: PrefillBatch,
+        *,
+        request_ids,
+        sampled_token_ids,
+    ) -> object:
+        """Return a complete DSpark prefill payload for a terminal batch.
+
+        Only model-specific executors with a serving-owned lowering provider
+        implement this hook.  The worker must never synthesize an empty stage
+        list as a fallback.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support DSpark lowering")
+
     def lookup_embeddings(self, model: RuntimeModel, token_ids: torch.Tensor) -> torch.Tensor:
         """Return embedding rows for ``token_ids`` on the model runtime device."""
         token_ids = token_ids.to(device=model.runtime.device, dtype=torch.long)
@@ -237,3 +253,9 @@ class ModelExecutor(ABC):
     def run_dspark_decode_batch(self, batch: DecodeBatch) -> DecodeResult:
         """Run a pre-lowered DSpark target/accept/draft/Markov round."""
         raise NotImplementedError(f"{type(self).__name__} does not support DSpark decode")
+
+    def lower_dspark_decode_batch(
+        self, model: RuntimeModel, batch: DecodeBatch,
+    ) -> object:
+        """Return a complete DSpark decode payload for one serving batch."""
+        raise NotImplementedError(f"{type(self).__name__} does not support DSpark lowering")

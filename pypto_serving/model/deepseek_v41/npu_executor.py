@@ -39,6 +39,7 @@ from .npu_runner import (
     load_composite_bindings,
 )
 from .task_args import build_cache_groups, validate_cache_groups
+from .dspark_runtime import DSparkLoweringProvider
 from .weight_loader import RankPlacement, V41ExecutionPlan, V41WeightLoader, plan_layers
 
 
@@ -144,7 +145,8 @@ class DeepSeekV41DirectoryLoader(SafetensorsDirectoryLoader):
 class DeepSeekV41PyptoExecutor(ModelExecutor):
     """Shared worker interface with a synchronous, collective V4.1 runner."""
     def __init__(self, kv_cache_manager=None, *, platform="a5", device_ids=tuple(range(8)),
-                 pypto_build_dir=None, use_compile_cache=False, bindings=None):
+                 pypto_build_dir=None, use_compile_cache=False, bindings=None,
+                 dspark_lowering_provider: DSparkLoweringProvider | None = None):
         super().__init__(kv_cache_manager)
         if platform != "a5":
             raise ValueError("V4.1 M0 currently requires the A5 platform")
@@ -155,6 +157,7 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         self.platform = platform
         self.pypto_build_dir = pypto_build_dir
         self.use_compile_cache = use_compile_cache
+        self.dspark_lowering_provider = dspark_lowering_provider
 
     def register_model(self, model_id, record):
         if model_id in self.runners:
@@ -163,7 +166,8 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
                    if record.runtime.kv_cache_groups else None)
         bindings = self.bindings or load_composite_bindings(
             record.runtime_model.extra["model_dir"], record.runtime.max_seq_len,
-            tokenizer=record.tokenizer, dp_size=dp_size)
+            tokenizer=record.tokenizer, dp_size=dp_size,
+            dspark_lowering_provider=self.dspark_lowering_provider)
         if not bindings.cache_groups:
             raise MissingCompositeInterface("V4.1 requires explicit grouped cache layouts and capacities")
         if record.runtime.kv_cache_groups != bindings.cache_groups:
@@ -190,6 +194,10 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
             if not runner.closed:
                 self._failed_runners.append(runner)
             raise
+        if self.dspark_lowering_provider is not None:
+            # Custom bindings may have been supplied by a test or deployment;
+            # attach the same provider after resident resources are created.
+            runner.resources.dspark_lowering_provider = self.dspark_lowering_provider
         self.runners[model_id] = runner
         return pages
 
@@ -210,6 +218,21 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
             raise RuntimeError("V4.1 DSpark batch dispatch requires one registered model")
         return next(iter(self.runners.values())).run_dspark_prefill_batch(batch)
 
+    def lower_dspark_prefill_batch(
+        self, model: RuntimeModel, batch: PrefillBatch, *,
+        request_ids, sampled_token_ids,
+    ):
+        """Create a complete DSpark prefill payload through the resident provider."""
+        if not self.runners:
+            raise MissingCompositeInterface("V4.1 DSpark runner is not registered")
+        if len(self.runners) != 1:
+            raise MissingCompositeInterface(
+                "V4.1 DSpark lowering requires one registered model"
+            )
+        return next(iter(self.runners.values())).lower_dspark_prefill_batch(
+            model, batch, request_ids=request_ids, sampled_token_ids=sampled_token_ids,
+        )
+
     def run_dspark_decode_batch(self, batch: DecodeBatch) -> DecodeResult:
         """Dispatch one serving-owned DSpark verification round."""
         if not self.runners:
@@ -220,6 +243,16 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         if not isinstance(result, DecodeResult):
             raise TypeError("V4.1 DSpark runner must return DecodeResult")
         return result
+
+    def lower_dspark_decode_batch(self, model: RuntimeModel, batch: DecodeBatch):
+        """Create a complete DSpark decode payload through the resident provider."""
+        if not self.runners:
+            raise MissingCompositeInterface("V4.1 DSpark runner is not registered")
+        if len(self.runners) != 1:
+            raise MissingCompositeInterface(
+                "V4.1 DSpark lowering requires one registered model"
+            )
+        return next(iter(self.runners.values())).lower_dspark_decode_batch(model, batch)
 
     def release_finished_requests(self, request_ids):
         for runner in self.runners.values():
