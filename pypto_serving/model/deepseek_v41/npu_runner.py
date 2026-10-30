@@ -42,7 +42,10 @@ from .task_args import (
     validate_cache_groups,
 )
 from .dspark_runtime import (
+    DECODE_STAGE_ORDER,
+    PREFILL_STAGE_ORDER,
     DSparkDecodeDispatch,
+    DSparkLoweredInputs,
     DSparkPrefillDispatch,
     V41DSparkRuntime,
 )
@@ -1590,7 +1593,7 @@ class V41ModelRunner:
                 self.ledger.release(request_ids, self._reset_request)
 
     def run_dspark_prefill(self, request_id, *, slot, generation, prompt_length,
-                           anchor, stages):
+                           anchor, stages, lowered=None):
         """Publish the first five drafts after a completed V4.1 prefill.
 
         The scheduler/device adapter supplies already-bound stage arguments;
@@ -1604,10 +1607,11 @@ class V41ModelRunner:
         return self.resources.run_dspark_prefill(
             request_id, slot=slot, generation=generation,
             prompt_length=prompt_length, anchor=anchor, stages=stages,
+            lowered=lowered,
         )
 
     def run_dspark_decode(self, request_ids, *, stages, accepted_counts=None,
-                          last_sampled=None, draft_ids=None):
+                          last_sampled=None, draft_ids=None, lowered=None):
         """Run one target-accept-drafter-Markov-commit verification round."""
         if self.runtime.num_speculative_tokens != 5:
             raise ValueError("V4.1 DSpark requires num_speculative_tokens=5")
@@ -1616,6 +1620,7 @@ class V41ModelRunner:
         return self.resources.run_dspark_decode(
             request_ids, stages=stages, accepted_counts=accepted_counts,
             last_sampled=last_sampled, draft_ids=draft_ids,
+            lowered=lowered,
         )
 
     def run_dspark_prefill_batch(self, batch):
@@ -1624,7 +1629,7 @@ class V41ModelRunner:
         return self.run_dspark_prefill(
             dispatch.request_id, slot=dispatch.slot, generation=dispatch.generation,
             prompt_length=dispatch.prompt_length, anchor=dispatch.anchor,
-            stages=dispatch.stages,
+            stages=dispatch.stages, lowered=dispatch.lowered,
         )
 
     def run_dspark_decode_batch(self, batch):
@@ -1634,6 +1639,7 @@ class V41ModelRunner:
             dispatch.request_ids, stages=dispatch.stages,
             accepted_counts=dispatch.accepted_counts,
             last_sampled=dispatch.last_sampled, draft_ids=dispatch.draft_ids,
+            lowered=dispatch.lowered,
         )
 
 
@@ -2846,6 +2852,29 @@ class PrefillForwardSegment:
 
 
 # resident_resources
+class _DSparkOrchestratorRunner:
+    """Adapt the lib's callable stage runner to resident serving resources."""
+
+    def __init__(self, resources, phase):
+        self.resources = resources
+        self.expected = PREFILL_STAGE_ORDER if phase == "prefill" else DECODE_STAGE_ORDER
+        self.index = 0
+
+    def __call__(self, _entry, arguments):
+        if self.index >= len(self.expected):
+            raise RuntimeError("V4.1 DSpark lib emitted more stages than its ABI")
+        stage = self.expected[self.index]
+        self.index += 1
+        self.resources.dispatch_dspark(stage, arguments)
+
+    def finish(self):
+        if self.index != len(self.expected):
+            raise RuntimeError(
+                "V4.1 DSpark lib emitted an incomplete stage sequence: "
+                f"{self.index}/{len(self.expected)}"
+            )
+
+
 class V41ResidentResources:
     """Own resident buffers and their shared host mappings until worker close.
 
@@ -3070,32 +3099,170 @@ class V41ResidentResources:
         self.worker.run(program.compiled,
                         *(arguments[name] for name in param_names), config=self.run_config)
 
+    def _run_dspark_orchestrator(self, lowered: DSparkLoweredInputs, *, phase: str) -> None:
+        """Run the lib-owned orchestration against resident compiled stages."""
+        if not isinstance(lowered, DSparkLoweredInputs):
+            raise TypeError("DSpark orchestration requires lowered serving inputs")
+        try:
+            module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd_dspark")
+            function = (module.prefill_bootstrap_dspark if phase == "prefill"
+                        else module.decode_fwd_dspark)
+        except (ImportError, AttributeError) as exc:
+            raise MissingCompositeInterface(
+                "V4.1 DSpark lib orchestration entry is unavailable"
+            ) from exc
+        runner = _DSparkOrchestratorRunner(self, phase)
+        try:
+            kwargs = dict(
+                attention_epoch=lowered.attention_epoch,
+                moe_epoch=lowered.moe_epoch,
+                logits_epoch=lowered.logits_epoch,
+            )
+            if phase == "prefill":
+                function(
+                    runner, lowered.state, lowered.workspace, lowered.draft_model,
+                    lowered.markov_model, lowered.cache_tables, lowered.rope_tables,
+                    **kwargs,
+                )
+            else:
+                function(
+                    runner, lowered.state, lowered.workspace, lowered.target_model,
+                    lowered.draft_model, lowered.markov_model, lowered.cache_tables,
+                    lowered.rope_tables, **kwargs,
+                )
+            runner.finish()
+        except MissingCompositeInterface:
+            raise
+        except BaseException as exc:
+            raise RuntimeError(f"V4.1 DSpark {phase} orchestration failed") from exc
+
+    def _read_dspark_output(self, lowered, name):
+        """Return an owned CPU copy of one device-produced DSpark output."""
+        value = lowered.outputs.get(name, lowered.workspace.get(name))
+        if value is None:
+            raise MissingCompositeInterface(
+                f"V4.1 DSpark output lowering is missing {name!r}"
+            )
+        if callable(value):
+            value = value()
+        if isinstance(value, torch.Tensor):
+            if value.device.type != "cpu":
+                raise MissingCompositeInterface(
+                    f"V4.1 DSpark output {name!r} needs a serving readback buffer"
+                )
+            return value.detach().clone()
+        from pypto.runtime import StackedDeviceTensor
+
+        shards = getattr(value, "shards", None)
+        if shards is None or not isinstance(value, StackedDeviceTensor):
+            raise TypeError(f"V4.1 DSpark output {name!r} is not a tensor")
+        result = torch.empty(tuple(value.shape), dtype=value.dtype).share_memory_()
+        for rank, shard in enumerate(shards):
+            destination = result[rank]
+            self.worker.copy_from(
+                destination.data_ptr(), shard.data_ptr,
+                destination.numel() * destination.element_size(),
+                src_offset=0, worker_id=value.worker_ids[rank],
+            )
+        return result
+
+    @staticmethod
+    def _dspark_output_row(value, *, rank, row):
+        if value.ndim == 1:
+            return value[row]
+        if value.ndim >= 2:
+            return value[rank, row]
+        raise ValueError("DSpark output tensor must have at least one dimension")
+
+    def _dspark_request_rows(self, lowered, count):
+        ranks = lowered.request_ranks
+        if ranks is None:
+            ranks = tuple(range(count))
+        if len(ranks) != count or any(type(rank) is not int or rank < 0 for rank in ranks):
+            raise ValueError("DSpark request_ranks must match request order")
+        explicit = lowered.outputs.get("request_rows")
+        if explicit is None:
+            explicit = lowered.workspace.get("request_rows")
+        if explicit is not None:
+            if len(explicit) != count:
+                raise ValueError("DSpark request_rows must match request order")
+            rows = tuple(int(row) for row in explicit)
+        else:
+            next_row = {}
+            rows = []
+            for rank in ranks:
+                rows.append(next_row.get(rank, 0))
+                next_row[rank] = rows[-1] + 1
+            rows = tuple(rows)
+        return tuple(ranks), rows
+
     def run_dspark_prefill(self, request_id, *, slot, generation, prompt_length,
-                           anchor, stages):
+                           anchor, stages, lowered=None):
         if self.dspark is None:
             raise MissingCompositeInterface("V4.1 DSpark programs were not registered")
-        # The stage-only seam does not yet return target prefill hidden rows,
-        # sampled anchor state, or the draft block consumed by the next decode.
-        # Do not mutate the request table and let the worker silently discard
-        # that missing result.
-        raise MissingCompositeInterface(
-            "V4.1 DSpark prefill output lowering is not implemented: "
-            "serving must bind target hidden/sample outputs and publish draft state"
+        if lowered is None:
+            raise MissingCompositeInterface(
+                "V4.1 DSpark prefill output lowering is not implemented: "
+                "serving must bind target hidden/sample outputs and publish draft state"
+            )
+        self._run_dspark_orchestrator(lowered, phase="prefill")
+        draft_ids = self._read_dspark_output(lowered, "draft_ids")
+        if draft_ids.ndim == 3:
+            rank = 0 if lowered.request_ranks is None else int(lowered.request_ranks[0])
+            draft_ids = draft_ids[rank, 0]
+        elif draft_ids.ndim == 2:
+            row = 0
+            request_rows = lowered.outputs.get("request_rows", lowered.workspace.get("request_rows"))
+            if request_rows is not None:
+                row = int(request_rows[0])
+            draft_ids = draft_ids[row]
+        state = self.dspark.record_bootstrap(
+            request_id, slot=slot, generation=generation,
+            prompt_length=prompt_length, anchor=anchor,
+            draft_ids=[int(token) for token in draft_ids.tolist()],
         )
+        return state
 
     def run_dspark_decode(self, request_ids, *, stages, accepted_counts=None,
-                          last_sampled=None, draft_ids=None):
+                          last_sampled=None, draft_ids=None, lowered=None):
         if self.dspark is None:
             raise MissingCompositeInterface("V4.1 DSpark programs were not registered")
-        # The current serving adapter only has the individual stage dispatch
-        # seam.  It does not yet lower the target decode inputs or collect the
-        # accepted IDs/draft counts needed by DecodeResult.  Calling the state
-        # tracker here would run device stages and return None, which the
-        # worker would then misinterpret as a completed decode result.
-        raise MissingCompositeInterface(
-            "V4.1 DSpark decode output lowering is not implemented: "
-            "serving must bind target decode, acceptance, draft/Markov outputs "
-            "and return DecodeResult"
+        if lowered is None:
+            raise MissingCompositeInterface(
+                "V4.1 DSpark decode output lowering is not implemented: "
+                "serving must bind target decode, acceptance, draft/Markov outputs "
+                "and return DecodeResult"
+            )
+        for request_id in request_ids:
+            self.dspark.states.get(request_id)
+        self._run_dspark_orchestrator(lowered, phase="decode")
+        counts_tensor = self._read_dspark_output(lowered, "accepted_counts")
+        accepted_tensor = self._read_dspark_output(lowered, "accepted_ids")
+        sampled_tensor = self._read_dspark_output(lowered, "last_sampled")
+        drafts_tensor = self._read_dspark_output(lowered, "draft_ids")
+        ranks, rows = self._dspark_request_rows(lowered, len(request_ids))
+        accepted, counts, sampled, drafts = [], [], [], []
+        for request_id, rank, row in zip(request_ids, ranks, rows, strict=True):
+            count = int(self._dspark_output_row(counts_tensor, rank=rank, row=row))
+            if not 1 <= count <= 6:
+                raise ValueError(f"DSpark accepted count for {request_id!r} is outside [1, 6]")
+            ids = self._dspark_output_row(accepted_tensor, rank=rank, row=row)
+            token_ids = [int(token) for token in ids[:count].tolist()]
+            sampled_token = int(self._dspark_output_row(sampled_tensor, rank=rank, row=row))
+            draft_row = self._dspark_output_row(drafts_tensor, rank=rank, row=row)
+            draft = [int(token) for token in draft_row[:5].tolist()]
+            self.dspark.states.get(request_id).validate_accept(count, sampled_token)
+            accepted.append(token_ids)
+            counts.append(count)
+            sampled.append(sampled_token)
+            drafts.append(draft)
+        self.dspark.apply_decode_outputs(
+            request_ids, accepted_counts=counts, last_sampled=sampled, draft_ids=drafts,
+        )
+        return DecodeResult(
+            hidden_states=None, logits=None,
+            accepted_token_ids=accepted,
+            num_draft_tokens=[5] * len(request_ids),
         )
 
     def finish_step(self, state, step):
