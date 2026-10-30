@@ -36,16 +36,17 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
 
 @pytest.mark.parametrize("tp_size", [1, 4])
 @pytest.mark.parametrize("prefill_tokens", [128, 8192])
-def test_cache_budget_treats_max_num_seqs_as_an_upper_limit(tp_size, prefill_tokens):
+@pytest.mark.parametrize("max_seq_len,budget", [(310000, 8530341888), (262144, 8457752576)],
+                         ids=["reported-310k", "daily-ci-256k"])
+def test_cache_budget_treats_max_num_seqs_as_an_upper_limit(tp_size, prefill_tokens, max_seq_len, budget):
     from pypto_serving.config.types import RuntimeConfig
     from pypto_serving.model.deepseek_dspark.cache_capacity import cache_pool_bytes, plan_cache_pages
     from pypto_serving.serving.memory.kv_cache import KvCacheManager
 
-    runtime = RuntimeConfig(max_batch_size=256, max_seq_len=310000)
+    runtime = RuntimeConfig(max_batch_size=256, max_seq_len=max_seq_len)
     partitions = 16 // tp_size
     groups = build_dspark_cache_group_specs(43, (0, 0) + (4,) * 21 + (128,) * 20,
         max_seq_len=runtime.max_seq_len, max_prefill_tokens=prefill_tokens, partitions=partitions)
-    budget = 8530341888
     counts = plan_cache_pages(groups, budget, active_requests=runtime.max_batch_size // partitions,
                              step_tokens=prefill_tokens, filler_pages=64)
     assert cache_pool_bytes(groups, counts, filler_pages=64) <= budget
@@ -73,7 +74,7 @@ def test_cache_budget_treats_max_num_seqs_as_an_upper_limit(tp_size, prefill_tok
     assert manager.group_request_partition("short-1") == manager.group_request_partition("short-2") == 0
     for request in ("short-1", "short-2"):
         manager.release_all_group_requests(request)
-    assert runtime.max_batch_size == 256 and runtime.max_seq_len == 310000
+    assert runtime.max_batch_size == 256 and runtime.max_seq_len == max_seq_len
 
 
 @pytest.mark.parametrize("resident", [1, 2, 4])
