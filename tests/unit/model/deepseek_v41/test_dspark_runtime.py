@@ -14,6 +14,7 @@ import pytest
 from pypto_serving.model.deepseek_v41.dspark_runtime import (
     DECODE_STAGE_ORDER,
     DSparkDecodeDispatch,
+    DSparkLoweredInputs,
     DSparkPrefillDispatch,
     DSPARK_SPECULATIVE_TOKENS,
     PREFILL_STAGE_ORDER,
@@ -162,6 +163,42 @@ def test_dspark_batch_hook_rejects_missing_required_fields():
     batch = type("Batch", (), {"dspark_stages": {"request_ids": ("request-0",)}})()
     with pytest.raises(ValueError, match="missing fields: stages"):
         DSparkDecodeDispatch.from_batch(batch)
+
+
+def test_dspark_batch_hook_validates_complete_lowered_bundle():
+    lowered = DSparkLoweredInputs.from_mapping({
+        "state": object(), "workspace": {"accepted_ids": object()},
+        "target_model": {}, "draft_model": {}, "markov_model": {},
+        "cache_tables": {}, "rope_tables": {}, "attention_epoch": 3,
+    })
+    dispatch = DSparkDecodeDispatch.from_batch(type("Batch", (), {
+        "dspark_stages": {
+            "request_ids": ("request-0",), "stages": (), "lowered": lowered,
+            "request_ranks": (2,),
+        },
+    })())
+    assert dispatch.lowered is lowered
+    assert dispatch.request_ranks == (2,)
+
+    with pytest.raises(ValueError, match="missing: workspace"):
+        DSparkLoweredInputs.from_mapping({"state": object()})
+    with pytest.raises(TypeError, match="markov_model"):
+        DSparkLoweredInputs.from_mapping({
+            "state": object(), "workspace": {}, "markov_model": object(),
+        })
+
+
+def test_dspark_record_bootstrap_updates_state_without_redispatch():
+    dispatch = _DispatchLog()
+    runtime = V41DSparkRuntime(dispatch, max_seq_len=128)
+    state = runtime.record_bootstrap(
+        "request-0", slot=0, generation=1, prompt_length=8, anchor=8,
+        draft_ids=[0, 1, 0, 1, 0],
+    )
+    assert state.valid
+    assert state.anchor == 8
+    assert state.draft_ids == (0, 1, 0, 1, 0)
+    assert dispatch.calls == []
 
 
 def test_dspark_stage_runner_rejects_unknown_phase_before_dispatch():
