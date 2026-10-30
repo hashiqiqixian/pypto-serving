@@ -35,6 +35,70 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
 
 
 @pytest.mark.parametrize("tp_size", [1, 4])
+@pytest.mark.parametrize("prefill_tokens", [128, 8192])
+def test_cache_budget_treats_max_num_seqs_as_an_upper_limit(tp_size, prefill_tokens):
+    from pypto_serving.config.types import RuntimeConfig
+    from pypto_serving.model.deepseek_dspark.cache_capacity import cache_pool_bytes, plan_cache_pages
+    from pypto_serving.serving.memory.kv_cache import KvCacheManager
+
+    runtime = RuntimeConfig(max_batch_size=256, max_seq_len=310000)
+    partitions = 16 // tp_size
+    groups = build_dspark_cache_group_specs(43, (0, 0) + (4,) * 21 + (128,) * 20,
+        max_seq_len=runtime.max_seq_len, max_prefill_tokens=prefill_tokens, partitions=partitions)
+    budget = 8530341888
+    counts = plan_cache_pages(groups, budget, active_requests=runtime.max_batch_size // partitions,
+                             step_tokens=prefill_tokens, filler_pages=64)
+    assert cache_pool_bytes(groups, counts, filler_pages=64) <= budget
+    rolling = [g for g in groups if g.sliding_window is not None]
+    per_request = {g.name: g.max_blocks_per_seq
+        + (prefill_tokens + g.spec.token_capacity - 1) // g.spec.token_capacity
+        + g.sliding_window // g.spec.token_capacity for g in rolling}
+    resident = counts["ori"] // per_request["ori"]
+    assert 1 <= resident <= runtime.max_batch_size // partitions
+    assert all(counts[g.name] == resident * per_request[g.name] for g in rolling)
+    assert all(counts[g.name] >= g.max_blocks_per_seq for g in groups)
+    if prefill_tokens == 8192:
+        assert resident == 1
+    # The physical page counts, not the configured scheduling ceiling, remain
+    # authoritative for the ordinary and PD cache allocation paths.
+    manager = KvCacheManager()
+    manager.initialize(replace(runtime, kv_cache_groups=groups), num_blocks=counts["ori"],
+                       group_num_blocks=counts)
+    assert {g.name: manager.group_num_blocks(g.name) for g in groups} == counts
+    blocks = manager.ensure_group_blocks("maximum-context", runtime.max_seq_len, partition=0)
+    assert {name: len(ids) for name, ids in blocks.items()} == {g.name: g.max_blocks_per_seq for g in groups}
+    manager.release_all_group_requests("maximum-context")
+    for request in ("short-1", "short-2"):
+        manager.ensure_group_blocks(request, 512, partition=0)
+    assert manager.group_request_partition("short-1") == manager.group_request_partition("short-2") == 0
+    for request in ("short-1", "short-2"):
+        manager.release_all_group_requests(request)
+    assert runtime.max_batch_size == 256 and runtime.max_seq_len == 310000
+
+
+@pytest.mark.parametrize("resident", [1, 2, 4])
+def test_cache_budget_preserves_async_checkpoint_minimum(resident):
+    from pypto_serving.model.deepseek_dspark.cache_capacity import cache_pool_bytes, plan_cache_pages
+
+    groups = build_dspark_cache_group_specs(43, (0, 0) + (4,) * 21 + (128,) * 20,
+        max_seq_len=310000, max_prefill_tokens=8192, partitions=4)
+    minimum_counts = {g.name: max(g.max_blocks_per_seq, resident * (8192 // g.spec.token_capacity))
+        if g.sliding_window is None else resident * (g.max_blocks_per_seq
+            + 8192 // g.spec.token_capacity + g.sliding_window // g.spec.token_capacity)
+        for g in groups}
+    budget = cache_pool_bytes(groups, minimum_counts, filler_pages=64)
+    if resident == 1:
+        assert budget == 7790919680
+        with pytest.raises(RuntimeError, match=f"minimum {budget}"):
+            plan_cache_pages(groups, budget - 1, active_requests=64, step_tokens=8192, filler_pages=64)
+    counts = plan_cache_pages(groups, budget, active_requests=64, step_tokens=8192, filler_pages=64)
+    assert cache_pool_bytes(groups, counts, filler_pages=64) <= budget
+    for group in groups:
+        if group.sliding_window is not None:
+            assert counts[group.name] == minimum_counts[group.name]
+
+
+@pytest.mark.parametrize("tp_size", [1, 4])
 def test_page_budget_uses_fractional_slot_without_changing_rings(tp_size):
     from pypto_serving.config.types import RuntimeConfig
     from pypto_serving.model.deepseek_dspark.cache_capacity import cache_pool_bytes, plan_cache_pages
