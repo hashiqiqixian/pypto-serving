@@ -358,3 +358,25 @@ def test_monitor_starts_and_stops_cleanly():
 
     assert asyncio.run(check()) > 0
     asyncio.run(monitor.stop())  # safe without a start
+
+
+def test_a_full_connection_pool_does_not_demote_a_healthy_replica():
+    """PoolTimeout is the router running out of its own connections.
+
+    It says nothing about the replica, and it hits every replica at once,
+    because the pool is the thing they share. Counting it as a failed probe
+    takes a healthy fleet out of rotation -- and, now that a replica which
+    stays unroutable is stopped and replaced, spends a model load on each.
+    """
+    httpx = pytest.importorskip("httpx")
+    monitor, registry, _ = _monitor(
+        answers={"http://h:8000/health": httpx.PoolTimeout("no free connection")}
+    )
+
+    async def several_cycles():
+        for _ in range(UNHEALTHY_THRESHOLD + 2):
+            await monitor.probe_once()
+
+    asyncio.run(several_cycles())
+    assert registry.state("r0").ready is True
+    assert registry.state("r0").failures == 0, "a probe that never left is not a failure"

@@ -31,6 +31,12 @@ DEFAULT_HEALTH_INTERVAL_SECONDS = 5.0
 # the whole exchange instead.
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 3600.0
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
+
+# The ceiling on upstream connections the router holds at once, which is the
+# ceiling on concurrent requests. httpx defaults this to 100 and that number is
+# easy to reach with long streams, so it is stated here rather than inherited.
+DEFAULT_MAX_CONNECTIONS = 512
+DEFAULT_MAX_KEEPALIVE_CONNECTIONS = 64
 # A model load is minutes, not seconds, and the spread is wide: Qwen3-14B
 # reports ready in ~130s with a warm kernel cache, DeepSeek V4 on eight cards in
 # ~370s as measured here. Older measurements of DeepSeek on a different
@@ -40,6 +46,10 @@ DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
 DEFAULT_LAUNCH_TIMEOUT_SECONDS = 600.0
 # Aborting a half-finished generation to reclaim a device is worse than waiting.
 DEFAULT_DRAIN_TIMEOUT_SECONDS = 300.0
+# How long a replica has to stay unroutable before the router stops waiting for
+# it to come back and refills its slot. Long next to the ~5s it takes to leave
+# rotation, because leaving rotation costs nothing and this costs a model load.
+DEFAULT_REPLACE_AFTER_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -176,12 +186,17 @@ class RouterConfig:
     health_interval_seconds: float = DEFAULT_HEALTH_INTERVAL_SECONDS
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
     connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS
+    max_connections: int = DEFAULT_MAX_CONNECTIONS
+    max_keepalive_connections: int = DEFAULT_MAX_KEEPALIVE_CONNECTIONS
     launch_timeout_seconds: float = DEFAULT_LAUNCH_TIMEOUT_SECONDS
     drain_timeout_seconds: float = DEFAULT_DRAIN_TIMEOUT_SECONDS
     # Zero by default: a config with only static replicas launches nothing.
     # The CLI raises this to 1 when the file declares launchable hosts.
     initial_replicas: int = 0
     max_replicas: int | None = None
+    # Refill a slot whose replica died, without waiting for an operator.
+    replace_dead: bool = True
+    replace_after_seconds: float = DEFAULT_REPLACE_AFTER_SECONDS
 
     def __post_init__(self) -> None:
         if not self.replicas and not self.hosts:
@@ -251,12 +266,18 @@ class RouterConfig:
         # request timeout aborts a proxied upload rather than its response read.
         if self.request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
+        if self.max_connections < 1:
+            raise ValueError("max_connections must be at least 1")
+        if not 0 <= self.max_keepalive_connections <= self.max_connections:
+            raise ValueError("max_keepalive_connections must be between 0 and max_connections")
         if self.connect_timeout_seconds <= 0:
             raise ValueError("connect_timeout_seconds must be positive")
         if self.launch_timeout_seconds <= 0:
             raise ValueError("launch_timeout_seconds must be positive")
         if self.drain_timeout_seconds <= 0:
             raise ValueError("drain_timeout_seconds must be positive")
+        if self.replace_after_seconds <= 0:
+            raise ValueError("replace_after_seconds must be positive")
         if self.initial_replicas < 0:
             raise ValueError("initial_replicas must be non-negative")
         if self.max_replicas is not None and self.max_replicas < 1:

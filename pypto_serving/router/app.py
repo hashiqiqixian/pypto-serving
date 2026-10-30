@@ -31,6 +31,7 @@ from pypto_serving.router.config import (
     DEFAULT_DRAIN_TIMEOUT_SECONDS,
     DEFAULT_HEALTH_INTERVAL_SECONDS,
     DEFAULT_LAUNCH_TIMEOUT_SECONDS,
+    DEFAULT_REPLACE_AFTER_SECONDS,
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_SESSION_TTL_SECONDS,
     RouterConfig,
@@ -39,12 +40,25 @@ from pypto_serving.router.config import (
 from pypto_serving.router.fleet import FleetManager, PoolExhausted
 from pypto_serving.router.launcher import LaunchError
 from pypto_serving.router.proxy import SESSION_HEADER, ReplicaProxy
-from pypto_serving.router.routing import HealthMonitor, ReplicaRegistry, SessionDirectory
+from pypto_serving.router.routing import (
+    HealthMonitor,
+    ReplicaRegistry,
+    SessionDirectory,
+    is_router_side_failure,
+)
 
 logger = logging.getLogger(__name__)
 
 # Preferred over --admin-token: argv is world-readable on the router host.
 ADMIN_TOKEN_ENV = "PYPTO_ROUTER_ADMIN_TOKEN"
+
+
+class ProbeNotSent(RuntimeError):
+    """A probe that failed in the router, before it could reach the replica.
+
+    Separate from a silent endpoint on purpose: silence is evidence about the
+    replica, this is evidence about us.
+    """
 
 try:
     from fastapi import FastAPI, Request
@@ -63,10 +77,25 @@ def default_client_factory(config: RouterConfig):
         raise ImportError("The serving router requires httpx. Install with: pip install httpx") from e
 
     # No read timeout: decode is slow by design and a token can be seconds away.
+    #
+    # pool is set explicitly because it otherwise inherits request_timeout: a
+    # request with no free connection would then wait an hour for one rather
+    # than failing, which is not a wait any client is asking for.
     timeout = httpx.Timeout(
-        config.request_timeout_seconds, connect=config.connect_timeout_seconds, read=None
+        config.request_timeout_seconds,
+        connect=config.connect_timeout_seconds,
+        read=None,
+        pool=config.connect_timeout_seconds,
     )
-    return httpx.AsyncClient(timeout=timeout, follow_redirects=False)
+    # Explicit, rather than httpx's default of 100. This is the ceiling on
+    # concurrent upstream requests, and a deployment whose clients hold long
+    # streams -- a coding agent does -- reaches it with far fewer users than
+    # the number suggests.
+    limits = httpx.Limits(
+        max_connections=config.max_connections,
+        max_keepalive_connections=config.max_keepalive_connections,
+    )
+    return httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=False)
 
 
 class ServingRouter:
@@ -81,8 +110,15 @@ class ServingRouter:
         self.sessions = SessionDirectory(config.session_ttl_seconds)
         self.registry = ReplicaRegistry(config, self.sessions)
         self.client = client_factory(config)
+        # A second client, so probes have a connection pool of their own. They
+        # share the proxy's otherwise, and a coding agent's long streams can
+        # hold every slot in it: the probes then fail for want of a connection
+        # and the fleet reads that as replicas dying. One pool makes router
+        # congestion indistinguishable from a dead backend, for every replica
+        # at once, because the pool is what they have in common.
+        self.probe_client = client_factory(config)
         self.proxy = ReplicaProxy(self.registry, self.client)
-        self.health = HealthMonitor(config, self.registry, self.sessions, self.client)
+        self.health = HealthMonitor(config, self.registry, self.sessions, self.probe_client)
         self._admin_token = admin_token
         fleet_kwargs = {
             "state_path": state_path,
@@ -135,23 +171,36 @@ class ServingRouter:
         finally:
             await self.fleet.stop_all()
             await self.health.stop()
-            close = getattr(self.client, "aclose", None)
-            if close is not None:
-                await close()
+            for client in (self.client, self.probe_client):
+                close = getattr(client, "aclose", None)
+                if close is not None:
+                    await close()
 
     async def _health_status(self, spec) -> int | None:
-        """The replica's /health status, or None if nothing answered."""
+        """The replica's /health status, or None if nothing answered.
+
+        Raises ProbeNotSent when the request never left the router, which is a
+        third answer: not "200", not "silent", but "we did not get to ask".
+        """
         try:
-            response = await self.client.get(
+            response = await self.probe_client.get(
                 f"{spec.base_url}/health", timeout=self.config.connect_timeout_seconds
             )
-        except Exception:  # noqa: BLE001 - unreachable is the answer, not an error
+        except Exception as exc:  # noqa: BLE001 - unreachable is the answer, not an error
+            if is_router_side_failure(exc):
+                raise ProbeNotSent(str(exc)) from exc
             return None
         return response.status_code
 
     async def _probe_replica(self, spec) -> bool:
         """Is a replica *serving* at this address? Readiness, so 200 only."""
-        return (await self._health_status(spec)) == 200
+        try:
+            return (await self._health_status(spec)) == 200
+        except ProbeNotSent:
+            # Not ready, because we cannot say it is. This probe decides
+            # whether to adopt or to keep waiting, and both are recoverable --
+            # unlike the liveness answer below, which frees devices.
+            return False
 
     async def _endpoint_answers(self, spec) -> bool:
         """Is *anything* still answering at this address? Any status counts.
@@ -162,7 +211,14 @@ class ServingRouter:
         Reading that as readiness is correct; reading it as an exit is how those
         devices get handed to the next launch.
         """
-        return (await self._health_status(spec)) is not None
+        try:
+            return (await self._health_status(spec)) is not None
+        except ProbeNotSent:
+            # Our own pool, not the replica's silence. The caller treats False
+            # as "the process is gone" and relaunches onto its cards, so a
+            # router that is merely busy would put a second serving process on
+            # a device group the first one still holds. Assume it is there.
+            return True
 
     def _authorized(self, request: Request) -> bool:
         if self._admin_token is None:
@@ -194,6 +250,9 @@ class ServingRouter:
             "ready": state.ready,
             "draining": state.draining,
             "owned": state.owned,
+            # starting / ready / draining / failed. "ready" alone could not say
+            # whether an unroutable replica was still loading or had died.
+            "phase": state.phase,
             "outstanding": state.outstanding,
             "routed": state.routed,
         }
@@ -239,6 +298,14 @@ class ServingRouter:
             return self._unauthorized()
         state = self.registry.state(name)
         if state is None:
+            # Checked before the 404: between a dead replica's stop and its
+            # replacement's launch there is no registry entry, and answering
+            # "no such replica" there would let the one the operator just
+            # retired come back a moment later.
+            if self.fleet.cancel_replacement(name):
+                return JSONResponse({"name": name, "stopped": True,
+                                     "message": "its replacement was called off",
+                                     "capacity": self.fleet.capacity()})
             return JSONResponse(
                 status_code=404,
                 content={"object": "error", "message": f"no replica named {name!r}"},
@@ -249,6 +316,12 @@ class ServingRouter:
                 content={"object": "error",
                          "message": f"replica {name!r} was not launched by this router"},
             )
+        # Disarmed before the stop, not only once the entry has gone: a
+        # replacement sets its flag and *then* drains, which can take the whole
+        # drain timeout. A DELETE inside that window joins the retirement
+        # already running and is answered "stopped", while the replacement --
+        # still armed -- puts the replica back a moment later.
+        self.fleet.cancel_replacement(name)
         stopped = await self.fleet.stop(name)
         if not stopped:
             # Out of rotation, but its devices are in an unknown state, so the
@@ -273,6 +346,9 @@ class ServingRouter:
         payload = {
             "status": "ok" if ready else "no_replicas",
             "replicas_ready": ready,
+            # Reported here and not only on /replicas, which needs the admin
+            # token: how many replicas died is operational, not administrative.
+            "replicas_failed": self.registry.failed_count(),
             "replicas_total": len(self.registry.states),
             "sessions": len(self.sessions),
             "routed": self.registry.total_routed(),
@@ -280,7 +356,7 @@ class ServingRouter:
             "rejected": self.registry.rejected,
             "replicas": [
                 {"name": s.name, "url": s.spec.base_url, "ready": s.ready,
-                 "outstanding": s.outstanding, "routed": s.routed}
+                 "phase": s.phase, "outstanding": s.outstanding, "routed": s.routed}
                 for s in self.registry.states
             ],
         }
@@ -357,6 +433,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--drain-timeout", type=float, default=DEFAULT_DRAIN_TIMEOUT_SECONDS,
                         help="Seconds to wait for in-flight requests before stopping a replica "
                              f"(default: {DEFAULT_DRAIN_TIMEOUT_SECONDS:g}).")
+    parser.add_argument("--replace-after", type=float, default=DEFAULT_REPLACE_AFTER_SECONDS,
+                        metavar="SECONDS",
+                        help="Seconds a replica may stay unroutable before the router retires it "
+                             "and launches another on the same device(s) "
+                             f"(default: {DEFAULT_REPLACE_AFTER_SECONDS:g}).")
+    parser.add_argument("--no-replace-dead", action="store_true",
+                        help="Leave a replica that died in place instead of replacing it. Its "
+                             "device(s) stay held, which is what you want while investigating "
+                             "one.")
     parser.add_argument("--state-file", default=None, metavar="PATH",
                         help="Where to record launched replicas so a restarted router can adopt "
                              "them instead of paying for a fresh model load.")
@@ -406,6 +491,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             connect_timeout_seconds=args.connect_timeout,
             launch_timeout_seconds=args.launch_timeout,
             drain_timeout_seconds=args.drain_timeout,
+            replace_dead=not args.no_replace_dead,
+            replace_after_seconds=args.replace_after,
             initial_replicas=initial,
             max_replicas=args.max_replicas,
         )

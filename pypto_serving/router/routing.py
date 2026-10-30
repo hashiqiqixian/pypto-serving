@@ -46,6 +46,25 @@ UNHEALTHY_THRESHOLD = 2
 DEFAULT_MAX_SESSIONS = 100_000
 
 
+def is_router_side_failure(exc: BaseException) -> bool:
+    """Did the request fail inside the router rather than at the replica?
+
+    httpx raises PoolTimeout when *our* connection pool has no free slot, which
+    happens when the router is busy and says nothing about the replica at the
+    other end. Every other transport error -- refused, reset, read timeout --
+    is evidence about the replica and is meant to count.
+
+    The distinction matters because a demotion is no longer only a pause in
+    rotation: a replica that stays unroutable long enough is now stopped and
+    replaced, at the price of a model load. Router congestion must not buy that.
+    """
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover - the router cannot run without it
+        return False
+    return isinstance(exc, httpx.PoolTimeout)
+
+
 class NoReplicaAvailable(RuntimeError):
     """Raised when every replica in the table is unroutable."""
 
@@ -140,6 +159,16 @@ class ReplicaState:
     draining: bool = False
     # True only for replicas this router started, and so may stop.
     owned: bool = False
+    # Whether this replica has ever reported ready. It is the only thing that
+    # separates one that died from one that has not finished loading: both are
+    # unroutable entries with everything else identical.
+    ever_ready: bool = False
+
+    def __post_init__(self) -> None:
+        # A statically configured replica starts routable, so it counts as
+        # having been ready: one that never answers has to read as failed
+        # rather than as forever starting.
+        self.ever_ready = self.ready
 
     @property
     def name(self) -> str:
@@ -148,6 +177,15 @@ class ReplicaState:
     @property
     def routable(self) -> bool:
         return self.ready and not self.draining
+
+    @property
+    def phase(self) -> str:
+        """``starting``, ``ready``, ``draining`` or ``failed``."""
+        if self.draining:
+            return "draining"
+        if self.ready:
+            return "ready"
+        return "failed" if self.ever_ready else "starting"
 
 
 @dataclass
@@ -179,6 +217,10 @@ class ReplicaRegistry:
 
     def ready_count(self) -> int:
         return sum(1 for state in self._states if state.routable)
+
+    def failed_count(self) -> int:
+        """Replicas that were serving and are not any more."""
+        return sum(1 for state in self._states if state.phase == "failed")
 
     def total_routed(self) -> int:
         return sum(state.routed for state in self._states)
@@ -245,7 +287,13 @@ class ReplicaRegistry:
 
     def set_ready(self, name: str, ready: bool) -> None:
         state = self._by_name.get(name)
-        if state is None or state.ready == ready:
+        if state is None:
+            return
+        if ready:
+            # Recorded before the unchanged-value return below, which a replica
+            # that is already ready takes every single poll.
+            state.ever_ready = True
+        if state.ready == ready:
             return
         state.ready = ready
         logger.info("replica %s is now %s", name, "routable" if ready else "unroutable")
@@ -356,6 +404,16 @@ class HealthMonitor:
             )
             healthy = response.status_code == 200
         except Exception as exc:  # noqa: BLE001 - refused and timeout both mean unroutable
+            if is_router_side_failure(exc):
+                # The probe never left the router, so this cycle saw nothing.
+                # Leaving failures and readiness untouched keeps a busy router
+                # from demoting -- and, with replacement on, reloading -- a
+                # fleet of replicas that are all perfectly healthy.
+                logger.warning(
+                    "health probe of %s could not be sent: %s; leaving its state alone",
+                    state.name, exc,
+                )
+                return
             logger.debug("health probe of %s failed: %s", state.name, exc)
 
         if healthy:

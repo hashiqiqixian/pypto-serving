@@ -37,7 +37,21 @@ COMMAND_TIMEOUT_SECONDS = 120.0
 
 
 class LaunchError(RuntimeError):
-    """A replica could not be started or stopped."""
+    """A replica could not be started or stopped.
+
+    ``exit_code`` is the command's own status when it ran at all, and None when
+    it could not be run. The two are different answers: a stop command that
+    exits non-zero has reported something about the host, a stop command that
+    never ran has reported nothing.
+    """
+
+    def __init__(self, message: str, *, exit_code: int | None = None) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+# pkill's "no process matched". 0 is a kill, 2 and 3 are its own errors.
+_NOTHING_MATCHED = 1
 
 
 class PoolExhausted(RuntimeError):
@@ -133,7 +147,10 @@ async def _run_and_wait(argv: list[str]) -> str:
 
     output = (stdout or b"").decode(errors="replace").strip()
     if process.returncode != 0:
-        raise LaunchError(f"{argv[0]!r} exited {process.returncode}: {output[-800:]}")
+        raise LaunchError(
+            f"{argv[0]!r} exited {process.returncode}: {output[-800:]}",
+            exit_code=process.returncode,
+        )
     return output
 
 
@@ -406,7 +423,7 @@ class HostPool:
         )
         return LaunchedReplica(slot=slot, spec=slot.replica_spec())
 
-    async def signal_stop(self, slot: Slot) -> bool:
+    async def signal_stop(self, slot: Slot) -> bool | None:
         """Ask a replica to stop. Does not release the slot.
 
         Signalling is not stopping: a stop command returns as soon as the signal
@@ -414,14 +431,28 @@ class HostPool:
         down and let go of its port. The slot stays taken until the caller has
         confirmed it is really gone, or a relaunch could race the port.
 
-        Returns whether the command itself succeeded. A failure is reported
-        rather than raised -- the caller decides what an unconfirmed stop means
-        for the slot -- but it must not be read as "stopped".
+        Three answers, because the caller needs them apart:
+          True  -- the command ran and killed something;
+          None  -- the command ran and matched nothing, which is pkill's exit 1;
+          False -- the command could not be run, so nothing is known.
+
+        A failure is reported rather than raised -- the caller decides what an
+        unconfirmed stop means for the slot -- but it must not be read as
+        "stopped".
         """
         transport = self._transport_factory(slot.host)
         try:
             await transport.run(slot.host, self.stop_argv(slot), {}, detach=False)
         except LaunchError as exc:
+            if exc.exit_code == _NOTHING_MATCHED and not slot.host.stop_command:
+                # The default stop is pkill, which matches on the command line
+                # and so finds a replica from the instant it execs -- long
+                # before it binds its port. Nothing matched therefore means
+                # nothing is running, not "we looked too early". Only the
+                # default command has this meaning; a configured one is free to
+                # use the exit code however it likes.
+                logger.info("stopping replica %s matched no process", slot.name)
+                return None
             # A stop command that fails leaves the device in an unknown state,
             # so the caller must not treat the slot as reclaimed.
             logger.warning("stopping replica %s failed: %s", slot.name, exc)
