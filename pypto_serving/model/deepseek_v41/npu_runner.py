@@ -1610,7 +1610,8 @@ class V41ModelRunner:
         )
 
     def run_dspark_decode(self, request_ids, *, stages, accepted_counts=None,
-                          last_sampled=None, draft_ids=None, lowered=None):
+                          last_sampled=None, draft_ids=None, lowered=None,
+                          request_ranks=None):
         """Run one target-accept-drafter-Markov-commit verification round."""
         if self.runtime.num_speculative_tokens != 5:
             raise ValueError("V4.1 DSpark requires num_speculative_tokens=5")
@@ -1619,7 +1620,7 @@ class V41ModelRunner:
         return self.resources.run_dspark_decode(
             request_ids, stages=stages, accepted_counts=accepted_counts,
             last_sampled=last_sampled, draft_ids=draft_ids,
-            lowered=lowered,
+            lowered=lowered, request_ranks=request_ranks,
         )
 
     def run_dspark_prefill_batch(self, batch):
@@ -1638,7 +1639,7 @@ class V41ModelRunner:
             dispatch.request_ids, stages=dispatch.stages,
             accepted_counts=dispatch.accepted_counts,
             last_sampled=dispatch.last_sampled, draft_ids=dispatch.draft_ids,
-            lowered=dispatch.lowered,
+            lowered=dispatch.lowered, request_ranks=dispatch.request_ranks,
         )
 
 
@@ -2936,6 +2937,7 @@ class V41ResidentResources:
             self.dspark = None
         self.weights = None
         self.dspark_weight_contract = dspark_weight_contract
+        self.failed = False
         self.closed = False
         try:
             self.weights = ResidentFullDecodeWeights(
@@ -3081,8 +3083,8 @@ class V41ResidentResources:
         ``decode_fwd_dspark`` orchestrator remain the owner of stage ordering;
         serving does not rebuild the drafter or Markov graph from small ops.
         """
-        if self.closed:
-            raise RuntimeError("cannot dispatch DSpark on a closed worker")
+        if self.closed or self.failed:
+            raise RuntimeError("cannot dispatch DSpark on a closed or failed worker")
         try:
             program = self.dspark_programs[stage]
             param_names = self.dspark_param_names[stage]
@@ -3102,6 +3104,19 @@ class V41ResidentResources:
         """Run the lib-owned orchestration against resident compiled stages."""
         if not isinstance(lowered, DSparkLoweredInputs):
             raise TypeError("DSpark orchestration requires lowered serving inputs")
+        if not lowered.workspace:
+            raise MissingCompositeInterface("V4.1 DSpark workspace lowering is empty")
+        required_mappings = (
+            ("draft_model", lowered.draft_model),
+            ("markov_model", lowered.markov_model),
+            ("cache_tables", lowered.cache_tables),
+            ("rope_tables", lowered.rope_tables),
+        )
+        missing = [name for name, mapping in required_mappings if not mapping]
+        if missing:
+            raise MissingCompositeInterface(
+                "V4.1 DSpark lowering is missing mappings: " + ", ".join(missing)
+            )
         try:
             module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd_dspark")
             function = (module.prefill_bootstrap_dspark if phase == "prefill"
@@ -3133,6 +3148,7 @@ class V41ResidentResources:
         except MissingCompositeInterface:
             raise
         except BaseException as exc:
+            self.failed = True
             raise RuntimeError(f"V4.1 DSpark {phase} orchestration failed") from exc
 
     def _read_dspark_output(self, lowered, name):
@@ -3166,10 +3182,18 @@ class V41ResidentResources:
         return result
 
     @staticmethod
-    def _dspark_output_row(value, *, rank, row):
+    def _dspark_output_row(value, *, rank, row, kind):
         if value.ndim == 1:
+            if row >= value.shape[0]:
+                raise ValueError(f"DSpark {kind} row is outside the output")
+            return value[row]
+        if kind in ("accepted_ids", "draft_ids") and value.ndim == 2:
+            if row >= value.shape[0]:
+                raise ValueError(f"DSpark {kind} row is outside the output")
             return value[row]
         if value.ndim >= 2:
+            if rank >= value.shape[0] or row >= value.shape[1]:
+                raise ValueError(f"DSpark {kind} rank/row is outside the output")
             return value[rank, row]
         raise ValueError("DSpark output tensor must have at least one dimension")
 
@@ -3204,26 +3228,25 @@ class V41ResidentResources:
                 "V4.1 DSpark prefill output lowering is not implemented: "
                 "serving must bind target hidden/sample outputs and publish draft state"
             )
-        self._run_dspark_orchestrator(lowered, phase="prefill")
-        draft_ids = self._read_dspark_output(lowered, "draft_ids")
-        if draft_ids.ndim == 3:
-            rank = 0 if lowered.request_ranks is None else int(lowered.request_ranks[0])
-            draft_ids = draft_ids[rank, 0]
-        elif draft_ids.ndim == 2:
-            row = 0
-            request_rows = lowered.outputs.get("request_rows", lowered.workspace.get("request_rows"))
-            if request_rows is not None:
-                row = int(request_rows[0])
-            draft_ids = draft_ids[row]
-        state = self.dspark.record_bootstrap(
-            request_id, slot=slot, generation=generation,
-            prompt_length=prompt_length, anchor=anchor,
-            draft_ids=[int(token) for token in draft_ids.tolist()],
-        )
-        return state
+        try:
+            self._run_dspark_orchestrator(lowered, phase="prefill")
+            draft_ids = self._read_dspark_output(lowered, "draft_ids")
+            rank, row = self._dspark_request_rows(lowered, 1)
+            draft_ids = self._dspark_output_row(
+                draft_ids, rank=rank[0], row=row[0], kind="draft_ids")
+            state = self.dspark.record_bootstrap(
+                request_id, slot=slot, generation=generation,
+                prompt_length=prompt_length, anchor=anchor,
+                draft_ids=[int(token) for token in draft_ids.tolist()],
+            )
+            return state
+        except BaseException:
+            self.failed = True
+            raise
 
     def run_dspark_decode(self, request_ids, *, stages, accepted_counts=None,
-                          last_sampled=None, draft_ids=None, lowered=None):
+                          last_sampled=None, draft_ids=None, lowered=None,
+                          request_ranks=None):
         if self.dspark is None:
             raise MissingCompositeInterface("V4.1 DSpark programs were not registered")
         if lowered is None:
@@ -3232,37 +3255,55 @@ class V41ResidentResources:
                 "serving must bind target decode, acceptance, draft/Markov outputs "
                 "and return DecodeResult"
             )
-        for request_id in request_ids:
-            self.dspark.states.get(request_id)
-        self._run_dspark_orchestrator(lowered, phase="decode")
-        counts_tensor = self._read_dspark_output(lowered, "accepted_counts")
-        accepted_tensor = self._read_dspark_output(lowered, "accepted_ids")
-        sampled_tensor = self._read_dspark_output(lowered, "last_sampled")
-        drafts_tensor = self._read_dspark_output(lowered, "draft_ids")
-        ranks, rows = self._dspark_request_rows(lowered, len(request_ids))
-        accepted, counts, sampled, drafts = [], [], [], []
-        for request_id, rank, row in zip(request_ids, ranks, rows, strict=True):
-            count = int(self._dspark_output_row(counts_tensor, rank=rank, row=row))
-            if not 1 <= count <= 6:
-                raise ValueError(f"DSpark accepted count for {request_id!r} is outside [1, 6]")
-            ids = self._dspark_output_row(accepted_tensor, rank=rank, row=row)
-            token_ids = [int(token) for token in ids[:count].tolist()]
-            sampled_token = int(self._dspark_output_row(sampled_tensor, rank=rank, row=row))
-            draft_row = self._dspark_output_row(drafts_tensor, rank=rank, row=row)
-            draft = [int(token) for token in draft_row[:5].tolist()]
-            self.dspark.states.get(request_id).validate_accept(count, sampled_token)
-            accepted.append(token_ids)
-            counts.append(count)
-            sampled.append(sampled_token)
-            drafts.append(draft)
-        self.dspark.apply_decode_outputs(
-            request_ids, accepted_counts=counts, last_sampled=sampled, draft_ids=drafts,
-        )
-        return DecodeResult(
-            hidden_states=None, logits=None,
-            accepted_token_ids=accepted,
-            num_draft_tokens=[5] * len(request_ids),
-        )
+        if request_ranks is not None and lowered.request_ranks is None:
+            lowered = replace(lowered, request_ranks=tuple(request_ranks))
+        try:
+            for request_id in request_ids:
+                self.dspark.states.get(request_id)
+            self._run_dspark_orchestrator(lowered, phase="decode")
+            counts_tensor = self._read_dspark_output(lowered, "accepted_counts")
+            accepted_tensor = self._read_dspark_output(lowered, "accepted_ids")
+            sampled_tensor = self._read_dspark_output(lowered, "last_sampled")
+            drafts_tensor = self._read_dspark_output(lowered, "draft_ids")
+            ranks, rows = self._dspark_request_rows(lowered, len(request_ids))
+            accepted, counts, sampled, drafts = [], [], [], []
+            for request_id, rank, row in zip(request_ids, ranks, rows, strict=True):
+                count = int(self._dspark_output_row(
+                    counts_tensor, rank=rank, row=row, kind="accepted_counts"))
+                if not 1 <= count <= 6:
+                    raise ValueError(f"DSpark accepted count for {request_id!r} is outside [1, 6]")
+                ids = self._dspark_output_row(
+                    accepted_tensor, rank=rank, row=row, kind="accepted_ids")
+                token_ids = [int(token) for token in ids[:count].tolist()]
+                sampled_token = int(self._dspark_output_row(
+                    sampled_tensor, rank=rank, row=row, kind="last_sampled"))
+                draft_row = self._dspark_output_row(
+                    drafts_tensor, rank=rank, row=row, kind="draft_ids")
+                draft = [int(token) for token in draft_row[:5].tolist()]
+                self.dspark.states.get(request_id).validate_accept(count, sampled_token)
+                accepted.append(token_ids)
+                counts.append(count)
+                sampled.append(sampled_token)
+                drafts.append(draft)
+            self.dspark.apply_decode_outputs(
+                request_ids, accepted_counts=counts, last_sampled=sampled, draft_ids=drafts,
+            )
+            draft_counts = lowered.outputs.get("draft_counts", lowered.workspace.get("draft_counts"))
+            if draft_counts is None:
+                draft_count_values = [5] * len(request_ids)
+            else:
+                draft_counts_tensor = self._read_dspark_output(lowered, "draft_counts")
+                draft_count_values = [int(self._dspark_output_row(
+                    draft_counts_tensor, rank=rank, row=row, kind="draft_counts"))
+                    for rank, row in zip(ranks, rows, strict=True)]
+            return DecodeResult(
+                hidden_states=None, logits=None,
+                accepted_token_ids=accepted,
+                num_draft_tokens=draft_count_values,
+            )
+        except BaseException:
+            self.failed = True
+            raise
 
     def finish_step(self, state, step):
         if self.closed or step is not self._step:
