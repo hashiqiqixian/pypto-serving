@@ -1142,17 +1142,18 @@ class WorkerProcess:
                     lower = getattr(self.executor, "lower_dspark_prefill_batch", None)
                     if not callable(lower):
                         self._require_v41_dspark_stages(runtime_model, batch, phase="prefill")
-                    if len(completed_request_ids) != 1:
-                        raise RuntimeError(
-                            "V4.1 DSpark prefill lowering currently requires one terminal request"
+                    for request_id, token_id in zip(
+                        completed_request_ids, completed_token_ids, strict=True
+                    ):
+                        dispatch = lower(
+                            runtime_model,
+                            batch,
+                            request_ids=(request_id,),
+                            sampled_token_ids=(token_id,),
                         )
-                    batch.dspark_stages = lower(
-                        runtime_model,
-                        batch,
-                        request_ids=completed_request_ids,
-                        sampled_token_ids=completed_token_ids,
-                    )
-                    self.executor.run_dspark_prefill_batch(batch)
+                        self.executor.run_dspark_prefill_batch(
+                            replace(batch, dspark_stages=dispatch)
+                        )
 
     def _resolve_decode_token(self, dr: DecodeRequest) -> int:
         """Return the decode input token, substituting from cache on placeholder.
