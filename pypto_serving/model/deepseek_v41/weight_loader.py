@@ -645,8 +645,9 @@ def iter_decode_weight_slices(model_dir, topology, *, max_bundle_bytes=32 << 30)
     """Yield one layer at a time in checkpoint order for bounded staging."""
     raw = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
     layers = plan_layers(raw)
-    if len(layers) != 40 or (topology.tp, topology.dp, topology.world) != (1, 8, 8):
-        raise ValueError("V4.1 M0 requires the 40-layer TP1/DP8/EP8 schedule")
+    if (len(layers) != 40 or topology.tp != 1
+            or topology.dp not in (4, 8) or topology.world != topology.dp):
+        raise ValueError("V4.1 requires the 40-layer TP1/DP4/EP4 or TP1/DP8/EP8 schedule")
     text = raw["text_config"]
     kv_sources = tuple(text["kv_source_layer_ids"])
     index_sources = tuple(text["index_source_layer_ids"])

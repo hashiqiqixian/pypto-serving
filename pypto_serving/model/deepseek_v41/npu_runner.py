@@ -41,12 +41,16 @@ from .task_args import (
     build_cache_groups,
     validate_cache_groups,
 )
+from .dspark_runtime import (
+    DSparkDecodeDispatch,
+    DSparkPrefillDispatch,
+    V41DSparkRuntime,
+)
 from .weight_loader import (
     DecodeWeightBank,
     DecodeWeightLayout,
     LayerPlan,
     RankPlacement,
-    ResidentDecodeWeights,
     ResidentFullDecodeWeights,
     RowAddressedCheckpoint,
     V41ExecutionPlan,
@@ -199,11 +203,11 @@ def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
         },
     }
     head, index, world = abi.HEAD_DIM, abi.INDEX_DIM, abi.EP_SIZE
-    if (world != 8 or any(type(value) is not int or value <= 0 for value in
+    if (world not in (4, 8) or any(type(value) is not int or value <= 0 for value in
                        (head, index, abi.STATE_CAPACITY, abi.STATE_WIDTH))
             or head % abi.WINDOW_CACHE_GROUP or head % abi.COMPRESSED_CACHE_GROUP
             or index % abi.INDEX_CACHE_GROUP):
-        raise ValueError("decode cache dimensions disagree with the V4.1 EP topology")
+        raise ValueError("decode cache dimensions disagree with the V4.1 EP4/EP8 topology")
     block = abi.BLOCK_SIZE
     window_pages = physical_group_blocks[resolved.window]
     # One lib source axis covers both compression families, so its stride must
@@ -574,15 +578,16 @@ class CompositeBindings:
                 raise MissingCompositeInterface(f"missing composite resource/output operation: {name}")
         if self.input_layout not in ("tp_replicated", "tp_local_token") or self.output_layout != self.input_layout:
             raise MissingCompositeInterface("layer entries must preserve their declared residual/pre_mix layout")
-        if (placement.tp_size, placement.dp_size, placement.ep_size) != (1, 8, 8):
-            raise ValueError("V4.1 serving currently targets TP1/DP8/EP8")
+        if (placement.tp_size != 1 or placement.dp_size not in (4, 8)
+                or placement.ep_size != placement.dp_size):
+            raise ValueError("V4.1 serving requires TP1 with matching DP/EP size 4 or 8")
 
 
-def load_composite_bindings(model_dir=None, max_seq_len=None, tokenizer=None) -> CompositeBindings:
+def load_composite_bindings(model_dir=None, max_seq_len=None, tokenizer=None, *, dp_size=None) -> CompositeBindings:
     """Resolve the model-specific contract without opening a device."""
     if model_dir is None or max_seq_len is None:
         raise ValueError("V4.1 composite bindings require a model directory and context length")
-    return make_production_bindings(model_dir, max_seq_len, tokenizer=tokenizer)
+    return make_production_bindings(model_dir, max_seq_len, tokenizer=tokenizer, dp_size=dp_size)
 
 
 # decode_padding
@@ -1563,6 +1568,53 @@ class V41ModelRunner:
             if self.ledger is not None:
                 self.bindings.wait(self.resources)
                 self.ledger.release(request_ids, self._reset_request)
+
+    def run_dspark_prefill(self, request_id, *, slot, generation, prompt_length,
+                           anchor, stages):
+        """Publish the first five drafts after a completed V4.1 prefill.
+
+        The scheduler/device adapter supplies already-bound stage arguments;
+        this method only owns request state and invokes the lib composites in
+        their documented order.
+        """
+        if self.runtime.num_speculative_tokens != 5:
+            raise ValueError("V4.1 DSpark requires num_speculative_tokens=5")
+        if not hasattr(self.resources, "run_dspark_prefill"):
+            raise MissingCompositeInterface("V4.1 resources do not expose DSpark stage dispatch")
+        return self.resources.run_dspark_prefill(
+            request_id, slot=slot, generation=generation,
+            prompt_length=prompt_length, anchor=anchor, stages=stages,
+        )
+
+    def run_dspark_decode(self, request_ids, *, stages, accepted_counts=None,
+                          last_sampled=None, draft_ids=None):
+        """Run one target-accept-drafter-Markov-commit verification round."""
+        if self.runtime.num_speculative_tokens != 5:
+            raise ValueError("V4.1 DSpark requires num_speculative_tokens=5")
+        if not hasattr(self.resources, "run_dspark_decode"):
+            raise MissingCompositeInterface("V4.1 resources do not expose DSpark stage dispatch")
+        return self.resources.run_dspark_decode(
+            request_ids, stages=stages, accepted_counts=accepted_counts,
+            last_sampled=last_sampled, draft_ids=draft_ids,
+        )
+
+    def run_dspark_prefill_batch(self, batch):
+        """Consume the typed DSpark prefill hook carried by a serving batch."""
+        dispatch = DSparkPrefillDispatch.from_batch(batch)
+        return self.run_dspark_prefill(
+            dispatch.request_id, slot=dispatch.slot, generation=dispatch.generation,
+            prompt_length=dispatch.prompt_length, anchor=dispatch.anchor,
+            stages=dispatch.stages,
+        )
+
+    def run_dspark_decode_batch(self, batch):
+        """Consume the typed DSpark decode hook carried by a serving batch."""
+        dispatch = DSparkDecodeDispatch.from_batch(batch)
+        return self.run_dspark_decode(
+            dispatch.request_ids, stages=dispatch.stages,
+            accepted_counts=dispatch.accepted_counts,
+            last_sampled=dispatch.last_sampled, draft_ids=dispatch.draft_ids,
+        )
 
 
 # prefill_segment
@@ -2554,8 +2606,9 @@ def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
                                      max_logit_rows: int = 16, chunk_rows: int = 64,
                                      max_host_bytes: int = 16 << 30) -> FinalOutputHostResources:
     """Load one TP vocabulary shard at a time before the worker forks."""
-    if not isinstance(topology, SegmentTopology) or (topology.tp, topology.dp) != (1, 8):
-        raise ValueError("V4.1 final output requires TP1/DP8 placement")
+    if (not isinstance(topology, SegmentTopology) or topology.tp != 1
+            or topology.dp not in (4, 8)):
+        raise ValueError("V4.1 final output requires TP1/DP4 or TP1/DP8 placement")
     if any(type(value) is not int or value <= 0 for value in
            (max_logit_rows, chunk_rows, max_host_bytes)):
         raise ValueError("final output capacities and memory budget must be positive")
@@ -2620,7 +2673,7 @@ class FinalOutputRuntime:
                 or host.logits.dtype != torch.float32
                 or host.logits.shape != (world, 16, host.head_weight.shape[1] * topology.tp)
                 or host.sampled_ids.dtype != torch.int32 or host.sampled_ids.shape != (world, 16, 8)):
-            raise ValueError("final output host buffers disagree with the lib TP1/DP8 ABI")
+            raise ValueError("final output host buffers disagree with the lib TP1/DP4 or TP1/DP8 ABI")
         self.worker, self.host, self.topology = worker, host, topology
         if (prefill_local_capacity is not None and
                 (type(prefill_local_capacity) is not int or not 0 < prefill_local_capacity <= 1024)):
@@ -2786,7 +2839,8 @@ class V41ResidentResources:
                  prefill_host, final_program, final_param_names, topology,
                  decode_input_host=None, decode_host=None, worker_factory=make_segment_worker,
                  prefill_program=None, prefill_param_names=None,
-                 dspark_programs=None, dspark_param_names=None):
+                 dspark_programs=None, dspark_param_names=None, max_seq_len=None,
+                 dspark_weight_contract=None):
         weight_bank.finish(weight_param_names)
         if decode_host is not None and (decode_input_host is None or
                 decode_host.topology != decode_input_host.topology):
@@ -2826,7 +2880,14 @@ class V41ResidentResources:
         self._prefill_binding = (prefill_program, prefill_param_names, run_config, topology)
         self.dspark_programs = dict(dspark_programs or {})
         self.dspark_param_names = dict(dspark_param_names or {})
+        if self.dspark_programs:
+            if type(max_seq_len) is not int or max_seq_len <= 0:
+                raise ValueError("DSpark resources require a positive max_seq_len")
+            self.dspark = V41DSparkRuntime(self, max_seq_len=max_seq_len)
+        else:
+            self.dspark = None
         self.weights = None
+        self.dspark_weight_contract = dspark_weight_contract
         self.closed = False
         try:
             self.weights = ResidentFullDecodeWeights(
@@ -2989,6 +3050,24 @@ class V41ResidentResources:
         self.worker.run(program.compiled,
                         *(arguments[name] for name in param_names), config=self.run_config)
 
+    def run_dspark_prefill(self, request_id, *, slot, generation, prompt_length,
+                           anchor, stages):
+        if self.dspark is None:
+            raise MissingCompositeInterface("V4.1 DSpark programs were not registered")
+        return self.dspark.bootstrap(
+            request_id, slot=slot, generation=generation,
+            prompt_length=prompt_length, anchor=anchor, stages=stages,
+        )
+
+    def run_dspark_decode(self, request_ids, *, stages, accepted_counts=None,
+                          last_sampled=None, draft_ids=None):
+        if self.dspark is None:
+            raise MissingCompositeInterface("V4.1 DSpark programs were not registered")
+        return self.dspark.decode(
+            request_ids, stages, accepted_counts=accepted_counts,
+            last_sampled=last_sampled, draft_ids=draft_ids,
+        )
+
     def finish_step(self, state, step):
         if self.closed or step is not self._step:
             raise ValueError("final output must use the active request step")
@@ -3000,6 +3079,9 @@ class V41ResidentResources:
     def reset_request(self, owner):
         self._step = self._inputs = self._group_counts = self._output_rows = None
         self.cache.reset_request(owner)
+        if self.dspark is not None:
+            self.dspark.release(tuple(request_id for request_id, value in self.dspark.states.requests.items()
+                                      if value.slot == owner.slot))
         if getattr(self, "engram", None) is not None:
             self.engram.history.pop(owner, None)
 
@@ -3097,11 +3179,13 @@ def _check_runtime_binaries(platform):
         builder.get_binaries(runtime)
 
 
-def make_production_bindings(model_dir, max_seq_len, *, tokenizer=None, engram_lookup_fn=None):
+def make_production_bindings(model_dir, max_seq_len, *, tokenizer=None, engram_lookup_fn=None,
+                             dp_size=None):
     model_dir = Path(model_dir).resolve()
     raw = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     layers = plan_layers(raw)
-    dp_size = int(os.environ.get("PYPTO_DSV41_DP_SIZE", "8"))
+    dp_size = (int(os.environ.get("PYPTO_DSV41_DP_SIZE", "8"))
+               if dp_size is None else dp_size)
     if dp_size not in (4, 8):
         raise ValueError("PYPTO_DSV41_DP_SIZE must be 4 or 8")
     groups = build_cache_groups(layers, max_seq_len, dp_size=dp_size)
@@ -3120,6 +3204,19 @@ def make_production_bindings(model_dir, max_seq_len, *, tokenizer=None, engram_l
         if len(device_ids) != topology.dp or options.platform != "a5":
             raise ValueError(f"V4.1 production binding requires {topology.dp} A5 devices")
         _check_runtime_binaries(options.platform)
+        dspark_weight_contract = None
+        if runtime.num_speculative_tokens:
+            from .dspark_weights import V41DSparkWeightContract
+
+            dspark_loader = V41WeightLoader(
+                model_dir, tp_size=topology.tp, tp_rank=0,
+                ep_size=topology.world, ep_rank=0, max_load_bytes=512 << 20,
+            )
+            dspark_weight_contract = V41DSparkWeightContract(dspark_loader)
+            # Validate the index before compiling or allocating the worker. The
+            # large three-layer draft bank is intentionally packed lazily by
+            # the stage-argument provider and is never materialized here.
+            dspark_weight_contract.validate_index()
         run_config = replace(
             build_pypto_run_config(
                 platform=options.platform,
@@ -3221,6 +3318,8 @@ def make_production_bindings(model_dir, max_seq_len, *, tokenizer=None, engram_l
             final_host=final_host, final_program=final, final_param_names=final_names,
             topology=topology, prefill_program=prefill, prefill_param_names=prefill_names,
             dspark_programs=dspark_programs, dspark_param_names=dspark_param_names,
+            max_seq_len=max_seq_len,
+            dspark_weight_contract=dspark_weight_contract,
         )
         resident.engram = engram
         _LOG.info("V4.1 resident upload and allocation %.2fs",
