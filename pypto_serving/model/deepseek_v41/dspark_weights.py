@@ -418,14 +418,12 @@ class V41DSparkWeightContract:
         return V41DSparkLayerWeights(tensors=tensors, routed_experts=routed)
 
     def _load_layer_for_rank(self, layer: int) -> dict[str, torch.Tensor]:
-        """Read one layer plus this loader's EP-local experts.
+        """Read the non-expert tensors for one draft layer.
 
         ``load_layer`` is kept as the shape-contract/debugging API and reads
-        every expert.  Runtime staging must use this bounded variant: the
-        deferred DSpark tensors are not part of ``V41WeightLoader.specs``, so
-        the generic loader cannot apply its backbone ownership filter.  The
-        explicit names below make the EP boundary visible and keep the raw
-        payload for at most one rank and one draft layer alive.
+        every expert. Runtime staging keeps the public layer payload separate
+        from expert reads; :meth:`_load_expert_for_rank` fetches one local
+        expert at a time.
         """
         if type(layer) is not int or layer not in DSPARK_DRAFT_LAYERS:
             raise ValueError("DSpark draft layer must be one of 0, 1 or 2")
@@ -439,12 +437,22 @@ class V41DSparkWeightContract:
             raise ValueError("V4.1 DSpark drafter packing currently requires TP1")
         prefix = f"mtp.{layer}."
         names = [prefix + suffix for suffix in _LAYER_SUFFIXES]
+        self.loader.store.require(names)
+        return self.loader.store.load_many(names)
+
+    def _load_expert_for_rank(self, layer: int, expert: int) -> dict[str, torch.Tensor]:
+        """Read one EP-local expert's three projections and scales."""
+        ep_size = int(getattr(self.loader, "ep_size", 1))
+        ep_rank = int(getattr(self.loader, "ep_rank", 0))
         local_count = self.n_routed_experts // ep_size
-        for expert in range(ep_rank * local_count, (ep_rank + 1) * local_count):
-            names.extend(
-                f"{prefix}ffn.experts.{expert}.{suffix}"
-                for suffix in DSPARK_EXPERT_SOURCE_TO_ABI
-            )
+        first = ep_rank * local_count
+        last = first + local_count
+        if type(layer) is not int or layer not in DSPARK_DRAFT_LAYERS:
+            raise ValueError("DSpark draft layer must be one of 0, 1 or 2")
+        if type(expert) is not int or not first <= expert < last:
+            raise ValueError("DSpark expert is outside the selected EP rank")
+        prefix = f"mtp.{layer}.ffn.experts.{expert}."
+        names = [prefix + suffix for suffix in DSPARK_EXPERT_SOURCE_TO_ABI]
         self.loader.store.require(names)
         return self.loader.store.load_many(names)
 
@@ -505,9 +513,9 @@ class V41DSparkWeightContract:
             int(self.loader.ep_rank) * local_count,
             (int(self.loader.ep_rank) + 1) * local_count,
         ):
-            expert_prefix = f"{prefix}ffn.experts.{expert}."
+            expert_raw = self._load_expert_for_rank(layer, expert)
             for suffix, abi_name in DSPARK_EXPERT_SOURCE_TO_ABI.items():
-                value = raw[expert_prefix + suffix]
+                value = expert_raw[f"mtp.{layer}.ffn.experts.{expert}.{suffix}"]
                 if suffix.endswith(".weight"):
                     packed = pack_fp4_tiles(value)
                     routed_values[abi_name].append(packed)
@@ -519,6 +527,8 @@ class V41DSparkWeightContract:
                     routed_values[abi_name].append(
                         _pack_expert_scale(scale, value.dtype)
                     )
+            del expert_raw
+        del raw
         for name, values in routed_values.items():
             result[name] = torch.cat(values, dim=0).contiguous()
 
