@@ -161,7 +161,10 @@ def _layer_contract(*, bad_suffix=None):
         q_lora, o_lora, groups = text["q_lora_rank"], text["o_lora_rank"], text["o_groups"]
         inter, hc = text["moe_intermediate_size"], text["hc_mult"]
         q_width, o_width = heads * head_dim, heads * head_dim // groups
-        ceil32 = lambda value: (value + 31) // 32
+
+        def ceil32(value):
+            return (value + 31) // 32
+
         return {
             "attn_norm.weight": (hidden,), "ffn_norm.weight": (hidden,),
             "attn.wq_a.weight": (q_lora, hidden), "attn.wq_a.scale": (ceil32(q_lora), ceil32(hidden)),
