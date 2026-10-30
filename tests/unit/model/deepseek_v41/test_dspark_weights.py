@@ -225,3 +225,108 @@ def test_load_layer_abi_maps_source_names_and_preserves_expert_indices():
 def test_load_layer_abi_rejects_source_layout_mismatch():
     with pytest.raises(ValueError, match="attn.wq_a.weight"):
         _layer_contract(bad_suffix="attn.wq_a.weight").load_layer_abi(0)
+
+
+def _packed_layer_contract():
+    """Build a tiny but tile-aligned FP8/FP4 source contract."""
+    text = {
+        "n_routed_experts": 2,
+        "hidden_size": 256,
+        "num_attention_heads": 8,
+        "head_dim": 32,
+        "q_lora_rank": 64,
+        "o_lora_rank": 32,
+        "o_groups": 2,
+        "moe_intermediate_size": 256,
+        "hc_mult": 1,
+    }
+    names = set(dspark_v41_layer_weight_names(0, text["n_routed_experts"]))
+    names.update(DSPARK_HEAD_SOURCE_TO_ABI)
+
+    def shape(suffix):
+        hidden, heads, head_dim = text["hidden_size"], text["num_attention_heads"], text["head_dim"]
+        q_lora, o_lora, groups = text["q_lora_rank"], text["o_lora_rank"], text["o_groups"]
+        inter, hc = text["moe_intermediate_size"], text["hc_mult"]
+        q_width, o_width = heads * head_dim, heads * head_dim // groups
+
+        def ceil32(value):
+            return (value + 31) // 32
+
+        return {
+            "attn_norm.weight": (hidden,), "ffn_norm.weight": (hidden,),
+            "attn.wq_a.weight": (q_lora, hidden), "attn.wq_a.scale": (ceil32(q_lora), ceil32(hidden)),
+            "attn.wq_b.weight": (q_width, q_lora), "attn.wq_b.scale": (ceil32(q_width), ceil32(q_lora)),
+            "attn.wkv.weight": (head_dim, hidden), "attn.wkv.scale": (ceil32(head_dim), ceil32(hidden)),
+            "attn.q_norm.weight": (q_lora,), "attn.kv_norm.weight": (head_dim,),
+            "attn.attn_sink": (heads,), "attn.wo_a.weight": (groups * o_lora, o_width),
+            "attn.wo_a.scale": (ceil32(groups * o_lora), ceil32(o_width)),
+            "attn.wo_b.weight": (hidden, groups * o_lora),
+            "attn.wo_b.scale": (ceil32(hidden), ceil32(groups * o_lora)),
+            "hc_attn_fn": ((2 + hc) * hc, hc * hidden), "hc_attn_scale": (3,),
+            "hc_attn_base": ((2 + hc) * hc,), "hc_ffn_fn": ((2 + hc) * hc, hc * hidden),
+            "hc_ffn_scale": (3,), "hc_ffn_base": ((2 + hc) * hc,),
+            "ffn.gate.weight": (2, hidden), "ffn.gate.bias": (2,),
+            "ffn.shared_experts.w1.weight": (inter, hidden),
+            "ffn.shared_experts.w1.scale": (ceil32(inter), ceil32(hidden)),
+            "ffn.shared_experts.w2.weight": (hidden, inter),
+            "ffn.shared_experts.w2.scale": (ceil32(hidden), ceil32(inter)),
+            "ffn.shared_experts.w3.weight": (inter, hidden),
+            "ffn.shared_experts.w3.scale": (ceil32(inter), ceil32(hidden)),
+        }[suffix]
+
+    class Store:
+        def require(self, values):
+            missing = set(values) - names
+            if missing:
+                raise KeyError(sorted(missing)[0])
+
+        def load_many(self, values):
+            result = {}
+            for name in values:
+                suffix = name.removeprefix("mtp.0.")
+                if suffix.startswith("ffn.experts."):
+                    suffix = suffix.split(".", 3)[-1]
+                    expert_shape = {
+                        "w1.weight": (256, 128), "w1.scale": (256, 8),
+                        "w2.weight": (256, 128), "w2.scale": (256, 8),
+                        "w3.weight": (256, 128), "w3.scale": (256, 8),
+                    }[suffix]
+                    dtype = torch.uint8 if suffix.endswith("weight") else torch.float8_e8m0fnu
+                elif name.endswith("main_proj.weight"):
+                    expert_shape, dtype = (256, 768), torch.bfloat16
+                elif name.endswith("main_norm.weight") or name.endswith("norm.weight"):
+                    expert_shape, dtype = (256,), torch.bfloat16
+                elif "markov_w" in name:
+                    expert_shape, dtype = (8, 2), torch.bfloat16
+                elif "confidence_head" in name:
+                    expert_shape, dtype = (1, 258), torch.float32
+                else:
+                    expert_shape = shape(suffix)
+                    if suffix.endswith(".scale"):
+                        dtype = torch.float8_e8m0fnu
+                    elif suffix.endswith(".weight") and suffix.startswith(
+                        ("attn.wq_", "attn.wkv", "attn.wo_", "ffn.shared")
+                    ):
+                        dtype = torch.float8_e4m3fn
+                    elif suffix.startswith(("hc_", "ffn.gate.bias", "attn.attn_sink")):
+                        dtype = torch.float32
+                    else:
+                        dtype = torch.bfloat16
+                result[name] = torch.zeros(expert_shape, dtype=dtype)
+            return result
+
+    loader = SimpleNamespace(
+        store=Store(), text=text, ep_size=2, ep_rank=1, tp_size=1,
+    )
+    return V41DSparkWeightContract(loader)
+
+
+def test_load_layer_packed_uses_only_one_ep_rank_and_lib_layouts():
+    packed = _packed_layer_contract().load_layer_packed(0).tensors
+    assert packed["wq_a"].shape == (256, 64)
+    assert packed["wq_a_scale"].shape == (8, 64)
+    assert packed["wo_a"].shape == (2, 128, 32)
+    assert packed["wo_b"].shape == (64, 256)
+    assert packed["routed_w1"].shape == (256, 128)
+    assert packed["routed_w1_scale"].shape == (8, 256)
+    assert packed["gate_weight"].dtype is torch.float32

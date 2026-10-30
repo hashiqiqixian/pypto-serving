@@ -11,16 +11,20 @@
 The V4.1 backbone loader intentionally excludes deferred draft modules.  This
 module keeps their checkpoint contract separate from backbone loading and only
 loads the small replicated heads needed by the Markov stage.  Layer weights are
-exposed through per-layer source names so a future packer can process one
-layer at a time without constructing the full three-layer bank in Host memory.
+exposed through per-layer source names.  The packed entry point below processes
+one EP rank and one draft layer at a time; callers can retain the result in a
+resident bank without ever materialising the other ranks' experts.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
+
+from .weight_loader import mxfp4_pair_lut
+from .weight_spec import fp8_input_major, pack_fp4_tiles, pack_grouped_wo_a
 
 
 DSPARK_DRAFT_LAYERS = (0, 1, 2)
@@ -172,6 +176,52 @@ class V41DSparkLayerWeights:
 
     def __getitem__(self, name: str) -> torch.Tensor:
         return self.tensors[name]
+
+
+@dataclass(frozen=True)
+class V41DSparkPackedWeights:
+    """Packed draft weights for one EP rank.
+
+    ``load_packed_weights`` returns tensors without an EP axis.  Use
+    :meth:`stack_ranks` after every rank has been packed to create the leading
+    axis required by the host composite.  Keeping these two operations separate
+    lets a caller fill a resident bank incrementally instead of retaining every
+    rank's temporary source tensors.
+    """
+
+    tensors: Mapping[str, torch.Tensor]
+
+    def __getitem__(self, name: str) -> torch.Tensor:
+        return self.tensors[name]
+
+    @classmethod
+    def stack_ranks(cls, values: Sequence["V41DSparkPackedWeights"]) -> "V41DSparkPackedWeights":
+        """Stack matching per-rank payloads on a new leading EP axis."""
+        ranks = tuple(values)
+        if not ranks:
+            raise ValueError("at least one EP rank is required")
+        names = tuple(ranks[0].tensors)
+        if any(tuple(value.tensors) != names for value in ranks[1:]):
+            raise ValueError("DSpark rank payloads must expose matching ABI names")
+        stacked = {}
+        for name in names:
+            tensors = tuple(value.tensors[name] for value in ranks)
+            if any(tensor.shape != tensors[0].shape or tensor.dtype != tensors[0].dtype
+                   for tensor in tensors[1:]):
+                raise ValueError(f"DSpark rank payload shape/dtype mismatch for {name}")
+            stacked[name] = torch.stack(tensors, dim=0).contiguous()
+        return cls(stacked)
+
+
+_PACKED_LAYER_NAMES = (
+    "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight",
+    "wq_a", "wq_a_scale", "q_norm_weight", "wq_b", "wq_b_scale", "wkv",
+    "wkv_scale", "kv_norm_weight", "attn_sink", "wo_a", "wo_a_scale", "wo_b",
+    "wo_b_scale", "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "ffn_norm_weight",
+    "gate_weight", "correction_bias", "routed_w1", "routed_w1_scale", "routed_w2",
+    "routed_w2_scale", "routed_w3", "routed_w3_scale", "shared_w1", "shared_w1_scale",
+    "shared_w2", "shared_w2_scale", "shared_w3", "shared_w3_scale",
+)
 
 
 class V41DSparkWeightContract:
@@ -364,3 +414,138 @@ class V41DSparkWeightContract:
                     )
                 routed[abi_name][expert] = value
         return V41DSparkLayerWeights(tensors=tensors, routed_experts=routed)
+
+    def _load_layer_for_rank(self, layer: int) -> dict[str, torch.Tensor]:
+        """Read one layer plus this loader's EP-local experts.
+
+        ``load_layer`` is kept as the shape-contract/debugging API and reads
+        every expert.  Runtime staging must use this bounded variant: the
+        deferred DSpark tensors are not part of ``V41WeightLoader.specs``, so
+        the generic loader cannot apply its backbone ownership filter.  The
+        explicit names below make the EP boundary visible and keep the raw
+        payload for at most one rank and one draft layer alive.
+        """
+        if type(layer) is not int or layer not in DSPARK_DRAFT_LAYERS:
+            raise ValueError("DSpark draft layer must be one of 0, 1 or 2")
+        ep_size = getattr(self.loader, "ep_size", 1)
+        ep_rank = getattr(self.loader, "ep_rank", 0)
+        if type(ep_size) is not int or ep_size <= 0 or type(ep_rank) is not int:
+            raise ValueError("DSpark packer requires a rank-aware V41WeightLoader")
+        if ep_rank < 0 or ep_rank >= ep_size or self.n_routed_experts % ep_size:
+            raise ValueError("DSpark routed experts must divide the selected EP world")
+        if getattr(self.loader, "tp_size", 1) != 1:
+            raise ValueError("V4.1 DSpark drafter packing currently requires TP1")
+        prefix = f"mtp.{layer}."
+        names = [prefix + suffix for suffix in _LAYER_SUFFIXES]
+        local_count = self.n_routed_experts // ep_size
+        for expert in range(ep_rank * local_count, (ep_rank + 1) * local_count):
+            names.extend(
+                f"{prefix}ffn.experts.{expert}.{suffix}"
+                for suffix in DSPARK_EXPERT_SOURCE_TO_ABI
+            )
+        self.loader.store.require(names)
+        return self.loader.store.load_many(names)
+
+    def load_layer_packed(self, layer: int) -> V41DSparkLayerWeights:
+        """Pack one EP-local draft layer for ``l3_dspark_drafter``.
+
+        The returned tensors have no leading EP or draft-layer axis.  The
+        caller is expected to copy them into a resident ``[EP, 3, ...]`` bank.
+        Native FP8 projections retain their E4M3 payload and receive the
+        physical E8M0 scale order required by the lib.  Routed MXFP4 payloads
+        are tile-reordered without float expansion, and their scales are
+        packed independently per local expert before concatenation.
+        """
+        raw = self._load_layer_for_rank(layer)
+        expected = self._layer_source_shapes()
+        prefix = f"mtp.{layer}."
+
+        def source(suffix: str) -> torch.Tensor:
+            value = raw[prefix + suffix]
+            shape = expected[suffix]
+            if tuple(value.shape) != shape:
+                raise ValueError(
+                    f"DSpark {prefix + suffix} must be {shape}, got {tuple(value.shape)}"
+                )
+            return value
+
+        result: dict[str, torch.Tensor] = {}
+        for suffix, abi_name in DSPARK_LAYER_SOURCE_TO_ABI.items():
+            if suffix.endswith(".scale"):
+                continue
+            value = source(suffix)
+            if suffix in (
+                "attn.wq_a.weight", "attn.wq_b.weight", "attn.wkv.weight",
+                "attn.wo_b.weight", "ffn.shared_experts.w1.weight",
+                "ffn.shared_experts.w2.weight", "ffn.shared_experts.w3.weight",
+            ):
+                scale_suffix = suffix.removesuffix(".weight") + ".scale"
+                weight, scale = fp8_input_major(value, source(scale_suffix))
+                result[abi_name] = weight
+                result[abi_name + "_scale"] = scale
+            elif suffix == "attn.wo_a.weight":
+                weight, scale = pack_grouped_wo_a(
+                    value, source("attn.wo_a.scale"),
+                    int(self.loader.text["o_groups"]),
+                )
+                result[abi_name] = weight
+                result[abi_name + "_scale"] = scale
+            elif suffix == "ffn.gate.weight":
+                result[abi_name] = value.float().contiguous()
+            else:
+                result[abi_name] = value.contiguous()
+
+        local_count = self.n_routed_experts // int(self.loader.ep_size)
+        routed_values: dict[str, list[torch.Tensor]] = {
+            name: [] for name in DSPARK_EXPERT_SOURCE_TO_ABI.values()
+        }
+        for expert in range(
+            int(self.loader.ep_rank) * local_count,
+            (int(self.loader.ep_rank) + 1) * local_count,
+        ):
+            expert_prefix = f"{prefix}ffn.experts.{expert}."
+            for suffix, abi_name in DSPARK_EXPERT_SOURCE_TO_ABI.items():
+                value = raw[expert_prefix + suffix]
+                if suffix.endswith(".weight"):
+                    packed = pack_fp4_tiles(value)
+                    routed_values[abi_name].append(packed)
+                else:
+                    # The scale source is [N, K/32].  The lib flattens local
+                    # experts before the K-group axis, so pack each expert
+                    # independently and concatenate on the group axis.
+                    scale = value.view(torch.uint8).T.contiguous()
+                    routed_values[abi_name].append(
+                        _pack_expert_scale(scale, value.dtype)
+                    )
+        for name, values in routed_values.items():
+            result[name] = torch.cat(values, dim=0).contiguous()
+
+        return V41DSparkLayerWeights(tensors=result, routed_experts={})
+
+    def load_packed_weights(self) -> V41DSparkPackedWeights:
+        """Pack all three draft layers for this EP rank, bounded by layer.
+
+        This helper intentionally returns one rank only.  A serving resource
+        can call it once per EP rank and fill a shared bank incrementally;
+        keeping rank ownership here prevents every worker from reading all
+        routed experts.  The small heads are included for convenience.
+        """
+        heads = self.load_heads().tensors
+        layers = [self.load_layer_packed(layer).tensors for layer in DSPARK_DRAFT_LAYERS]
+        packed: dict[str, torch.Tensor] = {}
+        for name in _PACKED_LAYER_NAMES:
+            values = [layer[name] for layer in layers]
+            packed[name] = torch.stack(values, dim=0).contiguous()
+        packed.update({name: value.contiguous() for name, value in heads.items()})
+        packed["mxfp4_pair_lut"] = mxfp4_pair_lut()
+        return V41DSparkPackedWeights(packed)
+
+
+def _pack_expert_scale(scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Pack one expert's logical [K/32, N] scale matrix to MX_B_NN."""
+    groups, width = scale.shape
+    if groups % 2 or width % 16:
+        raise ValueError("MXFP4 expert scales require K divisible by 64 and N by 16")
+    from .weight_spec import pack_mx_scale
+
+    return pack_mx_scale(scale).view(dtype).contiguous()
