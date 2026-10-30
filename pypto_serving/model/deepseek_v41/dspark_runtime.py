@@ -86,6 +86,8 @@ class DSparkLoweredInputs:
         if missing:
             raise ValueError("DSpark lowered input is missing: " + ", ".join(missing))
         values = {name: value[name] for name in required}
+        if not isinstance(values["workspace"], Mapping):
+            raise TypeError("DSpark workspace must be a mapping")
         for name in ("target_model", "draft_model", "markov_model", "cache_tables", "rope_tables"):
             mapping = value.get(name, {})
             if not isinstance(mapping, Mapping):
