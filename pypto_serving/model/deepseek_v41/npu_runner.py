@@ -51,7 +51,6 @@ from .weight_loader import (
     DecodeWeightLayout,
     LayerPlan,
     RankPlacement,
-    ResidentDecodeWeights,
     ResidentFullDecodeWeights,
     RowAddressedCheckpoint,
     V41ExecutionPlan,
