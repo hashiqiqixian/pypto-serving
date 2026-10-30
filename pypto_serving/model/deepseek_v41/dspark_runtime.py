@@ -16,7 +16,7 @@ without allocating an NPU worker.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Protocol, Sequence
 
 
@@ -57,6 +57,62 @@ class DSparkDispatch(Protocol):
 
 
 @dataclass(frozen=True)
+class DSparkLoweredInputs:
+    """Complete argument bundle for one lib-owned DSpark orchestration.
+
+    Serving owns the lifetime of these tensors and the request-to-rank mapping;
+    the lib owns the stage order and all model-side composition.  Keeping this
+    bundle explicit prevents a partially populated batch from silently falling
+    back to ordinary decode.
+    """
+
+    state: Any
+    workspace: Mapping[str, Any]
+    target_model: Mapping[str, Any] = field(default_factory=dict)
+    draft_model: Mapping[str, Any] = field(default_factory=dict)
+    markov_model: Mapping[str, Any] = field(default_factory=dict)
+    cache_tables: Mapping[str, Any] = field(default_factory=dict)
+    rope_tables: Mapping[str, Any] = field(default_factory=dict)
+    attention_epoch: int = 1
+    moe_epoch: int = 1
+    logits_epoch: int = 1
+    outputs: Mapping[str, Any] = field(default_factory=dict)
+    request_ranks: Sequence[int] | None = None
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "DSparkLoweredInputs":
+        required = ("state", "workspace")
+        missing = [name for name in required if name not in value]
+        if missing:
+            raise ValueError("DSpark lowered input is missing: " + ", ".join(missing))
+        values = {name: value[name] for name in required}
+        for name in ("target_model", "draft_model", "markov_model", "cache_tables", "rope_tables"):
+            mapping = value.get(name, {})
+            if not isinstance(mapping, Mapping):
+                raise TypeError(f"DSpark {name} must be a mapping")
+            values[name] = mapping
+        for name in ("attention_epoch", "moe_epoch", "logits_epoch"):
+            epoch = value.get(name, 1)
+            if type(epoch) is not int or epoch <= 0:
+                raise ValueError(f"DSpark {name} must be a positive integer")
+            values[name] = epoch
+        outputs = value.get("outputs", {})
+        if not isinstance(outputs, Mapping):
+            raise TypeError("DSpark outputs must be a mapping")
+        values["outputs"] = outputs
+        values["request_ranks"] = value.get("request_ranks")
+        return cls(**values)
+
+
+def coerce_dspark_lowered(value: Any) -> DSparkLoweredInputs:
+    if isinstance(value, DSparkLoweredInputs):
+        return value
+    if isinstance(value, Mapping):
+        return DSparkLoweredInputs.from_mapping(value)
+    raise TypeError("DSpark lowered input must be a mapping or DSparkLoweredInputs")
+
+
+@dataclass(frozen=True)
 class DSparkPrefillDispatch:
     """Already-lowered DSpark bootstrap arguments carried by a prefill batch.
 
@@ -71,13 +127,18 @@ class DSparkPrefillDispatch:
     prompt_length: int
     anchor: int
     stages: Sequence[tuple[str, Mapping[str, Any]]]
+    lowered: DSparkLoweredInputs | None = None
 
     @classmethod
     def from_batch(cls, batch: Any) -> "DSparkPrefillDispatch":
-        return _dispatch_from_batch(
+        result = _dispatch_from_batch(
             cls, batch,
             required=("request_id", "slot", "generation", "prompt_length", "anchor", "stages"),
+            optional=("lowered",),
         )
+        if result.lowered is not None:
+            result = replace(result, lowered=coerce_dspark_lowered(result.lowered))
+        return result
 
 
 @dataclass(frozen=True)
@@ -89,13 +150,18 @@ class DSparkDecodeDispatch:
     accepted_counts: Sequence[int] | None = None
     last_sampled: Sequence[int] | None = None
     draft_ids: Sequence[Sequence[int]] | None = None
+    lowered: DSparkLoweredInputs | None = None
+    request_ranks: Sequence[int] | None = None
 
     @classmethod
     def from_batch(cls, batch: Any) -> "DSparkDecodeDispatch":
-        return _dispatch_from_batch(
+        result = _dispatch_from_batch(
             cls, batch, required=("request_ids", "stages"),
-            optional=("accepted_counts", "last_sampled", "draft_ids"),
+            optional=("accepted_counts", "last_sampled", "draft_ids", "lowered", "request_ranks"),
         )
+        if result.lowered is not None:
+            result = replace(result, lowered=coerce_dspark_lowered(result.lowered))
+        return result
 
 
 def _dispatch_from_batch(
@@ -233,6 +299,25 @@ class V41DSparkRuntime:
         try:
             state.bootstrap(prompt_length, anchor)
             self.stages.run(stages, phase="prefill")
+        except BaseException:
+            self.states.release((request_id,))
+            raise
+        return state
+
+    def record_bootstrap(self, request_id: str, *, slot: int, generation: int,
+                         prompt_length: int, anchor: int,
+                         draft_ids: Sequence[int]) -> DSparkRequestState:
+        """Commit outputs already produced by the lib bootstrap composite.
+
+        The device orchestration path has its own runner and therefore must not
+        dispatch the stage list a second time merely to update host bookkeeping.
+        """
+        state = self.states.reserve(
+            request_id, slot=slot, generation=generation, prompt_length=prompt_length,
+        )
+        try:
+            state.bootstrap(prompt_length, anchor)
+            state.commit(draft_ids)
         except BaseException:
             self.states.release((request_id,))
             raise
