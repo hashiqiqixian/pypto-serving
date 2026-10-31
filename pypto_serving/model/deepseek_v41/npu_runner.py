@@ -41,6 +41,7 @@ from .task_args import (
     build_cache_groups,
     validate_cache_groups,
 )
+from .dspark_resources import DSPARK_MAX_BATCH_PER_DP
 from .dspark_runtime import (
     DECODE_STAGE_ORDER,
     PREFILL_STAGE_ORDER,
