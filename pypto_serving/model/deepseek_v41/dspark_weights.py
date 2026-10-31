@@ -466,12 +466,12 @@ class V41DSparkWeightContract:
         are tile-reordered without float expansion, and their scales are
         packed independently per local expert before concatenation.
         """
-        raw = self._load_layer_for_rank(layer)
+        layer_raw = self._load_layer_for_rank(layer)
         expected = self._layer_source_shapes()
         prefix = f"mtp.{layer}."
 
         def source(suffix: str) -> torch.Tensor:
-            value = raw[prefix + suffix]
+            value = layer_raw[prefix + suffix]
             shape = expected[suffix]
             if tuple(value.shape) != shape:
                 raise ValueError(
