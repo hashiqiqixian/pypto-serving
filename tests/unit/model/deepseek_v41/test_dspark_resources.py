@@ -44,7 +44,7 @@ def test_allocator_matches_v41_decode_and_prefill_abi():
     assert torch.equal(resources.state["meta"], torch.zeros_like(resources.state["meta"]))
     assert resources.decode_workspace["x_hc"].shape == (4, DSPARK_PADDED_ROWS, 4, 5120)
     assert resources.decode_workspace["target_hidden"].shape == (4, DSPARK_TARGET_ROWS, 15360)
-    assert resources.prefill_workspace["prefill_target_hidden"].shape == (4, 4096, 15360)
+    assert resources.prefill_workspace["prefill_target_hidden"].shape == (4, 8192, 15360)
     assert resources.prefill_workspace["input_ids"] is resources.decode_workspace["input_ids"]
     assert all(value.is_shared() for value in resources.state.values())
 
@@ -71,9 +71,11 @@ def test_provider_rejects_partial_payload_and_does_not_fabricate_weights():
             target_model={"embedding_weight": object()},
         )
 
-    provider = V41DSparkLoweringProvider(resources, payload_builder=builder)
+    provider = V41DSparkLoweringProvider(
+        resources, payload_builder=builder, state_resolver=lambda _request: (0, 1),
+    )
     batch = SimpleNamespace(request_ids=["request-0"], cache_partitions=[0])
-    with pytest.raises(MissingCompositeInterface, match="payload is missing"):
+    with pytest.raises(MissingCompositeInterface, match="missing ABI fields"):
         provider.lower_decode(model=object(), batch=batch)
 
 
