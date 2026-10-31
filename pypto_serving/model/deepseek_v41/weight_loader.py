@@ -837,9 +837,13 @@ def iter_decode_weight_slices(model_dir, topology, *, max_bundle_bytes=32 << 30,
     c2a_sources = tuple(layer.layer_id for layer in layers if layer.mode == "c2a_full")
     if len(kv_sources) != 4 or len(index_sources) != 8 or len(c2a_sources) != 3:
         raise ValueError("lib decode_fwd source axes disagree with the checkpoint schedule")
+    # Engram WKV is a large native-FP8 projection.  Its conservative conversion
+    # estimate is about 1.89 GiB per rank for the V4.1 checkpoint, while reads
+    # remain rank- and layer-serial here.  Keep the smaller budget for all other
+    # loader entry points, but allow this bounded staging path to complete.
     loaders = tuple(V41WeightLoader(
         model_dir, tp_size=topology.tp, tp_rank=rank % topology.tp,
-        ep_size=topology.world, ep_rank=rank, max_load_bytes=512 << 20,
+        ep_size=topology.world, ep_rank=rank, max_load_bytes=2 << 30,
     ) for rank in range(topology.world))
     for layer in layers:
         attention, moe = load_prefill_layer_weights(
