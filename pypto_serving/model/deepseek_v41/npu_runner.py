@@ -42,6 +42,7 @@ from .task_args import (
     validate_cache_groups,
 )
 from .engram import HostEngram
+from .dspark_resources import DSPARK_MAX_BATCH_PER_DP
 from .dspark_runtime import (
     DECODE_STAGE_ORDER,
     PREFILL_STAGE_ORDER,
