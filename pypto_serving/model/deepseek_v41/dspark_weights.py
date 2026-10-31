@@ -470,12 +470,18 @@ class V41DSparkWeightContract:
         expected = self._layer_source_shapes()
         prefix = f"mtp.{layer}."
 
-        def source(suffix: str) -> torch.Tensor:
-            value = layer_raw[prefix + suffix]
-            shape = expected[suffix]
+        def source(
+            suffix: str,
+            *,
+            values=layer_raw,
+            shapes=expected,
+            name_prefix=prefix,
+        ) -> torch.Tensor:
+            value = values[name_prefix + suffix]
+            shape = shapes[suffix]
             if tuple(value.shape) != shape:
                 raise ValueError(
-                    f"DSpark {prefix + suffix} must be {shape}, got {tuple(value.shape)}"
+                    f"DSpark {name_prefix + suffix} must be {shape}, got {tuple(value.shape)}"
                 )
             return value
 
