@@ -16,9 +16,12 @@ import logging
 import math
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from threading import Condition
 
 import torch
 
@@ -41,6 +44,14 @@ from .weight_spec import (
 # weight_loader
 _BYTES = {"BF16": 2, "F32": 4, "F8_E4M3": 1, "F8_E8M0": 1, "I8": 1}
 _EXPERT = re.compile(r"^layers\.\d+\.ffn\.experts\.(\d+)\.")
+_TORCH_DTYPES = {
+    "BF16": torch.bfloat16,
+    "F32": torch.float32,
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E8M0": torch.float8_e8m0fnu,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+}
 
 
 def _unique(pairs):
@@ -59,15 +70,71 @@ def _positive(value, name):
 
 
 def _validate_shard_paths(model_dir, weight_map):
+    filenames = {}
     for name, filename in weight_map.items():
         if not isinstance(name, str) or not isinstance(filename, str):
             raise ValueError("weight_map must map names to shard filenames")
+        filenames[filename] = None
+    for filename in filenames:
         relative = Path(filename)
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError("checkpoint shard path must stay inside model directory")
         path = (model_dir / relative).resolve()
         if not path.is_relative_to(model_dir):
             raise ValueError("checkpoint shard path must stay inside model directory")
+
+
+class _DirectSliceSession(ExitStack):
+    """Read selected checkpoint bytes without mmap faults during layer staging."""
+
+    def __init__(self, store):
+        super().__init__()
+        self.store = store
+        self.files = {}
+
+    def load_slice(self, name, ranges, *, shape, dtype):
+        path = self.store._slice_path(name, ranges, shape)
+        if path not in self.files:
+            handle = self.enter_context(path.open("rb", buffering=0))
+            size = os.fstat(handle.fileno()).st_size
+            prefix = handle.read(8)
+            if len(prefix) != 8:
+                raise ValueError(f"short safetensors header prefix: {path}")
+            length = int.from_bytes(prefix, "little")
+            if not 0 < length <= min(100_000_000, size - 8):
+                raise ValueError(f"invalid safetensors header size: {path}")
+            header = json.loads(handle.read(length), object_pairs_hook=_unique)
+            self.files[path] = handle, header, 8 + length, size
+        handle, header, data_start, size = self.files[path]
+        entry = header[name]
+        if tuple(entry["shape"]) != shape or entry["dtype"] != dtype:
+            raise ValueError(f"checkpoint shape/dtype mismatch: {name}")
+        if any(part.start != 0 or part.stop != dim for part, dim in zip(ranges, shape)):
+            with self.store._safe_open_fn(path, self.store.device) as reader:
+                return self.store._checked_slice(reader, name, ranges, shape, dtype)
+        start, end = entry["data_offsets"]
+        torch_dtype = _TORCH_DTYPES[dtype]
+        if not 0 <= start <= end <= size - data_start or end - start != math.prod(shape) * torch_dtype.itemsize:
+            raise ValueError(f"invalid safetensors tensor byte range: {name}")
+        data = bytearray(end - start)
+        view = memoryview(data)
+        handle.seek(data_start + start)
+        filled = 0
+        while filled < len(data):
+            count = handle.readinto(view[filled:])
+            if not count:
+                raise EOFError(f"short safetensors tensor read: {name}")
+            filled += count
+        return torch.frombuffer(data, dtype=torch_dtype).reshape(shape)
+
+
+class _V41SafetensorsStore(LazySafetensorsStore):
+    def __init__(self, *, safe_open_fn=None, **kwargs):
+        super().__init__(safe_open_fn=safe_open_fn, **kwargs)
+        self._direct_reads = safe_open_fn is None
+
+    def slice_session(self):
+        return _DirectSliceSession(self) if self._direct_reads else super().slice_session()
 
 
 @dataclass(frozen=True)
@@ -117,8 +184,8 @@ class V41WeightLoader:
         _validate_shard_paths(self.model_dir, weight_map)
         # Deferred-module entries are not required, validated or opened. Only
         # declared text weights are reachable through this loader.
-        self.store = LazySafetensorsStore(model_dir=self.model_dir, weight_map=weight_map,
-                                         safe_open_fn=safe_open_fn)
+        self.store = _V41SafetensorsStore(model_dir=self.model_dir, weight_map=weight_map,
+                                          safe_open_fn=safe_open_fn)
         self.store.require(self.specs)
 
     def names(self, layer_id=None):
@@ -427,21 +494,83 @@ def load_prefill_layer_weights(model_dir, layer_id, topology, *, max_bundle_byte
                                parallel_experts=parallel_experts)
 
 
-def _load_routed_experts(loader, layer_id, rank, ep_size):
+def _load_routed_projection(loader, layer_id, rank, ep_size, name):
     count = loader.text["n_routed_experts"] // ep_size
-    result = {}
-    held_bytes = 0
     with loader.store.slice_session() as session:
-        for name in ("w1", "w2", "w3"):
-            bundles = [loader.load(f"layers.{layer_id}.ffn.experts.{expert}.{name}.weight",
-                                   session=session)
-                       for expert in range(rank * count, (rank + 1) * count)]
-            held_bytes += sum(t.numel() * t.element_size()
-                              for bundle in bundles for t in (bundle.weight, bundle.scale)
-                              if t is not None)
-            result["routed_" + name] = stack_bytes([b.weight for b in bundles])
-            result["routed_" + name + "_scale"] = merge_expert_scales([b.scale for b in bundles])
-    return result, held_bytes
+        bundles = [loader.load(f"layers.{layer_id}.ffn.experts.{expert}.{name}.weight",
+                               session=session)
+                   for expert in range(rank * count, (rank + 1) * count)]
+        held_bytes = sum(t.numel() * t.element_size()
+                         for bundle in bundles for t in (bundle.weight, bundle.scale)
+                         if t is not None)
+        return (rank, name, stack_bytes([b.weight for b in bundles]),
+                merge_expert_scales([b.scale for b in bundles]), held_bytes)
+
+
+class _ByteBudget:
+    """Bound temporary bytes held by concurrently loading projections."""
+
+    def __init__(self, capacity):
+        if type(capacity) is not int or capacity <= 0:
+            raise ValueError("byte budget must be positive")
+        self.capacity = capacity
+        self._used = 0
+        self._condition = Condition()
+
+    def acquire(self, amount):
+        if type(amount) is not int or amount <= 0:
+            raise ValueError("reserved bytes must be positive")
+        if amount > self.capacity:
+            raise ValueError(
+                f"routed projection requires {amount} bytes; budget={self.capacity}")
+        with self._condition:
+            while self._used + amount > self.capacity:
+                self._condition.wait()
+            self._used += amount
+
+    def release(self, amount):
+        if type(amount) is not int or amount <= 0:
+            raise ValueError("released bytes must be positive")
+        with self._condition:
+            if amount > self._used:
+                raise ValueError("released bytes exceed reserved budget")
+            self._used -= amount
+            self._condition.notify_all()
+
+
+def peak_rss_bytes():
+    """Return the process high-water RSS where procfs exposes it."""
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _routed_projection_reservation(loader, layer_id, rank, ep_size, name):
+    """Estimate the raw, packed and scale buffers held by one projection task."""
+    count = loader.text["n_routed_experts"] // ep_size
+    source_bytes = 0
+    for expert in range(rank * count, (rank + 1) * count):
+        weight_name = f"layers.{layer_id}.ffn.experts.{expert}.{name}.weight"
+        ranges = loader._ranges(weight_name)
+        spec = loader.specs[weight_name]
+        source_bytes += math.prod(part.stop - part.start for part in ranges) * _BYTES[spec.dtype]
+        if spec.dtype in ("F8_E4M3", "I8"):
+            n_part, k_part = ranges
+            divisor = 16 if spec.dtype == "I8" else 32
+            scale_name = weight_name.removesuffix(".weight") + ".scale"
+            scale_ranges = (
+                n_part if spec.dtype == "I8" else slice(n_part.start // 32, n_part.stop // 32),
+                slice(k_part.start // divisor, k_part.stop // divisor),
+            )
+            scale_spec = loader.specs[scale_name]
+            source_bytes += math.prod(part.stop - part.start for part in scale_ranges) * _BYTES[scale_spec.dtype]
+    # Match the existing conservative layer check: source bundles plus packed
+    # weight and merged scale can be live at the same time in one task.
+    return max(1, 3 * source_bytes)
 
 
 def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_only,
@@ -451,6 +580,7 @@ def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_
     attention, moe = [], []
     shared_bundles = {}
     held_bytes = 0
+    routed_retained_bytes = 0
     if loaders is None:
         loaders = tuple(V41WeightLoader(
             model_dir, tp_size=topology.tp, tp_rank=rank % topology.tp,
@@ -469,15 +599,32 @@ def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_
         ratio = loader.text["compress_ratios"][layer_id]
         if swa_only and ratio != 0:
             raise ValueError("selected layer must be a SWA backbone layer")
-    if parallel_experts and (not include_moe or topology.world != 4):
-        raise ValueError("parallel expert packing requires a four-rank MoE layer")
+    if parallel_experts and (not include_moe or topology.world not in (4, 8)):
+        raise ValueError("parallel expert packing requires a four- or eight-rank MoE layer")
     routed = None
     if parallel_experts:
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            routed = list(executor.map(
-                lambda pair: _load_routed_experts(pair[1], layer_id, pair[0], topology.world),
-                enumerate(loaders),
-            ))
+        routed = [({}, 0) for _ in range(topology.world)]
+        jobs = tuple((loaders[rank], layer_id, rank, topology.world, name,
+                      _routed_projection_reservation(
+                          loaders[rank], layer_id, rank, topology.world, name))
+                     for rank in range(topology.world) for name in ("w1", "w2", "w3"))
+        budget = _ByteBudget(max_bundle_bytes)
+        routed_retained_bytes = sum(job[-1] // 3 for job in jobs)
+
+        def load_routed(job):
+            loader, selected_layer, rank, ep_size, name, reservation = job
+            budget.acquire(reservation)
+            try:
+                return _load_routed_projection(loader, selected_layer, rank, ep_size, name)
+            finally:
+                budget.release(reservation)
+
+        with ThreadPoolExecutor(max_workers=min(8, topology.world * 3)) as executor:
+            for rank, name, weight, scale, held in executor.map(load_routed, jobs):
+                fields, prior = routed[rank]
+                fields["routed_" + name] = weight
+                fields["routed_" + name + "_scale"] = scale
+                routed[rank] = fields, prior + held
     for rank, loader in enumerate(loaders):
         prefix = f"layers.{layer_id}."
         a, m = {}, {}
@@ -493,6 +640,8 @@ def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_
                 held_bytes += sum(t.numel() * t.element_size() for t in (bundle.weight, bundle.scale)
                                   if t is not None)
                 if 3 * held_bytes > max_bundle_bytes:
+                    raise ValueError("stacked layer weight budget exceeded")
+                if routed_retained_bytes + 3 * held_bytes > max_bundle_bytes:
                     raise ValueError("stacked layer weight budget exceeded")
                 return bundle
 
@@ -629,7 +778,7 @@ def bind_decode_layer_weights(layer, attention, moe, *, kv_sources, index_source
 
 
 def iter_decode_weight_slices(model_dir, topology, *, max_bundle_bytes=32 << 30,
-                              parallel_experts=False):
+                              parallel_experts=False, bank=None):
     """Yield one layer at a time in checkpoint order for bounded staging."""
     raw = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
     layers = plan_layers(raw)
@@ -650,10 +799,13 @@ def iter_decode_weight_slices(model_dir, topology, *, max_bundle_bytes=32 << 30,
             model_dir, layer.layer_id, topology, max_bundle_bytes=max_bundle_bytes,
             loaders=loaders, parallel_experts=parallel_experts,
         )
-        yield from bind_decode_layer_weights(
+        slices = bind_decode_layer_weights(
             layer, attention, moe, kv_sources=kv_sources, index_sources=index_sources,
             c2a_sources=c2a_sources,
         )
+        if layer.layer_id == 0 and bank is not None:
+            bank.preallocate(slices)
+        yield from slices
     # decode_fwd reserves one key/norm slot per index source, although only KV
     # producers have these checkpoint tensors. The trailing four slots are not
     # read by the current graph; initialize them deterministically nonetheless.
@@ -767,6 +919,42 @@ class DecodeWeightBank:
         self._seen = set()
         self.prepacked = False
         self.rank_major_uploads = {}
+
+    def preallocate(self, first_layer):
+        """Allocate the first layer's shared fields concurrently after validating their geometry."""
+        if self.tensors or self._seen:
+            raise ValueError("decode weight bank has already started staging")
+        fields = {}
+        total = 0
+        for item in first_layer:
+            if not isinstance(item, DecodeWeightSlice) or item.name not in _ALL:
+                raise ValueError("unknown decode weight slice")
+            value = item.value
+            if (not isinstance(value, torch.Tensor) or value.device.type != "cpu"
+                    or not value.is_contiguous()):
+                raise ValueError("decode weight slice must be contiguous CPU EP-stacked data")
+            if item.name in fields:
+                raise ValueError("duplicate decode weight field in first layer")
+            if type(item.slot) is not int or not 0 <= item.slot < self.layout.slots(item.name):
+                raise ValueError("decode weight slot is outside its source axis")
+            shape = _destination_shape(self.layout, item.name, value.shape)
+            size = value.element_size() * torch.Size(shape).numel()
+            total += size
+            if total > self.max_host_bytes:
+                raise MemoryError("decode weight bank exceeds the shared host budget")
+            fields[item.name] = (shape, value.dtype)
+
+        def allocate(field):
+            shape, dtype = field
+            return torch.empty(shape, dtype=dtype).share_memory_()
+
+        started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            tensors = list(executor.map(allocate, fields.values()))
+        elapsed = time.perf_counter() - started
+        self.tensors = dict(zip(fields, tensors))
+        self.allocated_bytes = total
+        _LOG.info("V4.1 shared weight bank preallocation %.2fs", elapsed)
 
     def prepare_rank_major_uploads(self, *, max_field_bytes=4 << 30):
         """Coalesce small slot-major fields into one contiguous upload per rank."""
