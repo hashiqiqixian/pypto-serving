@@ -38,13 +38,17 @@ DSPARK_MAIN_HIDDEN_SIZE = 15360
 DSPARK_HIDDEN_SIZE = 5120
 DSPARK_HC_MULT = 4
 DSPARK_WINDOW = 128
-DSPARK_ROPE_HALF = 256
+# The drafter's RoPE ABI is qk_rope_head_dim // 2 (64 // 2), not the
+# compressed-attention RoPE width used by the target backbone.
+DSPARK_ROPE_HALF = 32
 DSPARK_DRAFT_LAYERS = 3
 DSPARK_PREFILL_SAMPLE_ROWS = 16
 DSPARK_SAMPLED_STRIDE = 8
 
 _STATE_TOKEN_WIDTH = DSPARK_ROWS_PER_REQUEST
 _STATE_META_WIDTH = 6
+_STATE_VALID = 0
+_STATE_GENERATION = 1
 
 # These are the non-workspace arguments consumed by the current lib composites.
 # The target backbone has additional per-layer arguments and is checked by its
@@ -102,7 +106,7 @@ class DSparkResourceLayout:
     hidden_size: int = DSPARK_HIDDEN_SIZE
     main_hidden_size: int = DSPARK_MAIN_HIDDEN_SIZE
     vocab_size: int = 0
-    max_prefill_tokens: int = 4096
+    max_prefill_tokens: int = 8192
 
     def __post_init__(self) -> None:
         if self.dp_size not in (4, 8):
@@ -154,6 +158,7 @@ class DSparkResourceLayout:
             "c2a_slots": (world, DSPARK_PADDED_ROWS),
             "c1a_slots": (world, DSPARK_PADDED_ROWS),
             "query_starts": (world, batch + 1),
+            "logit_row_indices": (world, DSPARK_PREFILL_SAMPLE_ROWS),
             "target_hidden_padded": (world, DSPARK_PADDED_ROWS, self.main_hidden_size),
             "target_hidden": (world, DSPARK_TARGET_ROWS, self.main_hidden_size),
             **{
@@ -185,7 +190,7 @@ class DSparkResourceLayout:
     def decode_dtypes(self) -> Mapping[str, torch.dtype]:
         result = {name: torch.int32 for name in (
             "target_positions", "active_widths", "position_ids", "request_ids",
-            "window_indices", "query_starts", "accepted_ids", "accepted_counts",
+            "window_indices", "query_starts", "logit_row_indices", "accepted_ids", "accepted_counts",
             "context_valid", "context_positions", "num_sampled", "first_query_positions",
             "draft_ids", "committed", "target_sampled_ids", "chunk_0", "chunk_1",
             "chunk_2", "chunk_3", "chunk_4",
@@ -241,6 +246,8 @@ class DSparkHostResources:
     state: "DSparkHostState"
     decode_workspace: dict[str, torch.Tensor]
     prefill_workspace: dict[str, torch.Tensor]
+    cache_tables: dict[str, torch.Tensor]
+    rope_tables: dict[str, torch.Tensor]
 
     @property
     def workspace(self) -> Mapping[str, torch.Tensor]:
@@ -273,6 +280,32 @@ class DSparkHostState:
     def values(self):
         return (self.slot_ids, self.generations, self.tokens, self.meta)
 
+    def bind_request(self, rank: int, row: int, *, slot: int, generation: int) -> None:
+        """Bind one batch row to its persistent local state slot."""
+        if any(type(value) is not int for value in (rank, row, slot, generation)):
+            raise TypeError("DSpark state indices and generation must be integers")
+        if not 0 <= rank < self.slot_ids.shape[0]:
+            raise ValueError("DSpark state rank is outside the EP topology")
+        if not 0 <= row < self.slot_ids.shape[1]:
+            raise ValueError("DSpark state request row is outside the batch capacity")
+        if not 0 <= slot < self.meta.shape[1] or generation < 0:
+            raise ValueError("DSpark state slot or generation is invalid")
+        self.slot_ids[rank, row] = slot
+        self.generations[rank, row] = generation
+
+    def reserve_slot(self, rank: int, slot: int, *, generation: int, position_limit: int) -> None:
+        """Reset a persistent slot and publish its generation before bootstrap."""
+        if any(type(value) is not int for value in (rank, slot, generation, position_limit)):
+            raise TypeError("DSpark state reservation values must be integers")
+        if not 0 <= rank < self.meta.shape[0]:
+            raise ValueError("DSpark state rank is outside the EP topology")
+        if not 0 <= slot < self.meta.shape[1] or generation < 0 or position_limit <= 0:
+            raise ValueError("DSpark state reservation is invalid")
+        self.tokens[rank, slot].zero_()
+        self.meta[rank, slot].zero_()
+        self.meta[rank, slot, _STATE_GENERATION] = generation
+        self.meta[rank, slot, 5] = position_limit
+
 
 def _shared(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
     value = torch.empty(shape, dtype=dtype).share_memory_()
@@ -302,11 +335,45 @@ def allocate_dspark_host_resources(layout: DSparkResourceLayout) -> DSparkHostRe
                  "context_valid", "context_positions"):
         decode[name].fill_(-1)
     prefill = dict(decode)
+    # Prefill geometry consumes the complete prompt-token axis, whereas decode
+    # only consumes the fixed six-row target axis.  Keep separate buffers for
+    # the dynamic axes so a long prompt cannot overwrite decode scratch.
+    prefill["context_slots"] = _shared(
+        (layout.dp_size, DSPARK_DRAFT_LAYERS, layout.max_prefill_tokens), torch.int64)
+    prefill["context_rope_cos"] = _shared(
+        (layout.dp_size, layout.max_prefill_tokens, DSPARK_ROPE_HALF), torch.float32)
+    prefill["context_rope_sin"] = _shared(
+        (layout.dp_size, layout.max_prefill_tokens, DSPARK_ROPE_HALF), torch.float32)
+    prefill["prefill_target_hidden"] = _shared(
+        (layout.dp_size, layout.max_prefill_tokens, layout.main_hidden_size), torch.bfloat16)
     prefill.update({name: _shared(shape, layout.prefill_dtypes[name])
                     for name, shape in layout.prefill_shapes.items()})
     for name in ("sampled_rows", "prefill_positions", "prefill_request_ids"):
         prefill[name].fill_(-1)
-    return DSparkHostResources(layout, state, decode, prefill)
+    table_pages = (layout.max_seq_len + DSPARK_WINDOW - 1) // DSPARK_WINDOW
+    compressed_pages = (layout.max_seq_len + 255) // 256
+    cache_tables = {
+        "target_window": _shared(
+            (layout.dp_size, DSPARK_MAX_BATCH_PER_DP, table_pages), torch.int32),
+        "target_c2a": _shared(
+            (layout.dp_size, DSPARK_MAX_BATCH_PER_DP, compressed_pages), torch.int32),
+        "target_c1a": _shared(
+            (layout.dp_size, DSPARK_MAX_BATCH_PER_DP, table_pages), torch.int32),
+        "draft": _shared(
+            (layout.dp_size, DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH_PER_DP, table_pages),
+            torch.int32),
+    }
+    for value in cache_tables.values():
+        value.fill_(-1)
+    # Geometry uses the same full precision RoPE convention as the target
+    # metadata resources.  The provider fills these from decode_host's tables.
+    rope_tables = {
+        "draft_cos": _shared(
+            (layout.dp_size, layout.max_seq_len, DSPARK_ROPE_HALF), torch.float32),
+        "draft_sin": _shared(
+            (layout.dp_size, layout.max_seq_len, DSPARK_ROPE_HALF), torch.float32),
+    }
+    return DSparkHostResources(layout, state, decode, prefill, cache_tables, rope_tables)
 
 
 def validate_resource_mapping(resources: DSparkHostResources, phase: str) -> None:
@@ -425,21 +492,58 @@ class V41DSparkLoweringProvider:
             if absent:
                 raise _missing(f"V4.1 DSpark {name} is missing compiled ABI fields: {', '.join(absent)}")
 
+    def _resolve_state(self, request_id: str, rank_hint: int) -> tuple[int, int, int]:
+        """Resolve ``(rank, slot, generation)`` with a legacy two-field hook."""
+        if self.state_resolver is None:
+            raise _missing("V4.1 DSpark lowering requires a request state resolver")
+        value = tuple(self.state_resolver(request_id))
+        if len(value) == 2:
+            slot, generation = value
+            rank = rank_hint
+        elif len(value) == 3:
+            rank, slot, generation = value
+            if int(rank) != rank_hint:
+                raise ValueError("DSpark state resolver rank disagrees with the cache partition")
+        else:
+            raise ValueError("DSpark state resolver must return (slot, generation) or (rank, slot, generation)")
+        rank, slot, generation = int(rank), int(slot), int(generation)
+        if not 0 <= rank < self.resources.layout.dp_size:
+            raise ValueError("DSpark state rank is outside the selected DP topology")
+        if not 0 <= slot < DSPARK_MAX_BATCH_PER_DP or generation < 0:
+            raise ValueError("DSpark state slot or generation is invalid")
+        return rank, slot, generation
+
     def lower_prefill(self, *, model: Any, batch: Any, request_ids: Sequence[str],
                       sampled_token_ids: Sequence[int]) -> DSparkPrefillDispatch:
         if not request_ids or len(request_ids) != len(sampled_token_ids):
             raise ValueError("DSpark prefill request and sampled-token rows must match")
         if self.state_resolver is None:
             raise _missing("V4.1 DSpark prefill lowering requires a request state resolver")
+        partitions = getattr(batch, "cache_partitions", ())
+        rank = 0 if not partitions or partitions[0] is None else int(partitions[0])
+        rank, slot, generation = self._resolve_state(request_ids[0], rank)
+        request_rows = tuple(getattr(batch, "request_ids", ()))
+        row = request_rows.index(request_ids[0]) if request_ids[0] in request_rows else 0
+        # The lib bootstrap composite verifies the generation before publishing
+        # the sampled token.  Check the row before lowering, but only mutate it
+        # after the complete payload builder succeeds.
+        state_meta = self.resources.state.meta[rank, int(slot)]
+        if int(state_meta[_STATE_VALID]) != 0:
+            raise ValueError("DSpark prefill state slot is already active")
+        prompt_lengths = getattr(batch, "prompt_lens", ())
+        if not prompt_lengths:
+            raise ValueError("DSpark prefill batch is missing prompt_lens")
+        prompt_length = int(prompt_lengths[row])
         lowered = self._build(
             model=model, batch=batch, phase="prefill",
             request_ids=tuple(request_ids), sampled_token_ids=tuple(int(v) for v in sampled_token_ids),
         )
-        slot, generation = self.state_resolver(request_ids[0])
-        prompt_lengths = getattr(batch, "prompt_lens", ())
-        if not prompt_lengths:
-            raise ValueError("DSpark prefill batch is missing prompt_lens")
-        prompt_length = int(prompt_lengths[0])
+        self.resources.state.slot_ids.fill_(-1)
+        self.resources.state.generations.zero_()
+        self.resources.state.bind_request(rank, row, slot=slot, generation=generation)
+        self.resources.state.reserve_slot(
+            rank, slot, generation=generation, position_limit=self.resources.layout.max_seq_len,
+        )
         return DSparkPrefillDispatch(
             request_id=str(request_ids[0]), slot=int(slot), generation=int(generation),
             prompt_length=prompt_length, anchor=prompt_length, stages=(), lowered=lowered,
@@ -449,11 +553,24 @@ class V41DSparkLoweringProvider:
         request_ids = tuple(getattr(batch, "request_ids", ()))
         if not request_ids:
             raise ValueError("DSpark decode batch must contain request IDs")
+        partitions = tuple(getattr(batch, "cache_partitions", ()))
+        if len(partitions) != len(request_ids):
+            raise ValueError("DSpark decode cache partitions must match request order")
+        self.resources.state.slot_ids.fill_(-1)
+        self.resources.state.generations.zero_()
+        request_ranks = []
+        next_rows: dict[int, int] = {}
+        for request_id, partition in zip(request_ids, partitions, strict=True):
+            rank_hint = 0 if partition is None else int(partition)
+            rank, slot, generation = self._resolve_state(request_id, rank_hint)
+            row = next_rows.get(rank, 0)
+            next_rows[rank] = row + 1
+            self.resources.state.bind_request(rank, row, slot=slot, generation=generation)
+            request_ranks.append(rank)
         lowered = self._build(model=model, batch=batch, phase="decode")
         ranks = lowered.request_ranks
         if ranks is None:
-            partitions = getattr(batch, "cache_partitions", ())
-            ranks = tuple(int(value) for value in partitions)
+            ranks = tuple(request_ranks)
         if len(ranks) != len(request_ids):
             raise ValueError("DSpark request ranks must match decode request order")
         return DSparkDecodeDispatch(
