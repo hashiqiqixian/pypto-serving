@@ -33,28 +33,44 @@ def cache_pool_bytes(groups, counts, *, filler_pages):
 def plan_cache_pages(groups, budget, *, active_requests, step_tokens, filler_pages):
     """Reserve live rings, one in-flight replacement and bounded checkpoints.
 
+    ``active_requests`` is an upper limit, not guaranteed residency. Size the
+    live/async/checkpoint share to the largest request count the budget fits;
+    the normal cache allocator admits work against the resulting page pools.
     Full-history pools fit one maximum-context request, not every concurrent
     request at maximum length. Remaining bytes buy common source-token coverage.
     """
     if active_requests <= 0 or step_tokens <= 0:
         raise ValueError("cache planning requires positive request and step extents")
-    counts = {}
     history = [group for group in groups if group.sliding_window is None]
     if not history:
         raise ValueError("DSpark requires full-history cache groups")
-    for group in groups:
-        page = group.spec.token_capacity
-        if group.sliding_window is None:
-            counts[group.name] = max(group.max_blocks_per_seq, active_requests * math.ceil(step_tokens / page))
-        else:
-            # Maximum new logical pages for one more scheduled step, including
-            # unaligned starts. No request ring is extended or advanced here.
-            working = (step_tokens + page - 1) // page
-            checkpoint = group.sliding_window // page
-            counts[group.name] = active_requests * (group.max_blocks_per_seq + working + checkpoint)
+
+    def request_counts(requests):
+        counts = {}
+        for group in groups:
+            page = group.spec.token_capacity
+            if group.sliding_window is None:
+                counts[group.name] = max(group.max_blocks_per_seq, requests * math.ceil(step_tokens / page))
+            else:
+                # Keep the complete ring, in-flight replacements and a bounded
+                # checkpoint for every budgeted request. Do not shorten rings.
+                working = (step_tokens + page - 1) // page
+                checkpoint = group.sliding_window // page
+                counts[group.name] = requests * (group.max_blocks_per_seq + working + checkpoint)
+        return counts
+
+    counts = request_counts(1)
     minimum = cache_pool_bytes(groups, counts, filler_pages=filler_pages)
     if minimum > budget:
         raise RuntimeError(f"DSpark cache budget {budget} cannot fit live/async/checkpoint minimum {minimum}")
+    low, high = 1, active_requests
+    while low < high:
+        requests = (low + high + 1) // 2
+        if cache_pool_bytes(groups, request_counts(requests), filler_pages=filler_pages) <= budget:
+            low = requests
+        else:
+            high = requests - 1
+    counts = request_counts(low)
     alignment = math.lcm(*(group.spec.token_capacity for group in history))
     increment_bytes = sum(alignment // group.spec.token_capacity * group.spec.page_size_bytes
                           for group in history)
