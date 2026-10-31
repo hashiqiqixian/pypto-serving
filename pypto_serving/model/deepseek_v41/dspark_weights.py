@@ -528,7 +528,7 @@ class V41DSparkWeightContract:
                         _pack_expert_scale(scale, value.dtype)
                     )
             del expert_raw
-        del raw
+        del layer_raw
         for name, values in routed_values.items():
             result[name] = torch.cat(values, dim=0).contiguous()
 
