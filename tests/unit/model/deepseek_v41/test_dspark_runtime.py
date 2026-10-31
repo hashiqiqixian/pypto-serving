@@ -195,7 +195,10 @@ def test_dspark_lowered_inputs_reject_incomplete_decode_workspace():
         target_model={"embedding_weight": object()},
         draft_model={"draft": object()},
         markov_model={"markov": object()},
-        cache_tables={"draft": object()},
+        cache_tables={
+            "draft": object(), "target_window": object(), "target_c2a": object(),
+            "target_c1a": object(),
+        },
         rope_tables={"draft_cos": object(), "draft_sin": object()},
     )
     with pytest.raises(ValueError, match="workspace is missing"):
@@ -203,18 +206,25 @@ def test_dspark_lowered_inputs_reject_incomplete_decode_workspace():
 
 
 def test_dspark_lowered_inputs_require_target_model_for_decode():
+    decode_workspace = {name: object() for name in (
+        "input_ids", "target_positions", "active_widths", "x_hc", "pre_mix",
+        "position_ids", "request_ids", "window_slots", "window_indices", "c2a_slots",
+        "c1a_slots", "query_starts", "target_hidden_padded", "target_hidden",
+        "target_sampled_ids", "accepted_ids", "accepted_counts", "context_valid",
+        "context_positions", "num_sampled", "last_sampled", "anchor_ids",
+        "zero_prefill_tokens", "committed", "chunk_0", "chunk_1", "chunk_2",
+        "chunk_3", "chunk_4", "first_query_positions", "context_slots",
+        "context_rope_cos", "context_rope_sin", "query_rope_cos", "query_rope_sin",
+        "draft_head_hidden", "draft_ids", "confidences",
+    )}
     lowered = DSparkLoweredInputs(
         state={name: object() for name in ("slot_ids", "generations", "tokens", "meta")},
-        workspace={name: object() for name in (
-            "prompt_lengths", "position_limits", "sampled_rows", "prefill_sampled_ids",
-            "next_prefill_tokens", "first_query_positions", "prefill_positions",
-            "prefill_request_ids", "prefill_counts", "context_slots", "context_rope_cos",
-            "context_rope_sin", "query_rope_cos", "query_rope_sin", "prefill_target_hidden",
-            "zero_sampled", "zero_last_sampled", "draft_head_hidden", "draft_ids",
-            "confidences",
-        )},
+        workspace=decode_workspace,
         target_model={}, draft_model={"draft": object()}, markov_model={"markov": object()},
-        cache_tables={"draft": object()},
+        cache_tables={
+            "draft": object(), "target_window": object(), "target_c2a": object(),
+            "target_c1a": object(),
+        },
         rope_tables={"draft_cos": object(), "draft_sin": object()},
     )
     with pytest.raises(ValueError, match="target model mapping"):

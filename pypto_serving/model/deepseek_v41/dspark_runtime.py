@@ -429,6 +429,12 @@ class V41DSparkRuntime:
                 raise ValueError("DSpark draft state must match request order")
             if any(len(drafts) != DSPARK_SPECULATIVE_TOKENS for drafts in draft_ids):
                 raise ValueError("DSpark must commit exactly five draft tokens")
+        # Validate device-produced acceptance values before dispatching any
+        # stage.  A malformed sample must not leave a partially executed
+        # target/drafter chain or mutate persistent request state.
+        if accepted_counts is not None:
+            for request_id, count, token in zip(request_ids, accepted_counts, last_sampled, strict=True):
+                self.states.get(request_id).validate_accept(int(count), int(token))
         self.stages.run(stages, phase="decode")
         self.apply_decode_outputs(
             request_ids,
