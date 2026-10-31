@@ -294,6 +294,8 @@ def _packed_layer_contract():
                     dtype = torch.uint8 if suffix.endswith("weight") else torch.float8_e8m0fnu
                 elif name.endswith("main_proj.weight"):
                     expert_shape, dtype = (256, 768), torch.bfloat16
+                elif suffix in ("attn.q_norm.weight", "attn.kv_norm.weight"):
+                    expert_shape, dtype = shape(suffix), torch.bfloat16
                 elif name.endswith("main_norm.weight") or name.endswith("norm.weight"):
                     expert_shape, dtype = (256,), torch.bfloat16
                 elif "markov_w" in name:
