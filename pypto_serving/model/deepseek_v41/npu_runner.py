@@ -4187,7 +4187,12 @@ def make_production_bindings(
                 model_dir, tp_size=topology.tp, tp_rank=0,
                 ep_size=topology.world, ep_rank=0, max_load_bytes=512 << 20,
             )
+            # Transformers 5.x wraps the Rust tokenizer in a
+            # ``TokenizersBackend`` object.  Engram consumes the underlying
+            # tokenizers.Tokenizer ABI (get_vocab_size/id_to_token/normalizer)
+            # rather than the Transformers compatibility wrapper.
             tokenizer_impl = getattr(tokenizer, "tokenizer", tokenizer)
+            tokenizer_impl = getattr(tokenizer_impl, "_tokenizer", tokenizer_impl)
             engram = engram_module.HostEngram(
                 RowAddressedCheckpoint(engram_loader.store), tokenizer_impl)
             lookup_fn = engram.lookup
