@@ -234,25 +234,37 @@ def test_generate_config_defaults_to_greedy(options):
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4])
-def test_dspark_topology_accepts_the_8_card_and_16_card_worlds(tp):
+@pytest.mark.parametrize("lm_head_tp", [4, 8])
+def test_dspark_topology_accepts_the_8_card_and_16_card_worlds(tmp_path, tp, lm_head_tp):
     # Attention TP determines cache partitions; expert parallelism spans the world.
+    (tmp_path / "config.json").write_text('{"model_type":"deepseek_v4"}', encoding="utf-8")
     for ep in (8, 16):
         dp = ep // tp
         devices = ",".join(str(device) for device in range(ep))
         args = _parse_cli_args(
             [
-                "--model", "model",
+                "--model", str(tmp_path),
                 "--dp", str(dp),
                 "--ep", str(ep),
                 "--tp", str(tp),
+                "--lm-head-tp", str(lm_head_tp),
                 "--devices", devices,
                 "--block-size", "32",
                 "--max-num-seqs", "8",
                 "--max-model-len", "1024",
+                "--long-prefill-token-threshold", "128",
+                "--max-num-batched-tokens", "128",
+                "--speculative-config", '{"method":"dspark","num_speculative_tokens":0}',
             ]
         )
 
-        cli._validate_dspark_topology(args)
+        config = cli.build_serving_engine_config(args)
+        assert config.executor_kwargs["cache_ranks"] == ep
+        assert config.executor_kwargs["tp_size"] == tp
+        assert config.executor_kwargs["lm_head_tp_size"] == lm_head_tp
+        assert config.worker_device_ids() == tuple(range(ep))
+        assert config.runtime_config.kv_cache_groups
+        assert all(group.num_partitions == dp for group in config.runtime_config.kv_cache_groups)
 
 
 @pytest.mark.parametrize("requested", [None, "", "diagnostic-output"])
