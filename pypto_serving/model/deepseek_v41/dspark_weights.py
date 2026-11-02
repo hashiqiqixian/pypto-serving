@@ -573,7 +573,10 @@ class V41DSparkWeightContract:
             del expert_raw
         del layer_raw
         for name, values in routed_values.items():
-            result[name] = torch.cat(values, dim=0).contiguous()
+            # Payloads retain the expert axis; scale matrices flatten experts
+            # into their K-group axis in the drafter's declared ABI.
+            combine = torch.cat if name.endswith("_scale") else torch.stack
+            result[name] = combine(values, dim=0).contiguous()
 
         return V41DSparkLayerWeights(tensors=result, routed_experts={})
 

@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import ast
+import ctypes
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -305,10 +307,10 @@ def test_load_layer_abi_rejects_source_layout_mismatch():
         _layer_contract(bad_suffix="attn.wq_a.weight").load_layer_abi(0)
 
 
-def _packed_layer_contract():
+def _packed_layer_contract(*, n_experts=2, ep_size=2, ep_rank=1):
     """Build a tiny but tile-aligned FP8/FP4 source contract."""
     text = {
-        "n_routed_experts": 2,
+        "n_routed_experts": n_experts,
         "hidden_size": 256,
         "num_attention_heads": 8,
         "head_dim": 32,
@@ -318,7 +320,8 @@ def _packed_layer_contract():
         "moe_intermediate_size": 256,
         "hc_mult": 1,
     }
-    names = set(dspark_v41_layer_weight_names(0, text["n_routed_experts"]))
+    names = {name for layer in range(3)
+             for name in dspark_v41_layer_weight_names(layer, text["n_routed_experts"])}
     names.update(DSPARK_HEAD_SOURCE_TO_ABI)
 
     def shape(suffix):
@@ -343,7 +346,7 @@ def _packed_layer_contract():
             "hc_attn_fn": ((2 + hc) * hc, hc * hidden), "hc_attn_scale": (3,),
             "hc_attn_base": ((2 + hc) * hc,), "hc_ffn_fn": ((2 + hc) * hc, hc * hidden),
             "hc_ffn_scale": (3,), "hc_ffn_base": ((2 + hc) * hc,),
-            "ffn.gate.weight": (2, hidden), "ffn.gate.bias": (2,),
+            "ffn.gate.weight": (n_experts, hidden), "ffn.gate.bias": (n_experts,),
             "ffn.shared_experts.w1.weight": (inter, hidden),
             "ffn.shared_experts.w1.scale": (ceil32(inter), ceil32(hidden)),
             "ffn.shared_experts.w2.weight": (hidden, inter),
@@ -361,7 +364,7 @@ def _packed_layer_contract():
         def load_many(self, values):
             result = {}
             for name in values:
-                suffix = name.removeprefix("mtp.0.")
+                suffix = name.split(".", 2)[-1]
                 if suffix.startswith("ffn.experts."):
                     suffix = suffix.split(".", 3)[-1]
                     expert_shape = {
@@ -394,12 +397,15 @@ def _packed_layer_contract():
                         dtype = torch.bfloat16
                 if dtype == torch.float8_e4m3fn:
                     result[name] = (torch.arange(torch.Size(expert_shape).numel()).reshape(expert_shape) % 13).to(dtype)
+                elif dtype == torch.uint8:
+                    expert = int(name.split(".")[4])
+                    result[name] = torch.full(expert_shape, 17 * expert, dtype=dtype)
                 else:
                     result[name] = torch.zeros(expert_shape, dtype=dtype)
             return result
 
     loader = SimpleNamespace(
-        store=Store(), text=text, ep_size=2, ep_rank=1, tp_size=1,
+        store=Store(), text=text, ep_size=ep_size, ep_rank=ep_rank, tp_size=1,
     )
     return V41DSparkWeightContract(loader)
 
@@ -410,9 +416,75 @@ def test_load_layer_packed_uses_only_one_ep_rank_and_lib_layouts():
     assert packed["wq_a_scale"].shape == (8, 64)
     assert packed["wo_a"].shape == (2, 128, 32)
     assert packed["wo_b"].shape == (64, 256)
-    assert packed["routed_w1"].shape == (256, 128)
+    assert packed["routed_w1"].shape == (1, 256, 128)
     assert packed["routed_w1_scale"].shape == (8, 256)
     assert packed["gate_weight"].dtype is torch.float32
+
+
+def test_resident_drafter_expert_banks_match_selected_lib_annotations(monkeypatch):
+    """Exercise real packing and resident uploads with two experts per rank."""
+    from pypto.runtime import DeviceTensor
+    from pypto_serving.model.deepseek_v41 import weight_loader
+    from pypto_serving.model.deepseek_v41.npu_runner import ResidentDSparkWeights
+
+    root = Path(os.environ.get("PYPTO_LIB_ROOT") or Path(__file__).resolve().parents[4] / "pypto-lib")
+    source = root / "models/deepseek_v4_1_flash/dspark_drafter.py"
+    if not source.is_file():
+        pytest.skip("selected pypto-lib drafter source is unavailable")
+    tree = ast.parse(source.read_text(encoding="utf-8-sig"))
+    entry = next(node for node in tree.body
+                 if isinstance(node, ast.FunctionDef) and node.name == "l3_dspark_drafter")
+    annotations = {arg.arg: arg.annotation for arg in entry.args.args}
+    world, local_experts = 2, 2
+
+    def loader(model_dir, *, ep_size, ep_rank, **kwargs):
+        return _packed_layer_contract(n_experts=4, ep_size=ep_size, ep_rank=ep_rank).loader
+
+    monkeypatch.setattr(weight_loader, "V41WeightLoader", loader)
+
+    class Worker:
+        def __init__(self):
+            self.buffers = {}
+
+        def alloc_tensor(self, shape, dtype, *, worker_id):
+            value = torch.empty(shape, dtype=dtype)
+            self.buffers[value.data_ptr()] = value
+            return DeviceTensor(value.data_ptr(), shape, dtype)
+
+        def copy_to(self, destination, source, nbytes, *, dst_offset, worker_id):
+            value = self.buffers[destination]
+            assert dst_offset + nbytes <= value.numel() * value.element_size()
+            ctypes.memmove(destination + dst_offset, source, nbytes)
+
+        def free_tensor(self, value, *, worker_id):
+            del self.buffers[value.data_ptr]
+
+    # Evaluate the selected lib's actual shape expressions at the small test
+    # dimensions, preserving its axes without importing or compiling kernels.
+    dimensions = dict(C=SimpleNamespace(EP_SIZE=world), DSPARK_DRAFT_LAYERS=3,
+                      N_LOCAL_EXPERTS=local_experts, D=256, MOE_INTER=256, MX_GROUP=32,
+                      MX_W1_PACKED_ROWS=256, MX_W2_PACKED_ROWS=256, MX_W3_PACKED_ROWS=256,
+                      MX_PACKED_LANE_COLS=128)
+    worker = Worker()
+    resident = ResidentDSparkWeights(worker, "unused", world)
+    try:
+        for name in DSPARK_EXPERT_SOURCE_TO_ABI.values():
+            annotation = annotations[name]
+            shape_expression, dtype_expression = annotation.slice.elts[:2]
+            expected_shape = eval(compile(ast.Expression(shape_expression), "lib_shape", "eval"), dimensions)
+            expected_dtype = {"UINT8": torch.uint8, "FP8E8M0": torch.float8_e8m0fnu}[dtype_expression.attr]
+            value = resident.full(name)
+            assert tuple(value.shape) == tuple(expected_shape)
+            assert value.dtype == expected_dtype
+            for rank, shard in enumerate(value.shards):
+                assert tuple(shard.shape) == tuple(expected_shape[1:])
+                if not name.endswith("_scale"):
+                    uploaded = worker.buffers[shard.data_ptr]
+                    for expert in range(local_experts):
+                        assert bool((uploaded[:, expert] == 17 * (rank * local_experts + expert)).all())
+    finally:
+        resident.close()
+    assert not worker.buffers
 
 
 def test_drafter_attention_weights_use_nz_and_shared_experts_keep_nd():
