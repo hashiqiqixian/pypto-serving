@@ -62,7 +62,7 @@ _DRAFT_MODEL_KEYS = frozenset({
     "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "ffn_norm_weight",
     "gate_weight", "correction_bias", "routed_w1", "routed_w1_scale",
     "routed_w2", "routed_w2_scale", "routed_w3", "routed_w3_scale",
-    "mxfp4_pair_lut", "shared_w1", "shared_w1_scale", "shared_w2",
+    "shared_w1", "shared_w1_scale", "shared_w2",
     "shared_w2_scale", "shared_w3", "shared_w3_scale",
 })
 _MARKOV_MODEL_KEYS = frozenset({

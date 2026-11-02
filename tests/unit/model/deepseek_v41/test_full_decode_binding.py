@@ -61,6 +61,7 @@ def test_selected_lib_full_decode_abi_is_fully_bound():
     entry = next(node for node in module.body
                  if isinstance(node, ast.FunctionDef) and node.name == "l3_decode_fwd")
     parameters = {argument.arg for argument in entry.args.args}
+    assert "mxfp4_pair_lut" not in parameters
     metadata = set(DecodeForwardSegment._METADATA) | {
         "window_slots", "window_indices",
         "c2a_compressed_slots", "c1a_compressed_slots", "moe_num_tokens",
@@ -191,6 +192,7 @@ def test_full_prefill_import_uses_serving_capacity_and_complete_abi():
     }
     engram_weights = {"engram_wkv", "engram_wkv_scale", "engram_weight"}
     assert set(names) == _ALL | inputs | caches | outputs | engram_weights
+    assert "mxfp4_pair_lut" not in names
     assert not {"bank8", "bank4", "scales8", "offsets"} & set(names)
 
 

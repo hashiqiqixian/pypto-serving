@@ -218,8 +218,12 @@ def _selected_lib_orchestrators(production):
 def test_production_payload_runs_selected_lib_host_orchestrator(production):
     """Use the actual lib host composition and every stage's declared keys."""
     namespace = _selected_lib_orchestrators(production)
+    assert "mxfp4_pair_lut" not in namespace["l3_dspark_drafter"].param_names
+    assert "mxfp4_pair_lut" not in namespace["l3_decode_fwd"].param_names
     _reserve(production, "a", 1, 7)
     lowered = production.provider.lower_decode(model=object(), batch=_batch()).lowered
+    assert "mxfp4_pair_lut" not in lowered.target_model
+    assert "mxfp4_pair_lut" not in lowered.draft_model
     called = []
     namespace["decode_fwd_dspark"](
         lambda program, arguments: called.append(program._func.__name__),

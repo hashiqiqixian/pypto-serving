@@ -468,6 +468,8 @@ def test_resident_drafter_expert_banks_match_selected_lib_annotations(monkeypatc
     worker = Worker()
     resident = ResidentDSparkWeights(worker, "unused", world)
     try:
+        assert "mxfp4_pair_lut" not in annotations
+        assert "mxfp4_pair_lut" not in resident.tensors
         for name in DSPARK_EXPERT_SOURCE_TO_ABI.values():
             annotation = annotations[name]
             shape_expression, dtype_expression = annotation.slice.elts[:2]

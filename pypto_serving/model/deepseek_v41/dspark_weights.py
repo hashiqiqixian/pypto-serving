@@ -25,7 +25,6 @@ import torch
 
 from pypto_serving.model.common.weights.nz import pack_nz
 
-from .weight_loader import mxfp4_pair_lut
 from .weight_spec import fp8_input_major, pack_fp4_tiles, pack_grouped_wo_a
 
 
@@ -595,7 +594,6 @@ class V41DSparkWeightContract:
             values = [layer[name] for layer in layers]
             packed[name] = torch.stack(values, dim=0).contiguous()
         packed.update({name: value.contiguous() for name, value in heads.items()})
-        packed["mxfp4_pair_lut"] = mxfp4_pair_lut()
         return V41DSparkPackedWeights(packed)
 
 

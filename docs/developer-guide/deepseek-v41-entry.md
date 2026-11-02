@@ -118,6 +118,9 @@ at upload. Serving validates the checkpoint fingerprint and mapped fields, and
 falls back to checkpoint packing when the sidecar is absent, stale or cold.
 The current v2 bank format invalidates older ND projection sidecars; rebuild
 those sidecars for the BF16 compressor and NZ projection layouts.
+Native MXFP4 kernels no longer take a lookup table. Existing 45-field v2
+sidecars remain compatible: serving verifies and skips the retired INT16 LUT,
+while mapping the other 44 fields without repacking or changing their layouts.
 Prepacking requires roughly 300 GiB each of host staging and output storage;
 it does not make the first preparation free. Startup logs report checkpoint
 staging, bank copies and resident upload separately.

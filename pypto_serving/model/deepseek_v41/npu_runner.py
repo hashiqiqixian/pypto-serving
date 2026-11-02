@@ -904,7 +904,7 @@ ATTENTION_ARGS = (
 ).split()
 MOE_ARGS = (
     "x_hc pre_mix hc_ffn_fn hc_ffn_scale hc_ffn_base norm_weight gate_weight correction_bias "
-    "routed_w1 routed_w1_scale routed_w2 routed_w2_scale routed_w3 routed_w3_scale mxfp4_pair_lut "
+    "routed_w1 routed_w1_scale routed_w2 routed_w2_scale routed_w3 routed_w3_scale "
     "shared_w1 shared_w1_scale shared_w2 shared_w2_scale shared_w3 shared_w3_scale "
     "next_pre_mix x_mixed x_next num_tokens moe_epoch"
 ).split()
@@ -1148,9 +1148,9 @@ class SwaSegment:
         import torch
         from pypto.runtime import StackedDeviceTensor
 
-        for name in ("routed_w1", "routed_w2", "routed_w3", "mxfp4_pair_lut"):
+        for name in ("routed_w1", "routed_w2", "routed_w3"):
             value = moe[name]
-            expected = torch.int16 if name == "mxfp4_pair_lut" else torch.uint8
+            expected = torch.uint8
             if not isinstance(value, StackedDeviceTensor) or value.dtype != expected:
                 raise ValueError(f"{name} must be a resident packed-FP4 ABI tensor ({expected})")
 
@@ -3039,17 +3039,6 @@ class ResidentDSparkWeights:
         except BaseException:
             self.close()
             raise
-
-        from .dspark_weights import mxfp4_pair_lut
-        lut = mxfp4_pair_lut()
-        shards = []
-        for rank in range(world):
-            shard = worker.alloc_tensor(tuple(lut.shape), lut.dtype, worker_id=rank)
-            self._owned.append((rank, shard))
-            self._copy(worker, shard, lut, rank)
-            shards.append(shard)
-        self.tensors["mxfp4_pair_lut"] = StackedDeviceTensor(
-            tuple(shards), (world, *lut.shape), tuple(range(world)))
 
     @staticmethod
     def _copy(worker, destination, source, rank, *, offset=0):
