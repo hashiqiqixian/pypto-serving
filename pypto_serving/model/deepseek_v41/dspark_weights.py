@@ -23,6 +23,8 @@ from dataclasses import dataclass
 
 import torch
 
+from pypto_serving.model.common.weights.nz import pack_nz
+
 from .weight_loader import mxfp4_pair_lut
 from .weight_spec import fp8_input_major, pack_fp4_tiles, pack_grouped_wo_a
 
@@ -38,8 +40,8 @@ DSPARK_HEAD_SOURCE_TO_ABI = {
     "mtp.0.main_proj.weight": "main_proj_weight",
     "mtp.0.main_norm.weight": "main_norm_weight",
     "mtp.2.norm.weight": "final_norm_weight",
-    "mtp.2.markov_head.markov_w1.weight": "markov_w1",
-    "mtp.2.markov_head.markov_w2.weight": "markov_w2",
+    "mtp.2.markov_head.embed.weight": "markov_w1",
+    "mtp.2.markov_head.head.weight": "markov_w2",
     "mtp.2.confidence_head.proj.weight": "confidence_weight",
 }
 
@@ -124,7 +126,7 @@ def dspark_v41_required_weight_names(n_routed_experts: int) -> tuple[str, ...]:
     """Return the deferred checkpoint names required by the K=5 DSpark path."""
     if type(n_routed_experts) is not int or n_routed_experts <= 0:
         raise ValueError("n_routed_experts must be a positive integer")
-    names = list(DSPARK_HEAD_SOURCE_TO_ABI)
+    names = [*DSPARK_HEAD_SOURCE_TO_ABI, "mtp.0.main_proj.scale"]
     for layer in DSPARK_DRAFT_LAYERS:
         names.extend(f"mtp.{layer}.{suffix}" for suffix in _LAYER_SUFFIXES)
         names.extend(
@@ -151,6 +153,26 @@ def dspark_v41_layer_weight_names(layer: int, n_routed_experts: int) -> tuple[st
 
 def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
+
+
+def _dequantize_main_projection(payload: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Decode checkpoint block32 FP8 directly into the input-major BF16 ABI."""
+    rows, cols = payload.shape
+    if scale.dtype != torch.float8_e8m0fnu or tuple(scale.shape) != (
+        _ceil_div(rows, 32), _ceil_div(cols, 32)
+    ):
+        raise ValueError("DSpark main_proj.scale must be the matching block32 E8M0 grid")
+    codes = scale.contiguous().view(torch.uint8)
+    if bool((codes == 255).any()):
+        raise ValueError("DSpark main_proj.scale must contain finite E8M0 scales")
+    output = torch.empty((cols, rows), dtype=torch.bfloat16)
+    # Keep FP32 temporaries to one 32-row block, not the full [D, 3D] matrix.
+    for start in range(0, rows, 32):
+        stop = min(start + 32, rows)
+        factors = torch.exp2(codes[start // 32].float() - 127).repeat_interleave(32)[:cols]
+        values = payload[start:stop].float() * factors
+        output[:, start:stop].copy_(values.T)
+    return output
 
 
 @dataclass(frozen=True)
@@ -238,9 +260,13 @@ class V41DSparkWeightContract:
         if not hasattr(loader, "store") or not hasattr(loader, "text"):
             raise TypeError("V41 DSpark contract requires a V41WeightLoader-like object")
         self.loader = loader
-        self.n_routed_experts = loader.text.get("n_routed_experts")
+        # Older checkpoints share the backbone count; explicit DSpark metadata
+        # owns the drafter's gate shape and EP expert partition when present.
+        expert_field = ("dspark_n_routed_experts" if "dspark_n_routed_experts" in loader.text
+                        else "n_routed_experts")
+        self.n_routed_experts = loader.text.get(expert_field)
         if type(self.n_routed_experts) is not int or self.n_routed_experts <= 0:
-            raise ValueError("text.n_routed_experts must be a positive integer")
+            raise ValueError(f"text.{expert_field} must be a positive integer")
 
     @property
     def required_names(self) -> tuple[str, ...]:
@@ -254,14 +280,14 @@ class V41DSparkWeightContract:
         """Load only the replicated head tensors and normalize main-proj layout.
 
         The checkpoint stores ``main_proj`` as ``[D, 3D]`` while the lib ABI
-        consumes ``[3D, D]``.  Other head tensors already use their ABI logical
-        orientation; quantized layer transforms remain the packer's concern.
+        consumes BF16 ``[3D, D]``. Quantized main-projection payloads use the
+        checkpoint's block32 E8M0 scales; the confidence ABI requires FP32.
         """
         values = self.loader.store.load_many(tuple(DSPARK_HEAD_SOURCE_TO_ABI))
         main_proj = values["mtp.0.main_proj.weight"]
         main_norm = values["mtp.0.main_norm.weight"]
-        markov_w1 = values["mtp.2.markov_head.markov_w1.weight"]
-        markov_w2 = values["mtp.2.markov_head.markov_w2.weight"]
+        markov_w1 = values["mtp.2.markov_head.embed.weight"]
+        markov_w2 = values["mtp.2.markov_head.head.weight"]
         confidence = values["mtp.2.confidence_head.proj.weight"]
         if main_proj.ndim != 2 or main_norm.ndim != 1:
             raise ValueError("DSpark main projection must be rank-2 with a rank-1 norm")
@@ -293,7 +319,16 @@ class V41DSparkWeightContract:
             DSPARK_HEAD_SOURCE_TO_ABI[name]: value
             for name, value in values.items()
         }
-        result["main_proj_weight"] = main_proj.transpose(0, 1).contiguous()
+        if main_proj.dtype == torch.float8_e4m3fn:
+            scale_name = "mtp.0.main_proj.scale"
+            self.loader.store.require((scale_name,))
+            scale = self.loader.store.load_many((scale_name,))[scale_name]
+            result["main_proj_weight"] = _dequantize_main_projection(main_proj, scale)
+        elif main_proj.dtype == torch.bfloat16:
+            result["main_proj_weight"] = main_proj.transpose(0, 1).contiguous()
+        else:
+            raise ValueError("DSpark main_proj.weight must be BF16 or block32 FP8 E4M3")
+        result["confidence_weight"] = confidence.float().contiguous()
         return V41DSparkHeadWeights(result)
 
     def load_layer(self, layer: int) -> Mapping[str, torch.Tensor]:
@@ -497,6 +532,8 @@ class V41DSparkWeightContract:
             ):
                 scale_suffix = suffix.removesuffix(".weight") + ".scale"
                 weight, scale = fp8_input_major(value, source(scale_suffix))
+                if suffix.startswith("attn."):
+                    weight = pack_nz(weight)
                 result[abi_name] = weight
                 result[abi_name + "_scale"] = scale
             elif suffix == "attn.wo_a.weight":
@@ -504,7 +541,7 @@ class V41DSparkWeightContract:
                     value, source("attn.wo_a.scale"),
                     int(self.loader.text["o_groups"]),
                 )
-                result[abi_name] = weight
+                result[abi_name] = pack_nz(weight)
                 result[abi_name + "_scale"] = scale
             elif suffix == "ffn.gate.weight":
                 result[abi_name] = value.float().contiguous()

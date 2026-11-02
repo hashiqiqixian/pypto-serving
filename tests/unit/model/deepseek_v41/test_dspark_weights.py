@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from pypto_serving.model.common.weights.nz import unpack_nz
 from pypto_serving.model.deepseek_v41.dspark_weights import (
     DSPARK_EXPERT_SOURCE_TO_ABI,
     DSPARK_HEAD_SOURCE_TO_ABI,
@@ -26,7 +27,7 @@ from pypto_serving.model.deepseek_v41.dspark_weights import (
 )
 
 
-def _contract(names, *, hidden=4, markov_rank=2):
+def _contract(names, *, hidden=4, markov_rank=2, text=None, tensors=None):
     class Store:
         def __init__(self):
             self.required = None
@@ -40,11 +41,13 @@ def _contract(names, *, hidden=4, markov_rank=2):
         def load_many(self, values):
             result = {}
             for name in values:
-                if name.endswith("main_proj.weight"):
+                if tensors is not None and name in tensors:
+                    result[name] = tensors[name]
+                elif name.endswith("main_proj.weight"):
                     result[name] = torch.zeros((hidden, 3 * hidden), dtype=torch.bfloat16)
                 elif name.endswith("main_norm.weight") or name.endswith("norm.weight"):
                     result[name] = torch.ones(hidden, dtype=torch.bfloat16)
-                elif "markov_w" in name:
+                elif "markov_head." in name:
                     result[name] = torch.zeros((8, markov_rank), dtype=torch.bfloat16)
                 elif "confidence_head" in name:
                     result[name] = torch.zeros((1, hidden + markov_rank), dtype=torch.float32)
@@ -52,7 +55,7 @@ def _contract(names, *, hidden=4, markov_rank=2):
                     result[name] = torch.zeros(1)
             return result
 
-    loader = SimpleNamespace(store=Store(), text={"n_routed_experts": 2})
+    loader = SimpleNamespace(store=Store(), text={"n_routed_experts": 2} if text is None else text)
     return V41DSparkWeightContract(loader), loader
 
 
@@ -83,11 +86,86 @@ def test_head_mapping_transposes_main_projection_and_keeps_markov_shape():
     assert heads["confidence_weight"].shape == (1, 6)
 
 
+def test_checkpoint_heads_decode_fp8_scales_and_keep_markov_direction():
+    payload = (torch.arange(64 * 192).reshape(64, 192) % 7).to(torch.float8_e4m3fn)
+    codes = torch.tensor([[126, 127, 128, 129, 130, 131],
+                          [132, 131, 130, 129, 128, 127]], dtype=torch.uint8)
+    embed = torch.full((8, 2), 3.0, dtype=torch.bfloat16)
+    head = torch.full((8, 2), 5.0, dtype=torch.bfloat16)
+    tensors = {
+        "mtp.0.main_proj.weight": payload,
+        "mtp.0.main_proj.scale": codes.view(torch.float8_e8m0fnu),
+        "mtp.2.markov_head.embed.weight": embed,
+        "mtp.2.markov_head.head.weight": head,
+        "mtp.2.confidence_head.proj.weight": torch.ones((1, 66), dtype=torch.bfloat16),
+    }
+    contract, _ = _contract(dspark_v41_required_weight_names(2), hidden=64, tensors=tensors)
+    heads = contract.load_heads().tensors
+    factors = torch.tensor([[0.5, 1, 2, 4, 8, 16], [32, 16, 8, 4, 2, 1]])
+    expected = (payload.float() * factors.repeat_interleave(32, 0).repeat_interleave(32, 1)).bfloat16()
+    assert heads["main_proj_weight"].dtype == torch.bfloat16
+    assert heads["main_proj_weight"].is_contiguous()
+    assert torch.equal(heads["main_proj_weight"], expected.T)
+    assert torch.equal(heads["markov_w1"], embed)
+    assert torch.equal(heads["markov_w2"], head)
+    assert heads["confidence_weight"].dtype == torch.float32
+    assert torch.equal(heads["confidence_weight"], tensors["mtp.2.confidence_head.proj.weight"].float())
+
+
+@pytest.mark.parametrize("shape,dtype", [((2, 3), torch.float8_e8m0fnu), ((1, 3), torch.float32)])
+def test_quantized_main_projection_rejects_invalid_scale_grid(shape, dtype):
+    tensors = {
+        "mtp.0.main_proj.weight": torch.ones((32, 96)).to(torch.float8_e4m3fn),
+        "mtp.0.main_proj.scale": torch.zeros(shape, dtype=dtype),
+    }
+    contract, _ = _contract(dspark_v41_required_weight_names(2), hidden=32, tensors=tensors)
+    with pytest.raises(ValueError, match="matching block32 E8M0 grid"):
+        contract.load_heads()
+
+
+def test_index_requires_quantized_main_projection_scales():
+    names = tuple(name for name in dspark_v41_required_weight_names(2) if name != "mtp.0.main_proj.scale")
+    contract, _ = _contract(names)
+    with pytest.raises(KeyError, match="mtp.0.main_proj.scale"):
+        contract.validate_index()
+
+
 def test_validate_index_rejects_missing_deferred_tensor():
     names = dspark_v41_required_weight_names(2)
     contract, _ = _contract(names[:-1])
     with pytest.raises(KeyError):
         contract.validate_index()
+
+
+def test_drafter_expert_count_overrides_backbone_and_preserves_ep_ownership():
+    text = {"n_routed_experts": 384, "dspark_n_routed_experts": 128}
+    contract, loader = _contract(dspark_v41_required_weight_names(128), text=text)
+    contract.validate_index()
+    assert contract.n_routed_experts == 128
+    assert loader.text["n_routed_experts"] == 384
+    loader.ep_size, loader.ep_rank = 4, 3
+    for expert in (96, 127):
+        contract._load_expert_for_rank(2, expert)
+        assert set(loader.store.required) == {
+            f"mtp.2.ffn.experts.{expert}.{suffix}" for suffix in DSPARK_EXPERT_SOURCE_TO_ABI
+        }
+    for expert in (95, 128):
+        with pytest.raises(ValueError, match="outside the selected EP rank"):
+            contract._load_expert_for_rank(2, expert)
+
+
+def test_drafter_expert_override_still_requires_every_real_expert():
+    missing = "mtp.2.ffn.experts.127.w3.scale"
+    names = tuple(name for name in dspark_v41_required_weight_names(128) if name != missing)
+    contract, _ = _contract(names, text={"n_routed_experts": 384, "dspark_n_routed_experts": 128})
+    with pytest.raises(KeyError, match=missing):
+        contract.validate_index()
+
+
+@pytest.mark.parametrize("count", [0, -1, True, None, "128"])
+def test_invalid_explicit_drafter_expert_count_does_not_fall_back(count):
+    with pytest.raises(ValueError, match="text.dspark_n_routed_experts must be a positive integer"):
+        _contract((), text={"n_routed_experts": 384, "dspark_n_routed_experts": count})
 
 
 def test_v41_drafter_weight_contract_matches_lib_abi():
@@ -298,7 +376,7 @@ def _packed_layer_contract():
                     expert_shape, dtype = shape(suffix), torch.bfloat16
                 elif name.endswith("main_norm.weight") or name.endswith("norm.weight"):
                     expert_shape, dtype = (256,), torch.bfloat16
-                elif "markov_w" in name:
+                elif "markov_head." in name:
                     expert_shape, dtype = (8, 2), torch.bfloat16
                 elif "confidence_head" in name:
                     expert_shape, dtype = (1, 258), torch.float32
@@ -314,7 +392,10 @@ def _packed_layer_contract():
                         dtype = torch.float32
                     else:
                         dtype = torch.bfloat16
-                result[name] = torch.zeros(expert_shape, dtype=dtype)
+                if dtype == torch.float8_e4m3fn:
+                    result[name] = (torch.arange(torch.Size(expert_shape).numel()).reshape(expert_shape) % 13).to(dtype)
+                else:
+                    result[name] = torch.zeros(expert_shape, dtype=dtype)
             return result
 
     loader = SimpleNamespace(
@@ -332,3 +413,23 @@ def test_load_layer_packed_uses_only_one_ep_rank_and_lib_layouts():
     assert packed["routed_w1"].shape == (256, 128)
     assert packed["routed_w1_scale"].shape == (8, 256)
     assert packed["gate_weight"].dtype is torch.float32
+
+
+def test_drafter_attention_weights_use_nz_and_shared_experts_keep_nd():
+    contract = _packed_layer_contract()
+    packed = contract.load_layer_packed(0).tensors
+    for source, destination in (
+        ("attn.wq_a.weight", "wq_a"), ("attn.wq_b.weight", "wq_b"),
+        ("attn.wkv.weight", "wkv"), ("attn.wo_b.weight", "wo_b"),
+    ):
+        name = f"mtp.0.{source}"
+        raw = contract.loader.store.load_many((name,))[name]
+        assert torch.equal(unpack_nz(packed[destination]).view(torch.uint8), raw.T.contiguous().view(torch.uint8))
+    name = "mtp.0.attn.wo_a.weight"
+    raw = contract.loader.store.load_many((name,))[name]
+    groups = contract.loader.text["o_groups"]
+    expected = raw.reshape(groups, raw.shape[0] // groups, raw.shape[1]).transpose(-1, -2).contiguous()
+    assert torch.equal(unpack_nz(packed["wo_a"]).view(torch.uint8), expected.view(torch.uint8))
+    name = "mtp.0.ffn.shared_experts.w1.weight"
+    raw = contract.loader.store.load_many((name,))[name]
+    assert torch.equal(packed["shared_w1"].view(torch.uint8), raw.T.contiguous().view(torch.uint8))
