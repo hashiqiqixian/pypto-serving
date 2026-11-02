@@ -400,6 +400,13 @@ def _packed_layer_contract(*, n_experts=2, ep_size=2, ep_rank=1):
                 elif dtype == torch.uint8:
                     expert = int(name.split(".")[4])
                     result[name] = torch.full(expert_shape, 17 * expert, dtype=dtype)
+                elif dtype == torch.float8_e8m0fnu and "ffn.experts." in name:
+                    layer, expert = int(name.split(".")[1]), int(name.split(".")[4])
+                    projection = int(name.split(".")[-2][1:])
+                    width, groups = expert_shape
+                    codes = (torch.arange(width)[:, None] // 16 + 3 * torch.arange(groups)[None, :]
+                             + 11 * expert + 17 * layer + 5 * projection) % 64 + 96
+                    result[name] = codes.to(torch.uint8).view(dtype)
                 else:
                     result[name] = torch.zeros(expert_shape, dtype=dtype)
             return result
@@ -480,10 +487,26 @@ def test_resident_drafter_expert_banks_match_selected_lib_annotations(monkeypatc
             assert value.dtype == expected_dtype
             for rank, shard in enumerate(value.shards):
                 assert tuple(shard.shape) == tuple(expected_shape[1:])
+                uploaded = worker.buffers[shard.data_ptr]
                 if not name.endswith("_scale"):
-                    uploaded = worker.buffers[shard.data_ptr]
                     for expert in range(local_experts):
                         assert bool((uploaded[:, expert] == 17 * (rank * local_experts + expert)).all())
+                else:
+                    # Decode the complete MX_B_NN matrix, as the lib does.
+                    # Concatenating packed experts has the same shape but
+                    # mixes their scales with neighboring output blocks.
+                    rows, width = uploaded.shape[-2:]
+                    groups = rows // local_experts
+                    contract = _packed_layer_contract(n_experts=4, ep_size=world, ep_rank=rank)
+                    projection = name.removeprefix("routed_").removesuffix("_scale")
+                    for layer in range(3):
+                        logical = (uploaded[layer].view(torch.uint8)
+                                   .reshape(width // 16, rows // 2, 16, 2)
+                                   .permute(1, 3, 0, 2).reshape(local_experts, groups, width))
+                        for expert in range(local_experts):
+                            source = f"mtp.{layer}.ffn.experts.{rank * local_experts + expert}.{projection}.scale"
+                            raw = contract.loader.store.load_many((source,))[source]
+                            assert torch.equal(logical[expert], raw.view(torch.uint8).T)
     finally:
         resident.close()
     assert not worker.buffers

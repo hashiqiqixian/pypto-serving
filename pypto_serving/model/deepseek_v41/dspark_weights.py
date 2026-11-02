@@ -25,6 +25,7 @@ import torch
 
 from pypto_serving.model.common.weights.nz import pack_nz
 
+from .weight_loader import merge_expert_scales
 from .weight_spec import fp8_input_major, pack_fp4_tiles, pack_grouped_wo_a
 
 
@@ -498,7 +499,7 @@ class V41DSparkWeightContract:
         Native FP8 projections retain their E4M3 payload and receive the
         physical E8M0 scale order required by the lib.  Routed MXFP4 payloads
         are tile-reordered without float expansion, and their scales are
-        packed independently per local expert before concatenation.
+        merged into one MX_B_NN matrix across the local experts.
         """
         layer_raw = self._load_layer_for_rank(layer)
         expected = self._layer_source_shapes()
@@ -562,9 +563,8 @@ class V41DSparkWeightContract:
                     packed = pack_fp4_tiles(value)
                     routed_values[abi_name].append(packed)
                 else:
-                    # The scale source is [N, K/32].  The lib flattens local
-                    # experts before the K-group axis, so pack each expert
-                    # independently and concatenate on the group axis.
+                    # The scale source is [N, K/32].  Keep each expert's
+                    # packed scale until merging the flattened K-group axis.
                     scale = value.view(torch.uint8).T.contiguous()
                     routed_values[abi_name].append(
                         _pack_expert_scale(scale, value.dtype)
@@ -572,10 +572,10 @@ class V41DSparkWeightContract:
             del expert_raw
         del layer_raw
         for name, values in routed_values.items():
-            # Payloads retain the expert axis; scale matrices flatten experts
-            # into their K-group axis in the drafter's declared ABI.
-            combine = torch.cat if name.endswith("_scale") else torch.stack
-            result[name] = combine(values, dim=0).contiguous()
+            # MX_B_NN puts output blocks before expert/K-group, so packed
+            # per-expert scales must be reordered when combining experts.
+            result[name] = (merge_expert_scales(values) if name.endswith("_scale")
+                            else torch.stack(values, dim=0).contiguous())
 
         return V41DSparkLayerWeights(tensors=result, routed_experts={})
 
