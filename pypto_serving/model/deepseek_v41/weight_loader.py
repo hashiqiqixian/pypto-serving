@@ -30,6 +30,7 @@ from types import SimpleNamespace
 import torch
 
 from pypto_serving.model.common.weights.store import LazySafetensorsStore
+from pypto_serving.model.common.weights.nz import pack_nz
 from pypto_serving.model.deepseek.weight_loader import (
     _map_shared_prepacked_tensors,
     _sample_file_page_cache_residency,
@@ -47,6 +48,12 @@ from .weight_spec import (
 # weight_loader
 _BYTES = {"BF16": 2, "F32": 4, "F8_E4M3": 1, "F8_E8M0": 1, "I8": 1}
 _EXPERT = re.compile(r"^layers\.\d+\.ffn\.experts\.(\d+)\.")
+_NZ_PROJECTION_SUFFIXES = (
+    ".attn.wq_a.weight", ".attn.wq_b.weight", ".attn.wkv.weight",
+    ".attn.wo_a.weight", ".attn.wo_b.weight", ".indexer.wq_b.weight",
+    ".compressor.wkv.weight", ".compressor.wgate.weight",
+    ".indexer.wk.weight", ".indexer.weights_proj.weight",
+)
 _TORCH_DTYPES = {
     "BF16": torch.bfloat16,
     "F32": torch.float32,
@@ -349,6 +356,9 @@ class V41WeightLoader:
                 layout = "input_major_dense"
             else:
                 layout = "checkpoint_dense"
+        if name.endswith(_NZ_PROJECTION_SUFFIXES):
+            weight = pack_nz(weight)
+            layout += ";nz"
         return WeightBundle(weight, scale, layout, tuple(item[0] for item in requests),
                             self.tp_rank, self.ep_rank, estimate)
 
@@ -891,8 +901,8 @@ _AXIS_LAYER = frozenset({
     "wq_a", "wq_b", "wkv", "wo_b", "shared_w1", "shared_w2", "shared_w3",
 })
 _FLAT_KV = frozenset({"compressor_norm_weight"})
-_FLAT_INDEX = frozenset({"index_wk", "index_norm_weight", "index_wq_b_scale"})
-_AXIS_INDEX = frozenset({"index_wq_b", "index_weights_proj"})
+_FLAT_INDEX = frozenset({"index_norm_weight", "index_wq_b_scale"})
+_AXIS_INDEX = frozenset({"index_wk", "index_wq_b", "index_weights_proj"})
 _AXIS_C2A = frozenset({"c2a_compressor_wkv", "c2a_compressor_wgate"})
 _SINGLE = frozenset({"c1a_compressor_wkv", "mxfp4_pair_lut"})
 _ALL = (_FLAT_LAYER | _AXIS_LAYER | _FLAT_KV | _FLAT_INDEX |
@@ -1226,7 +1236,7 @@ class ResidentFullDecodeWeights(ResidentDecodeWeights):
 
 # weight_sidecar
 _LOG = logging.getLogger(__name__)
-_FORMAT = "pypto-deepseek-v41-decode-slot-major-v1"
+_FORMAT = "pypto-deepseek-v41-decode-slot-major-v2"
 _FLOAT8 = {"float8_e4m3fn": torch.float8_e4m3fn,
            "float8_e8m0fnu": torch.float8_e8m0fnu}
 

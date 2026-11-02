@@ -78,14 +78,16 @@ the Executor stage. This API does not invent an executable whole-layer ABI.
 
 | Source | CPU result |
 | --- | --- |
-| FP8 block32 `[N,K]` + UE8M0 grid | Contiguous FP8 `[K,N]`, expanded scale codes in MX_B_NN order |
+| Attention/indexer FP8 `[N,K]` + UE8M0 grid | NZ bytes in logical `[K,N]`, expanded scales in MX_B_NN order |
+| Shared-expert FP8 `[N,K]` + UE8M0 grid | Contiguous FP8 `[K,N]`, expanded scales in MX_B_NN order |
 | Routed FP4 `[N,K/2]` bytes | UINT8 tiles `[K*N/256,128]`, with MX_B_NN E8M0 scales |
 | `wo_a` FP8 | Dequantized grouped BF16 after selecting this rank's output groups |
 | Dense HC/norm weights | Preserved dense layout/dtype |
-| Gate and ratio-2 compressor | Required FP32 promotion; compressor/index matrices transposed where required |
+| Router gate | FP32 promotion for routing |
+| Compressor/index dense projections | BF16 input-major matrices in NZ order |
 | Embedding/head | BF16 vocabulary shard or a bounded local-row range |
 
-Packing matches lib `4c3eab2` host layout helpers; these pure CPU operations do
+Native projection packing matches lib `26e6dc6c` host layout helpers; these CPU operations do
 not import PyPTO or execute small model operators. Runtime integration will
 call composite lib entries, following V4 Executor/Runner structure. Verify the
 layouts again when lib changes. Current FP4 tiles require K/N multiples of 256;
@@ -104,6 +106,8 @@ prepared by separate deployment tooling. Set
 The sidecar stores slot-major, rank-stacked tensors so each layer is contiguous
 at upload. Serving validates the checkpoint fingerprint and mapped fields, and
 falls back to checkpoint packing when the sidecar is absent, stale or cold.
+The current v2 bank format invalidates older ND projection sidecars; rebuild
+those sidecars for the BF16 compressor and NZ projection layouts.
 Prepacking requires roughly 300 GiB each of host staging and output storage;
 it does not make the first preparation free. Startup logs report checkpoint
 staging, bank copies and resident upload separately.

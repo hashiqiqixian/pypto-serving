@@ -209,11 +209,10 @@ def backbone_weight_specs(config: Mapping[str, Any]) -> dict[str, TensorSpec]:
         expert(base + ".ffn.shared_experts", routed=False)
         if layer in kv_sources:
             prefix = attn + ".compressor"
-            promotion = "cast_bf16_to_fp32" if ratios[layer] > 1 else "identity"
-            add(prefix + ".wkv.weight", (head_dim, dim), "BF16", promotion)
+            add(prefix + ".wkv.weight", (head_dim, dim), "BF16")
             add(prefix + ".norm.weight", (head_dim,), "BF16")
             if ratios[layer] > 1:
-                add(prefix + ".wgate.weight", (head_dim, dim), "BF16", promotion)
+                add(prefix + ".wgate.weight", (head_dim, dim), "BF16")
         if layer in index_sources:
             prefix = attn + ".indexer"
             # C1A/C2A composites at lib fbe92bfc compute complete index scores
