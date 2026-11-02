@@ -428,13 +428,12 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
     if len({group.name for group in groups}) != len(groups):
         raise ValueError("V4.1 cache group names must be unique")
     runtime = dataclasses.replace(
-        _build_runtime_config(args),
+        _build_runtime_config(args, model_family="deepseek_v41", num_speculative_tokens=dspark_tokens),
         kv_cache_groups=groups,
         max_num_batched_tokens=step_tokens,
         max_prefill_tokens_per_request=step_tokens,
         requires_homogeneous_prefill_decode=True,
         supports_chunked_prefill_with_speculation=not bool(dspark_tokens),
-        num_speculative_tokens=dspark_tokens,
     )
     return EngineConfig(
         model_id=args.served_model_name or Path(model_dir).name,
@@ -463,8 +462,10 @@ def _build_runtime_config(
     *,
     model_family: str = "qwen",
     config_data: dict[str, object] | None = None,
+    num_speculative_tokens: int | None = None,
 ):
-    num_speculative_tokens = _resolve_num_speculative_tokens(args)
+    if num_speculative_tokens is None:
+        num_speculative_tokens = _resolve_num_speculative_tokens(args)
     kv_dtype = args.kv_cache_dtype
     if kv_dtype == "auto":
         kv_dtype = args.dtype
