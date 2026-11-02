@@ -4,8 +4,9 @@ V4.1 integration provides metadata loading, local text tokenization, selective
 CPU weight loading and a serving binding for lib composites. The model loader
 registers metadata without opening checkpoint payloads. The CLI routes V4.1
 through its own executor; the production binding checks that the selected lib
-checkout supplies the required composites before allocating devices. Short
-real-checkpoint text generation has run on A5, but M0 acceptance is pending.
+checkout supplies the required composites before allocating devices. The
+current real-checkpoint DSpark full-model smoke test and M0 acceptance are
+pending; CPU contracts and isolated lib tests do not establish either result.
 
 ```python
 from pypto_serving.model.deepseek_v41.encoding import load_text_config
@@ -39,16 +40,16 @@ and decoding but is not a full-checkpoint tokenizer validation.
 2. Selective checkpoint loading, weight formats and shard contracts (implemented on CPU).
 3. Executor/Runner lifecycle and explicit composite contract (framework implemented).
 4. Bounded CPU embedding rows from TP shards (implemented); device residual/pre-mix initialization is an adapter callback.
-5. Chunked prefill and request/cache ownership (framework implemented); numerical composites remain adapter callbacks.
+5. Request/cache ownership and target-only chunked prefill (implemented); K=5 requires a single prefill dispatch.
 6. Decode continuity and prefill-to-decode transitions (framework implemented).
-7. Rank-owned weights and all backbone layers (dispatch implemented); device TP/EP execution remains in the adapter.
-8. Final HC/norm/head boundary and shared greedy sampling (framework implemented); numerical head remains an adapter callback.
+7. Rank-owned weights and all backbone layers (dispatch implemented through full prefill/decode composites).
+8. Final HC/norm/head and lib-owned DSpark sampling (dispatch implemented); numerical acceptance remains pending.
 9. Model loader, CLI, scheduler metadata and request release (framework implemented); HTTP/device M0 acceptance remains pending.
 
-Engram, vision and speculative decoding are deferred. Optional metadata for
-these modules may be present in config.json; this stage does not initialize or
-load them. Later numerical acceptance must use a reference with the same
-Engram-disabled scope, not claim equality with the complete official model.
+Engram uses the shared host implementation described below. Optional K=5
+DSpark initializes three MTP layers and Markov heads from the checkpoint.
+Vision remains outside the text execution contract. Numerical acceptance must
+use a reference with the same enabled modules and sampling configuration.
 
 Development starts from upstream main. Existing experimental V4.1 code can be
 reused selectively with tests; its backend and runtime are not prerequisites.
@@ -81,16 +82,16 @@ the Executor stage. This API does not invent an executable whole-layer ABI.
 | Attention/indexer FP8 `[N,K]` + UE8M0 grid | NZ bytes in logical `[K,N]`, expanded scales in MX_B_NN order |
 | Shared-expert FP8 `[N,K]` + UE8M0 grid | Contiguous FP8 `[K,N]`, expanded scales in MX_B_NN order |
 | Routed FP4 `[N,K/2]` bytes | UINT8 tiles `[K*N/256,128]`, with MX_B_NN E8M0 scales |
-| `wo_a` FP8 | Dequantized grouped BF16 after selecting this rank's output groups |
+| `wo_a` FP8 | Grouped FP8 `[local_groups, group_input, o_lora]` in NZ order, with separate E8M0 scales in MX_B_NN order |
 | Dense HC/norm weights | Preserved dense layout/dtype |
 | Router gate | FP32 promotion for routing |
 | Compressor/index dense projections | BF16 input-major matrices in NZ order |
 | Embedding/head | BF16 vocabulary shard or a bounded local-row range |
 
-Native projection packing matches lib `26e6dc6c` host layout helpers; these CPU operations do
-not import PyPTO or execute small model operators. Runtime integration will
-call composite lib entries, following V4 Executor/Runner structure. Verify the
-layouts again when lib changes. Current FP4 tiles require K/N multiples of 256;
+Native projection packing follows the selected lib's host layout helpers;
+these CPU operations do not import PyPTO or execute small model operators.
+Runtime integration calls composite lib entries through the Executor/Runner.
+Verify the layouts again when lib changes. Current FP4 tiles require K/N multiples of 256;
 native FP8 matrices require K divisible by 64 and N by 32. Unsupported geometry
 is rejected. Torch/safetensors must support the checkpoint E8M0 dtype.
 
@@ -99,6 +100,15 @@ row-addressed lookup. Its projection weights are uploaded once through
 `ResidentEngramWeights`, outside the backbone weight bank, and shared by
 prefill and decode. Request cleanup waits for resident work before releasing
 host history; DSpark request state is released through its own owner.
+
+The target backbone uses 384 routed experts and Top-6 routing. The three
+DSpark MTP layers use 128 routed experts and Top-3 routing at lib `24f2b2a1`;
+the drafter expert count comes from `text_config.dspark_n_routed_experts` when
+present, independently of the backbone count. Routed draft payloads retain
+`[EP, 3, local_experts, packed_rows, 128]`; their scale matrices concatenate
+local experts along the K-group axis. The main projection is converted to
+BF16 `[3D, D]`, and Markov sampling uses `mtp.2.norm.weight` with the shared
+target LM head.
 
 For repeated full-model starts, V4.1 can use a V4-style prepacked sidecar
 prepared by separate deployment tooling. Set
@@ -158,8 +168,8 @@ names = plan.weight_names(24)  # local experts; no duplicate scale loads
 bundle = plan.load_weight(24, "layers.24.hc_attn_scale")
 ```
 
-Logical ranks form contiguous TP groups. With TP4/DP2/EP8, rank 7 is
-TP rank 3, DP rank 1 and EP rank 7. These are logical coordinates, not
+Logical ranks form contiguous TP groups. With TP1/DP8/EP8, rank 7 is
+TP rank 0, DP rank 7 and EP rank 7. These are logical coordinates, not
 physical NPU IDs. The checkpoint loader still enforces dimension divisibility.
 The plan preserves checkpoint names and the loader's per-operation budget;
 it does not invent parameter bindings for an unsupported composite signature.
@@ -173,7 +183,8 @@ weights. C1A candidates must address the same KV producer as their consumers.
 These layer references are not scheduler page IDs or request-global state.
 
 `DeepSeekV41PyptoExecutor` and `V41ModelRunner` follow the shared executor
-lifecycle, with one synchronous collective session for TP4/DP2/EP8 on A5.
+lifecycle, with one synchronous collective session for TP1 and matching
+DP/EP size 4 or 8 on A5.
 The runner does not inherit the generic dense K/V allocator. The scheduler
 owns page reservations; the adapter owns device pools, compilation, uploads
 and completion. Physical device IDs are independent of logical ranks.
@@ -199,13 +210,13 @@ completion across every participating rank before host code reuses storage.
 The runner carries opaque `LayerState` between layers. Both replicated and
 TP-local-token residual layouts are supported when all callbacks agree; it
 does not insert an unconditional residual AllGather. Every collective must
-include the two DP partitions even when one has no active requests. The
-adapter lowers logical positions, active tokens and page IDs into the exact
+include every configured DP partition even when some have no active requests.
+The adapter lowers logical positions, active tokens and page IDs into the exact
 lib ABI, including padding and communication-window lifetimes.
 
 `cache_groups` must describe the same concrete layouts and capacities to the
-scheduler and allocator, with two DP partitions. Full-history page tables are
-supported by the framework. Rolling page reuse requires a verified lowering
+scheduler and allocator, with one partition per DP rank. Full-history page
+tables are supported by the framework. Rolling page reuse requires a verified lowering
 contract and is explicitly rejected for now. Cache payloads must not use a
 generic dense K/V substitute. The adapter must bound physical page IDs against
 actual allocated pools when a group leaves `num_blocks` unspecified.
@@ -214,31 +225,26 @@ For the complete 40-layer model, the runner checks three distinct full-history
 scheduler groups before calling `allocate`: a 128-source-token window group
 covering every layer, a ratio-2 C2A group for KV producers 2/8/14 with 256
 source tokens per 128-row physical page, and a ratio-1 C1A group for producer
-20 with 128 source tokens per physical page. Each group uses two private DP
+20 with 128 source tokens per physical page. Each group uses 4 or 8 private DP
 partitions and must cover `max_seq_len` in both its per-request limit and any
 declared physical `num_blocks`. Group names are resolved from producer layer
 IDs rather than hardcoded. Physical allocation, index-key alignment and
 reset/completion remain adapter responsibilities; this host check does not
 prove device cache reuse.
 
-At inspected upstream lib revision `fbe92bfc`, serving dispatches the existing
-sequence-parallel Attention and packed-FP4 MoE composites through
-`SwaSegment`/`PrefillSegment`. This does not depend on the older full-layer
-prefill fixture. Initial residual/pre-mix, private request metadata and
-producer-owned compressed caches have bounded integration evidence, but this
-does not establish M0 numerical acceptance.
+The production binding compiles `l3_prefill_fwd` and `l3_decode_fwd`, with
+separate C2A and C1A metadata. DSpark reuses that complete target decode
+program and follows lib's `prefill_bootstrap_dspark` / `decode_fwd_dspark`
+stage order. Each verification uses up to six target rows per request and
+publishes five drafts for the next call. Serving binds weights, state,
+private draft cache pages and output buffers; lib owns target acceptance,
+drafter execution, Markov sampling and device state publication.
 
-At the tested lib revision `25c2693`, serving dispatches each layer through
-`decode_layer`, which composes Attention and MoE with family-specific metadata.
-The complete `decode_fwd` entry cannot receive independent C2A and C1A cache
-metadata for the same request, so production does not call it. The lib
-`final_output.py` composite consumes the final residual/pre-mix and produces
-logits. The production binding allocates resident weights and caches, owns
-request reset, and registers these composites. A5 short real-checkpoint
-generation passed in this configuration; the selected lib revision is not the
-official main pin and the full M0 request has not passed. The bounded two-layer
-SWA reference also still fails the provisional accumulated pre-mix gate in
-3/256 elements (`rtol=0.01`, `atol=0.001`).
+Draft pages belong to stable request slots rather than target physical page
+IDs. Persistent drafter programs receive increasing attention/MoE epochs at
+actual dispatch, including bootstrap. CPU regressions cover the production
+payload builder, selected lib signatures, resident expert axes and epoch
+progression. Full-model real-checkpoint device validation remains pending.
 
 ## Request state and serving lifecycle
 
@@ -252,8 +258,9 @@ capacity; no batch row is used as a persistent state address.
 Packed prefill metadata carries both the end of the current chunk (`seq_lens`)
 and the original full prompt length (`prompt_lens`). A subsequent chunk must
 start at the committed position. Decode requires completed prefill and consumes
-exactly one supplied token per request. Lengths are committed only after all
-layers and output finish. Failed execution waits, resets affected requests and
+one supplied anchor per request; K=5 adds the five retained drafts for target
+verification and returns the accepted token list to the scheduler. Lengths are
+committed only after all layers and output finish. Failed execution waits, resets affected requests and
 releases their ownership; failed completion/reset poisons the session instead
 of reusing uncertain state. This does not attempt to roll back in-place device
 updates to an earlier token position.
@@ -264,10 +271,20 @@ adapter cannot overwrite them while the worker samples. Prefix caching and
 asynchronous scheduling are disabled: restoring a prefix also needs matching
 compressor state, and concurrent dispatch needs separate mutable state tickets.
 
-The CLI requires A5, eight distinct device IDs, TP4/DP2/EP8 and 128-row pages.
+The CLI requires A5, TP1, matching DP/EP size 4 or 8, the same number of
+distinct device IDs, and 128-row pages.
 The shared engine sees one overlapped EP worker; internal TP/DP placement lives
-in the rank plan and the two cache partitions. A3 execution, Engram, MTP and
-vision are outside this framework's current execution contract.
+in the rank plan and the corresponding cache partitions. Target-only execution
+is the default. Enable K=5 with
+`--speculative-config '{"method":"dspark","num_speculative_tokens":5}'`.
+This is the V4.1 native FP8/FP4 path; the V4 W8A8 K=7 deployment uses a separate
+executor and contract. A3 execution and vision remain outside this contract.
+
+The current production prefill capacity is 80 tokens per dispatch. K=5
+disables chunked prefill admission, and bootstrap currently requires a
+single-request prefill batch. Packed multi-request bootstrap and continuation
+near the context limit need further host integration; the current lowering
+requires five retained drafts.
 
 ## Validation boundary
 
