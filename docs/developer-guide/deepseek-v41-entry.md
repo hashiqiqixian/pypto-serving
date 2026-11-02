@@ -102,13 +102,13 @@ prefill and decode. Request cleanup waits for resident work before releasing
 host history; DSpark request state is released through its own owner.
 
 The target backbone uses 384 routed experts and Top-6 routing. The three
-DSpark MTP layers use 128 routed experts and Top-3 routing at lib `24f2b2a1`;
+DSpark MTP layers use 128 routed experts and Top-3 routing;
 the drafter expert count comes from `text_config.dspark_n_routed_experts` when
 present, independently of the backbone count. Routed draft payloads retain
-`[EP, 3, local_experts, packed_rows, 128]`; their scale matrices concatenate
-local experts along the K-group axis. The main projection is converted to
-BF16 `[3D, D]`, and Markov sampling uses `mtp.2.norm.weight` with the shared
-target LM head.
+`[EP, 3, local_experts, packed_rows, 128]`; their scale matrices combine
+local experts along the logical K-group axis before MX_B_NN packing. The
+main projection is converted to BF16 `[3D, D]`, and Markov sampling uses
+`mtp.2.norm.weight` with the shared target LM head.
 
 For repeated full-model starts, V4.1 can use a V4-style prepacked sidecar
 prepared by separate deployment tooling. Set
