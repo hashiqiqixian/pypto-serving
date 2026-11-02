@@ -136,4 +136,3 @@ def test_runner_finishes_or_aborts_speculative_ownership_transaction(fail):
         assert ledger.owners["a"].length == 129
         assert ledger.owners["a"].pages["window"] == (0, 1)
     assert ledger.pending is None
-
