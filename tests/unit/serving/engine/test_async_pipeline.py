@@ -271,11 +271,16 @@ def test_rejected_request_does_not_leave_an_engine_context():
     ("PyptoQwen14BExecutor", 0, 2),
     ("PyptoDeepSeekV4Executor", 1, 0),
     ("PyptoDeepSeekV4DSparkExecutor", 7, 2),
+    ("PyptoDeepSeekV41Executor", 0, 2),
+    ("PyptoDeepSeekV41Executor", 5, 0),
 ])
 def test_min_tokens_reaches_worker_registration(executor_cls, speculative_tokens, expected_min_tokens):
     core, dispatched = _async_pipeline_core(num_speculative_tokens=speculative_tokens)
     core.config.executor_cls = executor_cls
     core.tokenizer.eos_token_id = 9
+    assert core.config.sampling_capabilities().honor_min_tokens is (expected_min_tokens > 0)
+    assert core.config.resolve_min_tokens(2) == expected_min_tokens
+    assert core.config.resolve_min_tokens(0) == 0
 
     class Queued(Exception):
         pass
