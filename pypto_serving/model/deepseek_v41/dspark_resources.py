@@ -73,8 +73,7 @@ _ROPE_TABLE_KEYS = frozenset({"draft_cos", "draft_sin"})
 _TARGET_DYNAMIC_KEYS = frozenset({
     "embedding_weight", "x_hc", "pre_mix", "dspark_target_hidden", "position_ids",
     "token_to_req_indices", "window_slots", "window_indices", "c2a_compressed_slots",
-    "c1a_compressed_slots", "query_start_loc", "logit_row_indices", "logits", "sampled_ids",
-    "attention_num_tokens", "moe_num_tokens",
+    "c1a_compressed_slots", "query_start_loc",
 })
 _DRAFT_DYNAMIC_KEYS = frozenset({
     "target_hidden", "num_sampled", "last_sampled", "next_prefill_tokens", "anchor_ids",
@@ -158,6 +157,9 @@ class DSparkResourceLayout:
             "c2a_slots": (world, DSPARK_PADDED_ROWS),
             "c1a_slots": (world, DSPARK_PADDED_ROWS),
             "query_starts": (world, batch + 1),
+            "state_block_table": (world, batch, 1),
+            "attention_num_tokens": (world,),
+            "moe_num_tokens": (world,),
             "logit_row_indices": (world, DSPARK_PREFILL_SAMPLE_ROWS),
             "target_hidden_padded": (world, DSPARK_PADDED_ROWS, self.main_hidden_size),
             "target_hidden": (world, DSPARK_TARGET_ROWS, self.main_hidden_size),
@@ -193,7 +195,8 @@ class DSparkResourceLayout:
             "window_indices", "query_starts", "logit_row_indices", "accepted_ids", "accepted_counts",
             "context_valid", "context_positions", "num_sampled", "first_query_positions",
             "draft_ids", "committed", "target_sampled_ids", "chunk_0", "chunk_1",
-            "chunk_2", "chunk_3", "chunk_4",
+            "chunk_2", "chunk_3", "chunk_4", "state_block_table",
+            "attention_num_tokens", "moe_num_tokens",
         )}
         result.update({name: torch.int64 for name in (
             "input_ids", "window_slots", "c2a_slots", "c1a_slots", "context_slots",

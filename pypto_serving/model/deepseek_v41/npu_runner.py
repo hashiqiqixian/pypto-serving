@@ -1506,6 +1506,8 @@ class V41ModelRunner:
             self.ledger = RequestLedger(max_requests=self.runtime.max_batch_size,
                                         max_seq_len=self.runtime.max_seq_len,
                                         partitions=self.plan.placement.dp_size)
+        if getattr(self.resources, "dspark", None) is not None:
+            self.resources.ledger = self.ledger
         return self.ledger
 
     def _reset_request(self, key, owner):
@@ -3121,7 +3123,7 @@ class ResidentDSparkCache:
         from .dspark_resources import DSPARK_DRAFT_LAYERS, DSPARK_WINDOW
 
         self.worker = worker
-        blocks = (max_seq_len + DSPARK_WINDOW - 1) // DSPARK_WINDOW
+        blocks = DSPARK_MAX_BATCH_PER_DP * ((max_seq_len + DSPARK_WINDOW - 1) // DSPARK_WINDOW)
         self.window_cache = alloc_device_buffer(
             worker, (world, DSPARK_DRAFT_LAYERS, blocks, DSPARK_WINDOW, 1, 512),
             torch.float8_e4m3fn, stacked=True)
@@ -3305,6 +3307,7 @@ class V41ResidentResources:
         self.dspark_embedding = None
         self.dspark_cache = None
         self.dspark_buffers = None
+        self.ledger = None
         self._dspark_generations = {}
         self._owned = []
         self._step = None
@@ -3400,110 +3403,19 @@ class V41ResidentResources:
         """Return the generation currently reserved for one local state slot."""
         return self._dspark_generations.get((rank, slot), 1)
 
-    @staticmethod
-    def _dspark_group_pages(batch, row, group):
-        tables = getattr(batch, "block_ids_by_group", ())
-        if row < len(tables) and isinstance(tables[row], Mapping):
-            pages = tables[row].get(group)
-            if pages is not None:
-                return tuple(int(page) for page in pages)
-        blocks = getattr(batch, "block_ids", ())
-        if group == "window" and row < len(blocks):
-            return tuple(int(page) for page in blocks[row])
-        return ()
+    def _build_dspark_target_model(self, resources):
+        from .dspark_resources import _TARGET_DYNAMIC_KEYS
 
-    def _stage_dspark_tables(self, batch):
-        host = self.dspark_host_resources
-        if host is None or self.dspark_buffers is None:
-            raise MissingCompositeInterface("V4.1 DSpark host/device resources are not initialized")
-        tables = host.cache_tables
-        for value in tables.values():
-            value.fill_(-1)
-        request_ids = tuple(getattr(batch, "request_ids", ()))
-        partitions = tuple(getattr(batch, "cache_partitions", ()))
-        next_rows = {}
-        for row, partition_value in enumerate(partitions):
-            rank = 0 if partition_value is None else int(partition_value)
-            local_row = next_rows.get(rank, 0)
-            next_rows[rank] = local_row + 1
-            if not 0 <= rank < host.layout.dp_size or local_row >= DSPARK_MAX_BATCH_PER_DP:
-                raise ValueError("DSpark batch row exceeds the selected DP topology")
-            for group, name in (("window", "target_window"), ("c2a", "target_c2a"),
-                                ("c1a", "target_c1a")):
-                pages = self._dspark_group_pages(batch, row, group)
-                target = tables[name]
-                if len(pages) > target.shape[-1]:
-                    raise ValueError(f"DSpark {group} page table exceeds its capacity")
-                if pages:
-                    target[rank, local_row, :len(pages)] = torch.tensor(
-                        pages, dtype=target.dtype)
-                if group == "window":
-                    tables["draft"][rank, :, local_row, :len(pages)] = target[rank, local_row, :len(pages)]
-        self.dspark_buffers.sync_cache_tables()
-        return request_ids
-
-    def _build_dspark_target_model(self):
         if self._decode_fwd is None:
             self._activate_decode()
-        dynamic = {
-            "x_hc", "pre_mix", "dspark_target_hidden", "position_ids", "token_to_req_indices",
-            "window_slots", "window_indices", "c2a_compressed_slots", "c1a_compressed_slots",
-            "query_start_loc", "logit_row_indices", "attention_num_tokens", "moe_num_tokens",
-        }
         target = {name: value for name, value in self._decode_fwd.arguments.items()
-                  if name not in dynamic}
+                  if name not in _TARGET_DYNAMIC_KEYS}
         target["embedding_weight"] = self.dspark_embedding.tensor
-        target["logit_row_indices"] = self.dspark_buffers.decode_workspace["logit_row_indices"]
+        for name in ("logit_row_indices", "attention_num_tokens", "moe_num_tokens", "state_block_table"):
+            target[name] = resources.decode_workspace[name]
+        target["c2a_index_block_table"] = resources.cache_tables["target_c2a"]
+        target["c1a_index_block_table"] = resources.cache_tables["target_c1a"]
         return target
-
-    def build_dspark_payload(self, *, model, batch, phase, resources, **extra):
-        """Build real device mappings for the lib-owned DSpark orchestrator."""
-        if resources is not self.dspark_host_resources:
-            raise ValueError("DSpark payload resources do not belong to this resident worker")
-        if self.dspark_buffers is None or self.dspark_weights is None or self.dspark_embedding is None:
-            raise MissingCompositeInterface("V4.1 DSpark deferred weights and buffers are unavailable")
-        request_ids = tuple(extra.get("request_ids", getattr(batch, "request_ids", ())))
-        self._stage_dspark_tables(batch)
-        self.dspark_buffers.sync_state()
-        draft = {name: self.dspark_weights.full(name) for name in self.dspark_weights.tensors}
-        draft.update({
-            "embedding_weight": self.dspark_embedding.tensor,
-            "window_cache": self.dspark_cache.window_cache,
-            "window_cache_scale": self.dspark_cache.window_cache_scale,
-        })
-        markov = {
-            "final_norm_weight": self.final.norm_weight,
-            "lm_head_weight": self.final.head_weight,
-            **{name: self.dspark_weights.full(name) for name in (
-                "markov_w1", "markov_w2", "confidence_weight")},
-        }
-        workspace = (self.dspark_buffers.prefill_workspace if phase == "prefill"
-                     else self.dspark_buffers.decode_workspace)
-        target = {} if phase == "prefill" else self._build_dspark_target_model()
-        outputs = {
-            "accepted_counts": workspace.get("accepted_counts"),
-            "accepted_ids": workspace.get("accepted_ids"),
-            "last_sampled": workspace.get("last_sampled"),
-            "draft_ids": workspace.get("draft_ids"),
-        }
-        from .dspark_runtime import DSparkLoweredInputs
-        return DSparkLoweredInputs(
-            state=self.dspark_buffers.state,
-            workspace=workspace,
-            target_model=target,
-            draft_model=draft,
-            markov_model=markov,
-            cache_tables=self.dspark_buffers.cache_tables,
-            rope_tables=self.dspark_buffers.rope_tables,
-            attention_epoch=getattr(self, "_dspark_attention_epoch", 1),
-            moe_epoch=getattr(self, "_dspark_moe_epoch", 1),
-            logits_epoch=getattr(self, "_dspark_logits_epoch", 1),
-            outputs=outputs,
-            request_ranks=tuple(
-                0 if value is None else int(value)
-                for value in getattr(batch, "cache_partitions", ())
-            ) or None,
-        )
 
     def _resolve_dspark_state(self, request_id):
         """Resolve the stable scheduler slot before/after bootstrap."""
@@ -3515,7 +3427,7 @@ class V41ResidentResources:
                 f"V4.1 DSpark request {request_id!r} has no scheduler state"
             )
         owner = self.ledger.owners[request_id]
-        generation = self._dspark_generations.setdefault(request_id, 1)
+        generation = self._dspark_generations.setdefault((owner.partition, owner.slot), 1)
         return owner.slot, generation
 
     @staticmethod
@@ -3532,10 +3444,11 @@ class V41ResidentResources:
             raise MissingCompositeInterface(
                 "V4.1 DSpark requires scheduler block_ids_by_group for all cache families"
             )
-        window_name = self.cache_groups.window
-        c2a_name = self.cache_groups.c2a
-        c1a_name = self.cache_groups.c1a
+        families = self.cache.plan.family_groups
+        window_name, c2a_name, c1a_name = families.window, families.c2a, families.c1a
         for index, (rank, row) in enumerate(zip(request_ranks, request_rows, strict=True)):
+            if not 0 <= rank < resources.layout.dp_size or not 0 <= row < DSPARK_MAX_BATCH_PER_DP:
+                raise ValueError("DSpark batch row exceeds the selected DP topology")
             groups = batch.block_ids_by_group[index]
             for name, target in ((window_name, tables["target_window"]),
                                  (c1a_name, tables["target_c1a"])):
@@ -3552,8 +3465,14 @@ class V41ResidentResources:
                 raise ValueError("DSpark C2A page table exceeds its ABI capacity")
             tables["target_c2a"][rank, row, :len(pages)] = torch.tensor(pages, dtype=torch.int32)
             draft = tables["draft"]
-            draft[rank, :, row, :len(groups[window_name])] = torch.tensor(
-                groups[window_name], dtype=torch.int32)
+            slot, _generation = self._resolve_dspark_state(batch.request_ids[index])
+            if not 0 <= slot < DSPARK_MAX_BATCH_PER_DP:
+                raise ValueError("DSpark draft cache slot exceeds its capacity")
+            # Target page IDs belong to another allocation. Draft pages follow
+            # the stable state slot, even when the request's batch row changes.
+            pages_per_slot = draft.shape[-1]
+            draft[rank, :, row] = torch.arange(
+                slot * pages_per_slot, (slot + 1) * pages_per_slot, dtype=torch.int32)
 
     def _stage_dspark_decode(self, resources, batch):
         request_ids = tuple(batch.request_ids)
@@ -3573,13 +3492,20 @@ class V41ResidentResources:
         workspace["input_ids"].zero_()
         workspace["target_positions"].fill_(-1)
         workspace["active_widths"].zero_()
+        workspace["logit_row_indices"].fill_(-1)
+        workspace["state_block_table"].fill_(-1)
         tokens = self._host_tensor(batch.token_ids).reshape(-1).tolist()
-        positions = self._host_tensor(batch.seq_lens).reshape(-1).tolist()
+        # DecodeBatch.seq_lens includes the sampled anchor token, as in
+        # decode_requests; Engram resumes at the preceding committed length.
+        positions = [int(end) - 1 for end in self._host_tensor(batch.seq_lens).reshape(-1).tolist()]
         if len(tokens) != len(request_ids) or len(positions) != len(request_ids):
             raise ValueError("DSpark decode token and position rows must match requests")
         state = resources.state
+        engram_requests = []
         for index, (request_id, rank, row) in enumerate(
                 zip(request_ids, partitions, request_rows, strict=True)):
+            if not 0 <= rank < resources.layout.dp_size or row >= DSPARK_MAX_BATCH_PER_DP:
+                raise ValueError("DSpark batch row exceeds the selected DP topology")
             request_state = self.dspark.states.get(request_id)
             if len(request_state.draft_ids) != 5:
                 raise MissingCompositeInterface(
@@ -3595,7 +3521,20 @@ class V41ResidentResources:
                 dtype=torch.int32)
             workspace["active_widths"][rank, row] = DSPARK_ROWS_PER_REQUEST
             workspace["zero_prefill_tokens"][rank, row] = 0
+            workspace["state_block_table"][rank, row, 0] = slot
+            workspace["logit_row_indices"][rank, row] = (row + 1) * DSPARK_ROWS_PER_REQUEST - 1
+            workspace["attention_num_tokens"][rank] = (row + 1) * DSPARK_ROWS_PER_REQUEST
+            workspace["moe_num_tokens"][rank] = (row + 1) * DSPARK_ROWS_PER_REQUEST
+            engram_requests.append(RequestSlice(
+                request_id, rank, slot, int(positions[index]),
+                (int(tokens[index]), *request_state.draft_ids), request_state.prompt_length,
+                batch.block_ids_by_group[index],
+            ))
         self._stage_dspark_tables(resources, batch, partitions, request_rows)
+        if self.engram_host is not None:
+            self.engram_host.stage_lookup(
+                self.decode_host.fields["engram_lookup"],
+                ForwardStep("decode", tuple(engram_requests), 0), self.decode_host.topology)
         return tuple(partitions), tuple(request_rows)
 
     def _stage_dspark_prefill(self, resources, batch, request_ids, sampled_token_ids):
@@ -3609,12 +3548,15 @@ class V41ResidentResources:
         for value in workspace.values():
             if isinstance(value, torch.Tensor):
                 value.zero_()
+        workspace["sampled_rows"].fill_(-1)
+        workspace["prefill_positions"].fill_(-1)
+        workspace["prefill_request_ids"].fill_(-1)
         prompt_length = int(batch.prompt_lens[0])
         if not 0 < prompt_length <= resources.layout.max_prefill_tokens:
             raise ValueError("DSpark prefill prompt exceeds the configured ABI capacity")
         workspace["prompt_lengths"][rank, 0] = prompt_length
         workspace["position_limits"][rank, 0] = resources.layout.max_seq_len
-        workspace["sampled_rows"][rank, 0] = prompt_length - 1
+        workspace["sampled_rows"][rank, 0] = 0
         workspace["next_prefill_tokens"][rank, 0] = int(sampled_token_ids[0])
         workspace["prefill_counts"][rank, 0] = prompt_length
         workspace["first_query_positions"][rank, 0] = prompt_length
@@ -3636,8 +3578,10 @@ class V41ResidentResources:
         return request_id, slot, generation
 
     def _dspark_payload(self, *, model, batch, phase, resources, **extra):
-        from .dspark_resources import _DRAFT_MODEL_KEYS, _MARKOV_MODEL_KEYS, _TARGET_DYNAMIC_KEYS
+        from .dspark_resources import _DRAFT_MODEL_KEYS, _MARKOV_MODEL_KEYS
 
+        if resources is not self.dspark_host_resources:
+            raise ValueError("DSpark payload resources do not belong to this resident worker")
         if self.dspark_weights is None or self.dspark_embedding is None or self.dspark_cache is None:
             raise MissingCompositeInterface("resident DSpark weights/cache are not initialized")
         draft = {name: self.dspark_weights.full(name) for name in _DRAFT_MODEL_KEYS
@@ -3650,14 +3594,12 @@ class V41ResidentResources:
                   if name in heads.tensors}
         markov["final_norm_weight"] = self.final.norm_weight
         markov["lm_head_weight"] = self.final.head_weight
-        target = {}
-        if self._decode_fwd is not None:
-            target.update({name: value for name, value in self._decode_fwd.arguments.items()
-                           if name not in _TARGET_DYNAMIC_KEYS})
-        target["embedding_weight"] = self.dspark_embedding.tensor
         if phase == "decode":
             ranks, rows = self._stage_dspark_decode(resources, batch)
             workspace = resources.decode_workspace
+            target = self._build_dspark_target_model(resources)
+            target["logits"].zero_()
+            target["sampled_ids"].fill_(-1)
             outputs = {name: workspace[name] for name in (
                 "accepted_counts", "accepted_ids", "last_sampled", "draft_ids", "confidences")}
             outputs["request_rows"] = rows
@@ -4090,6 +4032,19 @@ class V41ResidentResources:
         self.cache.reset_request(owner)
         if self.dspark is not None:
             self.dspark.release((key,))
+            if getattr(self, "dspark_host_resources", None) is not None:
+                rank, slot = owner.partition, owner.slot
+                generation = self.dspark_state_generation(rank, slot) + 1
+                self._dspark_generations[rank, slot] = generation
+                self.dspark_buffers.reset_slot(rank, slot, generation)
+                host = self.dspark_host_resources
+                released = host.state.slot_ids[rank] == slot
+                host.state.slot_ids[rank, released] = -1
+                host.state.generations[rank, released] = 0
+                host.cache_tables["draft"][rank, :, released] = -1
+                # Slot-owned pages can be reused after this synchronous reset:
+                # bootstrap overwrites the visible prefix before publishing
+                # the new generation, so stale KV rows remain unreachable.
 
     def release_request(self, request_id):
         if self.engram_host is not None:
