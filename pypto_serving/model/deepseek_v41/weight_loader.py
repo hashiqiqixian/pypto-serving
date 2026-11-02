@@ -18,15 +18,13 @@ import logging
 import math
 import os
 import re
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from threading import Condition
-import sys
-from dataclasses import asdict, dataclass
-from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -797,28 +795,6 @@ class DecodeWeightSlice:
     value: torch.Tensor
 
 
-class RowAddressedCheckpoint:
-    """Read only selected rows from the large Engram embedding tables."""
-
-    def __init__(self, store):
-        self.store = store
-
-    def tensor_rows(self, name, rows):
-        rows = torch.as_tensor(rows, dtype=torch.int64)
-        if rows.ndim < 1:
-            raise ValueError("Engram row indices must have at least one dimension")
-        reader_path = self.store.path_for(name)
-        values = []
-        with self.store._safe_open_fn(reader_path, self.store.device) as reader:
-            source = reader.get_slice(name)
-            shape = tuple(source.get_shape())
-            if len(shape) != 2 or bool((rows < 0).any()) or bool((rows >= shape[0]).any()):
-                raise ValueError(f"Engram row indices are outside {name}")
-            for row in rows.reshape(-1).tolist():
-                values.append(source[int(row)])
-        return torch.stack(values).reshape(*rows.shape, shape[1])
-
-
 def bind_decode_layer_weights(layer, attention, moe, *, kv_sources, index_sources, c2a_sources):
     """Map one loaded layer to the lib's layer/source axes without copying data."""
     if not attention or not moe or "mxfp4_pair_lut" not in moe:
@@ -861,7 +837,7 @@ def bind_decode_layer_weights(layer, attention, moe, *, kv_sources, index_source
 
 
 def iter_decode_weight_slices(model_dir, topology, *, max_bundle_bytes=32 << 30,
-                              parallel_experts=False, bank=None, include_engram=True):
+                              parallel_experts=False, bank=None):
     """Yield one layer at a time in checkpoint order for bounded staging."""
     raw = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
     layers = plan_layers(raw)
@@ -874,13 +850,9 @@ def iter_decode_weight_slices(model_dir, topology, *, max_bundle_bytes=32 << 30,
     c2a_sources = tuple(layer.layer_id for layer in layers if layer.mode == "c2a_full")
     if len(kv_sources) != 4 or len(index_sources) != 8 or len(c2a_sources) != 3:
         raise ValueError("lib decode_fwd source axes disagree with the checkpoint schedule")
-    # Engram WKV is a large native-FP8 projection.  Its conservative conversion
-    # estimate is about 1.89 GiB per rank for the V4.1 checkpoint, while reads
-    # remain rank- and layer-serial here.  Keep the smaller budget for all other
-    # loader entry points, but allow this bounded staging path to complete.
     loaders = tuple(V41WeightLoader(
         model_dir, tp_size=topology.tp, tp_rank=rank % topology.tp,
-        ep_size=topology.world, ep_rank=rank, max_load_bytes=2 << 30,
+        ep_size=topology.world, ep_rank=rank, max_load_bytes=512 << 20,
     ) for rank in range(topology.world))
     for layer in layers:
         attention, moe = load_prefill_layer_weights(
@@ -894,25 +866,6 @@ def iter_decode_weight_slices(model_dir, topology, *, max_bundle_bytes=32 << 30,
         if layer.layer_id == 0 and bank is not None:
             bank.preallocate(slices)
         yield from slices
-    # Engram projections are replicated on every EP rank.  The embedding
-    # tables are intentionally not loaded here; lookup rows are request data.
-    engram_layers = tuple(text.get("engram_layer_ids", ())) if include_engram else ()
-    for slot, layer_id in enumerate(engram_layers):
-        wkv = []
-        scales = []
-        for loader in loaders:
-            bundle = loader.load(f"layers.{layer_id}.engram.wkv.weight")
-            if bundle.scale is None:
-                raise ValueError("Engram WKV requires native FP8 payload and scale")
-            wkv.append(bundle.weight)
-            scales.append(bundle.scale)
-        q = loaders[0].load(f"layers.{layer_id}.engram.q_weight").weight.float()
-        k = loaders[0].load(f"layers.{layer_id}.engram.k_weight").weight.float()
-        gate = (q * k).contiguous()
-        yield DecodeWeightSlice("engram_wkv", slot, stack_bytes(wkv))
-        yield DecodeWeightSlice("engram_wkv_scale", slot, stack_bytes(scales))
-        yield DecodeWeightSlice("engram_weight", slot,
-                                gate.unsqueeze(0).expand(topology.world, -1, -1).contiguous())
     # decode_fwd reserves one key/norm slot per index source, although only KV
     # producers have these checkpoint tensors. The trailing four slots are not
     # read by the current graph; initialize them deterministically nonetheless.
@@ -941,10 +894,9 @@ _FLAT_KV = frozenset({"compressor_norm_weight"})
 _FLAT_INDEX = frozenset({"index_wk", "index_norm_weight", "index_wq_b_scale"})
 _AXIS_INDEX = frozenset({"index_wq_b", "index_weights_proj"})
 _AXIS_C2A = frozenset({"c2a_compressor_wkv", "c2a_compressor_wgate"})
-_AXIS_ENGRAM = frozenset({"engram_wkv", "engram_wkv_scale", "engram_weight"})
 _SINGLE = frozenset({"c1a_compressor_wkv", "mxfp4_pair_lut"})
 _ALL = (_FLAT_LAYER | _AXIS_LAYER | _FLAT_KV | _FLAT_INDEX |
-        _AXIS_INDEX | _AXIS_C2A | _AXIS_ENGRAM | _SINGLE)
+        _AXIS_INDEX | _AXIS_C2A | _SINGLE)
 _LAYER_ABI_ALIASES = {
     "c2a_compressor_wkv": "compressor_wkv",
     "c2a_compressor_wgate": "compressor_wgate",
@@ -981,23 +933,16 @@ class DecodeWeightLayout:
     c2a_sources: int
     world: int = 8
     tp_size: int = 1
-    engram_layers: int = 0
 
     @classmethod
-    def from_lib(cls, abi):
-        engram_layers = getattr(abi, "ENGRAM_LAYER_COUNT", None)
-        if engram_layers is None:
-            engram_layers = getattr(abi, "ENGRAM_LAYERS", None)
-        if engram_layers is None:
-            # Current V4.1 ABI exposes ENGRAM_K and reserves two model layers;
-            # an ABI without ENGRAM_K has no Engram weight axis.
-            engram_layers = 2 if getattr(abi, "ENGRAM_K", None) is not None else 0
+    def from_lib(cls, abi, *, tp_size=None):
         # V4.1 decode_fwd is TP1 by contract and intentionally does not
         # export TP_SIZE. Keep the loader compatible with that ABI while
         # honoring an explicit value from future lib revisions.
-        tp_size = int(getattr(abi, "TP_SIZE", 1))
+        if tp_size is None:
+            tp_size = int(getattr(abi, "TP_SIZE", 1))
         return cls(abi.N_LAYERS, abi.KV_SOURCE_COUNT, abi.INDEX_SOURCE_COUNT,
-                   abi.C2A_SOURCE_COUNT, abi.EP_SIZE, tp_size, engram_layers)
+                   abi.C2A_SOURCE_COUNT, abi.EP_SIZE, tp_size)
 
     def __post_init__(self):
         if any(type(n) is not int or n <= 0 for n in (
@@ -1007,8 +952,6 @@ class DecodeWeightLayout:
             raise ValueError("decode weight dimensions must be positive integers")
         if self.world % self.tp_size:
             raise ValueError("decode weight world size must be divisible by TP size")
-        if type(self.engram_layers) is not int or self.engram_layers < 0:
-            raise ValueError("decode Engram layer count must be a nonnegative integer")
 
     def slots(self, name):
         if name in _FLAT_LAYER | _AXIS_LAYER:
@@ -1019,8 +962,6 @@ class DecodeWeightLayout:
             return self.index_sources
         if name in _AXIS_C2A:
             return self.c2a_sources
-        if name in _AXIS_ENGRAM:
-            return self.engram_layers
         if name in _SINGLE:
             return 1
         raise ValueError(f"unknown decode weight ABI field: {name}")
@@ -1137,10 +1078,8 @@ class DecodeWeightBank:
     @staticmethod
     def validate_abi(parameter_names):
         names = set(parameter_names)
-        engram_enabled = bool(names & _AXIS_ENGRAM)
-        expected = _ALL if engram_enabled else _ALL - _AXIS_ENGRAM
         absent = {name for name in _ALL
-                  if name in expected and name not in names and _LAYER_ABI_ALIASES.get(name) not in names}
+                  if name not in names and _LAYER_ABI_ALIASES.get(name) not in names}
         if absent:
             raise ValueError("lib decode ABI omits checkpoint weight fields: " + ", ".join(sorted(absent)))
 

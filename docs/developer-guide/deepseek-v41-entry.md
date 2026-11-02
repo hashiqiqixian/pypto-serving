@@ -92,6 +92,12 @@ layouts again when lib changes. Current FP4 tiles require K/N multiples of 256;
 native FP8 matrices require K divisible by 64 and N by 32. Unsupported geometry
 is rejected. Torch/safetensors must support the checkpoint E8M0 dtype.
 
+Engram uses serving's official `HostEngram` adapter for request history and
+row-addressed lookup. Its projection weights are uploaded once through
+`ResidentEngramWeights`, outside the backbone weight bank, and shared by
+prefill and decode. Request cleanup waits for resident work before releasing
+host history; DSpark request state is released through its own owner.
+
 For repeated full-model starts, V4.1 can use a V4-style prepacked sidecar
 prepared by separate deployment tooling. Set
 `PYPTO_V41_PREPACKED_WEIGHTS=/path/to/v41-decode.safetensors` for serving.

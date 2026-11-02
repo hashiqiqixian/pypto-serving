@@ -72,7 +72,8 @@ def test_selected_lib_full_decode_abi_is_fully_bound():
     }
     assert parameters == _ALL | metadata | caches | {
         "x_hc", "pre_mix", "attention_num_tokens", "final_norm_weight",
-        "lm_head_weight", "logit_row_indices", "logits", "sampled_ids"}
+        "lm_head_weight", "logit_row_indices", "logits", "sampled_ids",
+        "engram_wkv", "engram_wkv_scale", "engram_weight"}
 
 
 def test_weight_views_alias_one_full_rank_allocation():
@@ -188,7 +189,8 @@ def test_full_prefill_import_uses_serving_capacity_and_complete_abi():
         "final_norm_weight", "lm_head_weight", "x_hc_out", "pre_mix_out",
         "dspark_target_hidden", "logits", "sampled_ids",
     }
-    assert set(names) == _ALL | inputs | caches | outputs
+    engram_weights = {"engram_wkv", "engram_wkv_scale", "engram_weight"}
+    assert set(names) == _ALL | inputs | caches | outputs | engram_weights
     assert not {"bank8", "bank4", "scales8", "offsets"} & set(names)
 
 
@@ -230,6 +232,7 @@ def test_full_forward_reuses_one_weight_bank_between_prefill_and_decode(monkeypa
     resources.prefill_host = object()
     resources.decode_host = SimpleNamespace(topology=object())
     resources.cache = resources.final = object()
+    resources.engram = None
     resources._prefill_fwd = resources._decode_fwd = None
     resources._owned = []
     resources._step = resources._inputs = resources._group_counts = None

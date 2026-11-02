@@ -60,7 +60,6 @@ from .weight_loader import (
     LayerPlan,
     RankPlacement,
     ResidentFullDecodeWeights,
-    RowAddressedCheckpoint,
     V41ExecutionPlan,
     V41WeightLoader,
     iter_decode_weight_slices,
@@ -2483,8 +2482,7 @@ class PrefillMetadataResources:
 
     def __init__(self, topology, *, max_seq_len, max_requests, window_pages,
                  c2a_pages, c1a_pages, rope_tables, compressed_rope_tables,
-                 full_hidden_size=None, engram_width=None, dspark_hidden_size=None,
-                 engram_lookup_fn=None, engram_k=6144):
+                 full_hidden_size=None, dspark_hidden_size=None, engram_k=6144):
         if any(type(value) is not int or value <= 0 for value in
                (max_seq_len, max_requests, window_pages, c2a_pages, c1a_pages)):
             raise ValueError("prefill metadata capacities must be positive integers")
@@ -2502,15 +2500,10 @@ class PrefillMetadataResources:
         self.full_hidden_size = full_hidden_size
         if full_hidden_size is not None and (type(full_hidden_size) is not int or full_hidden_size <= 0):
             raise ValueError("full prefill hidden size must be positive")
-        for value, name in ((engram_width, "engram width"),
-                            (dspark_hidden_size, "DSpark hidden size")):
-            if value is not None and (type(value) is not int or value <= 0):
-                raise ValueError(f"{name} must be positive")
-        self.engram_width = engram_width
+        if dspark_hidden_size is not None and (
+                type(dspark_hidden_size) is not int or dspark_hidden_size <= 0):
+            raise ValueError("DSpark hidden size must be positive")
         self.dspark_hidden_size = dspark_hidden_size
-        if engram_lookup_fn is not None and not callable(engram_lookup_fn):
-            raise TypeError("Engram lookup provider must be callable")
-        self.engram_lookup_fn = engram_lookup_fn
 
         def shared(name, shape, dtype, fill=0):
             value = torch.empty(shape, dtype=dtype).share_memory_()
@@ -2568,10 +2561,6 @@ class PrefillMetadataResources:
             shared("full_token_requests", (world, 2, tokens), torch.int32, -1)
             shared("full_query_starts", (world, 2, max_requests + 1), torch.int32)
             shared("full_logit_rows", (world, 16), torch.int32, -1)
-        if engram_width is not None:
-            # Host rows are populated from the request's Engram history before
-            # dispatch. The table itself remains checkpoint-backed and lazy.
-            shared("engram_lookup", (world, 2, tokens, engram_width), torch.bfloat16)
         if dspark_hidden_size is not None:
             # The target hidden is an output of the complete backbone and is
             # retained for the following DSpark drafter dispatch.
@@ -2630,25 +2619,6 @@ class PrefillMetadataResources:
             else:
                 self.fields["compressed_rope_cos"].copy_(rows[0])
                 self.fields["compressed_rope_sin"].copy_(rows[1])
-        if self.engram_width is not None:
-            lookup = self.fields["engram_lookup"]
-            lookup.zero_()
-            if self.engram_lookup_fn is None:
-                raise MissingCompositeInterface(
-                    "V4.1 Engram-enabled lib requires a request lookup provider")
-            offsets = [0] * self.topology.world
-            for request in step.requests:
-                count = len(request.token_ids)
-                offset = offsets[request.partition]
-                rows = self.engram_lookup_fn(
-                    torch.tensor(request.token_ids, dtype=torch.int64), count,
-                    request.start, request.request_id)
-                if (not isinstance(rows, torch.Tensor) or rows.device.type != "cpu"
-                        or rows.dtype != torch.bfloat16
-                        or tuple(rows.shape) != (2, count, self.engram_width)):
-                    raise ValueError("Engram lookup provider returned an invalid host shape")
-                lookup[request.partition, :, offset:offset + count].copy_(rows)
-                offsets[request.partition] += count
         return swa.group_counts
 
     def stage_full(self, step, embeddings, engram=None):
@@ -4120,8 +4090,6 @@ class V41ResidentResources:
         self.cache.reset_request(owner)
         if self.dspark is not None:
             self.dspark.release((key,))
-        if getattr(self, "engram", None) is not None:
-            self.engram.history.pop(key, None)
 
     def release_request(self, request_id):
         if self.engram_host is not None:
@@ -4131,8 +4099,6 @@ class V41ResidentResources:
         if self.closed:
             return
         self._step = self._inputs = self._group_counts = self._output_rows = None
-        if getattr(self, "engram", None) is not None:
-            self.engram.history.clear()
         try:
             if self._prefill_fwd is not None:
                 self._prefill_fwd.close()
@@ -4234,7 +4200,6 @@ def make_production_bindings(
     max_seq_len,
     *,
     tokenizer=None,
-    engram_lookup_fn=None,
     dp_size=None,
     dspark_lowering_provider=None,
 ):
@@ -4294,28 +4259,8 @@ def make_production_bindings(
             dspark_programs, dspark_param_names = {}, {}
         final, final_names = compile_final_output(compiler, root, topology)
         abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
-        engram = None
-        lookup_fn = engram_lookup_fn
-        if getattr(abi, "ENGRAM_K", None) is not None:
-            if tokenizer is None:
-                raise MissingCompositeInterface(
-                    "V4.1 Engram-enabled lib requires the serving tokenizer")
-            engram_module = importlib.import_module("models.deepseek_v4_1_flash.engram")
-            engram_loader = V41WeightLoader(
-                model_dir, tp_size=topology.tp, tp_rank=0,
-                ep_size=topology.world, ep_rank=0, max_load_bytes=512 << 20,
-            )
-            # Transformers 5.x wraps the Rust tokenizer in a
-            # ``TokenizersBackend`` object.  Engram consumes the underlying
-            # tokenizers.Tokenizer ABI (get_vocab_size/id_to_token/normalizer)
-            # rather than the Transformers compatibility wrapper.
-            tokenizer_impl = getattr(tokenizer, "tokenizer", tokenizer)
-            tokenizer_impl = getattr(tokenizer_impl, "_tokenizer", tokenizer_impl)
-            engram = engram_module.HostEngram(
-                RowAddressedCheckpoint(engram_loader.store), tokenizer_impl)
-            lookup_fn = engram.lookup
         kv_sources, index_sources, c2a_sources = _sources(layers)
-        layout = DecodeWeightLayout.from_lib(abi)
+        layout = DecodeWeightLayout.from_lib(abi, tp_size=topology.tp)
         if (layout.layers, layout.kv_sources, layout.index_sources,
                 layout.c2a_sources, layout.world) != (
                     len(layers), len(kv_sources), len(index_sources), len(c2a_sources), topology.world):
@@ -4346,18 +4291,6 @@ def make_production_bindings(
             finally:
                 if parallel_experts and previous_threads < 8:
                     torch.set_num_threads(previous_threads)
-            for item in iter_decode_weight_slices(
-                model_dir, topology, parallel_experts=parallel_experts, bank=bank,
-                include_engram=layout.slots("engram_wkv") > 0,
-            ):
-                append_started = time.perf_counter()
-                bank.append(item)
-                append_seconds += time.perf_counter() - append_started
-                if item.name == "hc_attn_fn":
-                    now = time.perf_counter()
-                    _LOG.info("V4.1 checkpoint layer %d/%d loaded into shared weight bank (%.2fs)",
-                              item.slot + 1, layout.layers, now - layer_started)
-                    layer_started = now
             bank.finish(decode_names)
             _LOG.info("V4.1 checkpoint staging %.2fs (bank copies %.2fs)",
                       time.perf_counter() - bank_started, append_seconds)
@@ -4390,9 +4323,8 @@ def make_production_bindings(
             c1a_pages=cache_plan.physical_group_blocks[family.c1a],
             rope_tables=swa_tables,
             compressed_rope_tables=compressed_tables,
-            engram_width=getattr(abi, "ENGRAM_K", None),
+            engram_k=getattr(abi, "ENGRAM_K", 6144),
             dspark_hidden_size=getattr(abi, "DSPARK_MAIN_IN", None),
-            engram_lookup_fn=lookup_fn,
         )
         decode_host = PrefillMetadataResources(topology, **host_kwargs)
         input_host = make_input_host_resources(topology, plan.weights.config.hidden_size)
@@ -4402,13 +4334,15 @@ def make_production_bindings(
             topology, **host_kwargs, full_hidden_size=plan.weights.config.hidden_size)
         engram_host = None
         if "engram_lookup" in set(decode_names) | set(prefill_names):
-            from pypto_serving.model.tokenizer import load_tokenizer
+            tokenizer_adapter = tokenizer
+            if tokenizer_adapter is None:
+                from pypto_serving.model.tokenizer import load_tokenizer
 
-            tokenizer_adapter = load_tokenizer(model_dir)
-            tokenizer = getattr(tokenizer_adapter, "tokenizer", tokenizer_adapter)
-            tokenizer = getattr(tokenizer, "_tokenizer", tokenizer)
+                tokenizer_adapter = load_tokenizer(model_dir)
+            tokenizer_impl = getattr(tokenizer_adapter, "tokenizer", tokenizer_adapter)
+            tokenizer_impl = getattr(tokenizer_impl, "_tokenizer", tokenizer_impl)
             engram_host = HostEngramResources(
-                model_dir, topology, tokenizer, capacity=topology.capacity)
+                model_dir, topology, tokenizer_impl, capacity=topology.capacity)
         dspark_host = None
         if runtime.num_speculative_tokens:
             from .dspark_resources import DSparkResourceLayout, allocate_dspark_host_resources
@@ -4440,7 +4374,6 @@ def make_production_bindings(
             dspark_lowering_provider=dspark_lowering_provider,
             dspark_host_resources=dspark_host,
         )
-        resident.engram = engram
         _LOG.info("V4.1 resident upload and allocation %.2fs",
                   time.perf_counter() - resident_started)
         try:
