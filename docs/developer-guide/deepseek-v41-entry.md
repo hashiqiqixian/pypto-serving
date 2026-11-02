@@ -284,7 +284,9 @@ The current production prefill capacity is 80 tokens per dispatch. K=5
 disables chunked prefill admission, and bootstrap currently requires a
 single-request prefill batch. Packed multi-request bootstrap and continuation
 near the context limit need further host integration; the current lowering
-requires five retained drafts.
+requires five retained drafts. K=5 resolves `min_tokens` to zero because the
+target sampler does not accept a stop-token mask. For a fixed-length validation
+run, set `ignore_eos=true` together with the desired `max_new_tokens`.
 
 ## Validation boundary
 
