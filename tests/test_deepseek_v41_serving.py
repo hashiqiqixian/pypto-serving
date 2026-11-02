@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Four-device V4.1 HTTP answer smoke test."""
+"""Four-device V4.1 HTTP answer smoke test, selecting K0 or K5 per process."""
 
 import json
 import os
@@ -67,6 +67,9 @@ def test_v41_dp4_http_answer(tmp_path):
     model_dir = Path(model_path)
     devices = tuple(part.strip() for part in os.environ.get("TASK_DEVICE", "").split(","))
     assert len(devices) == 4 and len(set(devices)) == 4 and all(part.isdecimal() for part in devices)
+    speculative_tokens = os.environ.get("PYPTO_DSV41_SMOKE_SPECULATIVE_TOKENS", "0")
+    if speculative_tokens not in ("0", "5"):
+        pytest.fail("PYPTO_DSV41_SMOKE_SPECULATIVE_TOKENS must be 0 or 5")
 
     from pypto_serving.model.tokenizer import load_tokenizer
 
@@ -82,6 +85,9 @@ def test_v41_dp4_http_answer(tmp_path):
         "--max-num-batched-tokens", "80", "--host", "127.0.0.1", "--port", str(port),
         "--show-startup-logs",
     ]
+    if speculative_tokens == "5":
+        command.extend(("--speculative-config", json.dumps({"method": "dspark", "num_speculative_tokens": 5})))
+    print(f"V41_SMOKE_SPECULATIVE_TOKENS {speculative_tokens}", flush=True)
     log_path = tmp_path / "server.log"
     started = time.monotonic()
     with log_path.open("w", encoding="utf-8") as log:
@@ -116,7 +122,7 @@ def test_v41_dp4_http_answer(tmp_path):
             assert len(result["choices"]) == 1, result
             choice = result["choices"][0]
             answer = choice["message"]["content"]
-            print("ANSWER", json.dumps({"question": question, "answer": answer,
+            print("ANSWER", json.dumps({"speculative_tokens": int(speculative_tokens), "question": question, "answer": answer,
                 "usage": result["usage"], "finish_reason": choice["finish_reason"]}, ensure_ascii=False), flush=True)
             assert choice["finish_reason"] == "stop", result
             assert re.search(r"\b323\b", answer), result

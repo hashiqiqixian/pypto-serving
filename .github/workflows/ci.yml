@@ -192,7 +192,7 @@ jobs:
           build-namespace: pypto-serving-v41-a5
           pip-cache-name: pip-pypto-serving-v41-a5
 
-      - name: Run V4.1 DP4 HTTP answer guard
+      - name: Run V4.1 DP4 K5 HTTP answer guard
         run: |
           source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
           run_cmd="cd $GITHUB_WORKSPACE/dist-checkout"
@@ -200,6 +200,7 @@ jobs:
           run_cmd="$run_cmd && TASK_DEVICE=\$TASK_DEVICE"
           run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout"
           run_cmd="$run_cmd PYPTO_DSV41_MODEL_DIR=$PYPTO_DSV41_MODEL_DIR"
+          run_cmd="$run_cmd PYPTO_DSV41_SMOKE_SPECULATIVE_TOKENS=5"
           run_cmd="$run_cmd python -m pytest tests/test_deepseek_v41_serving.py::test_v41_dp4_http_answer -q -s"
           task-submit --device auto --device-num 4 \
             --timeout 3600 --max-time 3600 --run "$run_cmd"

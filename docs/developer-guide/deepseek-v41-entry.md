@@ -4,9 +4,10 @@ V4.1 integration provides metadata loading, local text tokenization, selective
 CPU weight loading and a serving binding for lib composites. The model loader
 registers metadata without opening checkpoint payloads. The CLI routes V4.1
 through its own executor; the production binding checks that the selected lib
-checkout supplies the required composites before allocating devices. The
-current real-checkpoint DSpark full-model smoke test and M0 acceptance are
-pending; CPU contracts and isolated lib tests do not establish either result.
+checkout supplies the required composites before allocating devices. Real-checkpoint
+A5 validation has exercised K0 and K5 through the serving engine and ASGI chat
+API, including 8K prefill and request recovery. The validation boundary below
+distinguishes these results from independent-reference M0 acceptance.
 
 ```python
 from pypto_serving.model.deepseek_v41.encoding import load_text_config
@@ -43,8 +44,8 @@ and decoding but is not a full-checkpoint tokenizer validation.
 5. Request/cache ownership and chunked prefill, including K=5 target-tap retention (implemented).
 6. Decode continuity and prefill-to-decode transitions (framework implemented).
 7. Rank-owned weights and all backbone layers (dispatch implemented through full prefill/decode composites).
-8. Final HC/norm/head and lib-owned DSpark sampling (dispatch implemented); numerical acceptance remains pending.
-9. Model loader, CLI, scheduler metadata and request release (framework implemented); HTTP/device M0 acceptance remains pending.
+8. Final HC/norm/head and lib-owned DSpark sampling (implemented); independent-reference numerical acceptance remains pending.
+9. Model loader, CLI, scheduler metadata and request release (implemented); real-device lifecycle checks are described below.
 
 Engram uses the shared host implementation described below. Optional K=5
 DSpark initializes three MTP layers and Markov heads from the checkpoint.
@@ -53,8 +54,8 @@ use a reference with the same enabled modules and sampling configuration.
 
 Development starts from upstream main. Existing experimental V4.1 code can be
 reused selectively with tests; its backend and runtime are not prerequisites.
-Kernel stages should track current pypto-lib interfaces and record the revision
-used for validation. This integration does not change the lib pin.
+Kernel stages track the repository's pypto-lib gitlink. Use its matching runtime
+toolchain and record both revisions when reporting validation.
 
 ## Selective weight loading
 
@@ -115,7 +116,9 @@ prepared by separate deployment tooling. Set
 `PYPTO_V41_PREPACKED_WEIGHTS=/path/to/v41-decode.safetensors` for serving.
 The sidecar stores slot-major, rank-stacked tensors so each layer is contiguous
 at upload. Serving validates the checkpoint fingerprint and mapped fields, and
-falls back to checkpoint packing when the sidecar is absent, stale or cold.
+falls back to checkpoint packing when the sidecar is absent, has stale metadata,
+or has incompatible field names. A valid sidecar remains eligible when its
+page cache is cold; residency is logged rather than used to disable mapping.
 The current v2 bank format invalidates older ND projection sidecars; rebuild
 those sidecars for the BF16 compressor and NZ projection layouts.
 Native MXFP4 kernels no longer take a lookup table. Existing 45-field v2
@@ -239,7 +242,7 @@ The production binding compiles `l3_prefill_fwd` and `l3_decode_fwd`, with
 separate C2A and C1A metadata. DSpark reuses that complete target decode
 program and follows lib's `prefill_bootstrap_dspark` / `decode_fwd_dspark`
 stage order. Each verification uses up to six target rows per request and
-publishes five drafts for the next call. Serving binds weights, state,
+publishes up to five drafts for the next call. Serving binds weights, state,
 private draft cache pages and output buffers; lib owns target acceptance,
 drafter execution, Markov sampling and device state publication.
 
@@ -247,7 +250,7 @@ Draft pages belong to stable request slots rather than target physical page
 IDs. Persistent drafter programs receive increasing attention/MoE epochs at
 actual dispatch, including bootstrap. CPU regressions cover the production
 payload builder, selected lib signatures, resident expert axes and epoch
-progression. Full-model real-checkpoint device validation remains pending.
+progression. Real-checkpoint device coverage is recorded below.
 
 ## Request state and serving lifecycle
 
@@ -297,8 +300,70 @@ use K=0 for stochastic sampling. K=5 resolves `min_tokens` to zero because the
 target sampler does not accept a stop-token mask. For a fixed-length validation
 run, set `ignore_eos=true` together with the desired `max_new_tokens`.
 
+## Run K5 without an HTTP listener
+
+Preserve the validated lifecycle: start each engine in a fresh Python process
+and retain its standard spawned model worker across requests. That worker
+prepares programs before creating one persistent L3 runtime for prefill,
+decode and DSpark. Do not add standalone L2 device execution or L2 init/close
+inside that model worker before L3 initialization; this avoids the sequence
+reported in [Simpler #2842](https://github.com/hw-native-sys/simpler/issues/2842),
+without claiming the upstream issue is fixed. Normal completion and cancellation
+reuse the resident worker.
+
+Run from an installed serving checkout with its pinned lib and compatible A5
+runtime. `TASK_DEVICE` must contain the four allocated device IDs. The offline
+`--prompt` option accepts raw model text, so apply the V4.1 chat template first:
+
+```bash
+MODEL_DIR=/path/to/DeepSeek-V4.1-Flash
+CHAT_PROMPT="$(python - "$MODEL_DIR" <<'PY'
+import sys
+from pypto_serving.model.tokenizer import load_tokenizer
+
+tokenizer = load_tokenizer(sys.argv[1])
+print(tokenizer.apply_chat_template(
+    [{"role": "user", "content": "What is 17 times 19? Answer with the number and one sentence."}],
+    tokenize=False, add_generation_prompt=True, thinking_mode="chat",
+), end="")
+PY
+)"
+python -m pypto_serving.cli --model "$MODEL_DIR" --backend npu --platform a5 \
+  --devices "$TASK_DEVICE" --tp 1 --dp 4 --ep 4 --block-size 128 \
+  --max-model-len 8320 --max-num-seqs 4 --max-num-batched-tokens 80 \
+  --long-prefill-token-threshold 80 --enable-chunked-prefill \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":5}' \
+  --generate-config '{"max_new_tokens":128,"temperature":0.0,"top_p":1.0}' \
+  --prompt "$CHAT_PROMPT" --show-startup-logs
+```
+
+Omit `--speculative-config` for K0. Optional
+`PYPTO_V41_PREPACKED_WEIGHTS` selects a compatible v2 sidecar. If checkpoint
+shards are symlinked outside `MODEL_DIR`, set `PYPTO_V41_SHARED_SHARD_DIR` to
+their existing shared directory. These options use the same scheduler and
+worker as HTTP requests; the tokenizer command performs no device initialization.
+
+The persistent device smoke is
+`tests/test_deepseek_v41_serving.py::test_v41_dp4_http_answer`. It retains its
+HTTP server mechanism and runs one model process, selected by
+`PYPTO_DSV41_SMOKE_SPECULATIVE_TOKENS=0` (default) or `5`. The existing four-card
+CI job selects K5; K0 remains available as a control. The test requires
+`PYPTO_DSV41_MODEL_DIR` and `TASK_DEVICE`, and checks an 8000–8192-token prompt,
+a 128-token generation budget, the answer `323`, and natural completion.
+Use the offline command above on hosts where listening ports are unavailable.
+
 ## Validation boundary
 
-CPU contract checks and isolated A5 runs do not establish M0 acceptance. Real
-M0 still needs matched-reference 8K + 128-token greedy results, HTTP request
-isolation, cache recovery, numerical parity and device memory observations.
+Real-checkpoint validation on A5 with TP1/DP4/EP4 passed 16 K0 and 18 K5 ASGI
+cases, with exact token agreement in all 14 comparable cases. Coverage included
+8K chunked prefill, natural EOS, streamed content and usage, repeated and
+concurrent requests, context-limit fallback, cancellation and request-ID reuse.
+K5 also rejected non-greedy requests before streaming headers. These runs used
+PyPTO `950a30e`, Simpler `31f9e72` and PTO ISA `f83d4b7`.
+
+ASGI validation opened no listening port and does not establish network
+backpressure or disconnect behavior. K0/K5 agreement is not an independent
+numerical reference. M0 still needs matched-reference 8K + 128-token greedy
+results and device-memory observations; general model quality and performance
+have not been accepted. CPU contracts and isolated kernels do not replace
+those checks.
