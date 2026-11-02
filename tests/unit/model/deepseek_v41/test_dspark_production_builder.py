@@ -40,7 +40,7 @@ from pypto_serving.model.deepseek_v41.npu_runner import (
     V41ModelRunner,
     V41ResidentResources,
 )
-from pypto_serving.model.deepseek_v41.task_args import V41CacheGroups
+from pypto_serving.model.deepseek_v41.task_args import ForwardStep, RequestSlice, V41CacheGroups
 
 
 @pytest.fixture
@@ -72,7 +72,7 @@ def production(monkeypatch):
     )
     engram_steps = []
 
-    def stage_lookup(target, step, topology):
+    def stage_lookup(target, step, topology, *, row_stride=None):
         engram_steps.append(step)
         target.zero_()
         offsets = [0] * topology.dp
@@ -80,7 +80,7 @@ def production(monkeypatch):
             start = offsets[request.partition]
             count = len(request.token_ids)
             target[request.partition, :, start:start + count, 0] = torch.tensor(request.token_ids)
-            offsets[request.partition] += count
+            offsets[request.partition] += count if row_stride is None else row_stride
 
     resident.engram_host = SimpleNamespace(stage_lookup=stage_lookup)
     arguments = {
@@ -136,6 +136,11 @@ def _reserve(production, request_id, rank, slot, *, bootstrapped=True):
             draft_ids=(21, 22, 23, 24, 25))
 
 
+def _retain_prefill(production, request_id="a", length=32):
+    request = RequestSlice(request_id, 1, 7, 0, (1,) * length, length, {})
+    production.resident._retain_dspark_prefill(ForwardStep("prefill", (request,), 1))
+
+
 def test_production_decode_binds_six_rows_counts_outputs_and_current_tables(production):
     for request_id, rank, slot in (("a", 1, 7), ("b", 1, 2), ("c", 3, 4)):
         _reserve(production, request_id, rank, slot)
@@ -170,6 +175,43 @@ def test_production_decode_binds_six_rows_counts_outputs_and_current_tables(prod
         (11, 21, 22, 23, 24, 25), (12, 21, 22, 23, 24, 25), (13, 21, 22, 23, 24, 25)]
     assert target["engram_lookup"][1, 0, :12, 0].tolist() == [11, 21, 22, 23, 24, 25,
                                                             12, 21, 22, 23, 24, 25]
+
+
+def test_decode_tail_keeps_fixed_slabs_and_looks_up_only_active_engram_tokens(production):
+    for request_id, slot, anchor, token in (("a", 7, 251, 11), ("b", 2, 250, 12)):
+        _reserve(production, request_id, 1, slot)
+        state = production.resident.dspark.states.get(request_id)
+        state.anchor = state.committed = anchor
+        state.anchor_token = token
+        state.commit((21, 22, 23, 24, 25))
+    batch = _batch(("a", "b"), (1, 1))
+    batch.seq_lens = [252, 251]
+
+    lowered = production.provider.lower_decode(model=object(), batch=batch).lowered
+
+    assert lowered.workspace["active_widths"][1, :2].tolist() == [1, 6]
+    assert lowered.workspace["target_positions"][1, :2].tolist() == [
+        [251, -1, -1, -1, -1, -1], [250, 251, 252, 253, 254, 255]]
+    assert lowered.target_model["attention_num_tokens"].tolist() == [0, 12, 0, 0]
+    assert lowered.target_model["logit_row_indices"][1, :2].tolist() == [0, 11]
+    assert [request.token_ids for request in production.engram_steps[-1].requests] == [
+        (11,), (12, 21, 22, 23, 24, 25)]
+    assert lowered.target_model["engram_lookup"][1, 0, :12, 0].tolist() == [
+        11, 0, 0, 0, 0, 0, 12, 21, 22, 23, 24, 25]
+
+
+@pytest.mark.parametrize("mismatch", ["position", "token"])
+def test_decode_rejects_scheduler_anchor_disagreement_before_dispatch(production, mismatch):
+    _reserve(production, "a", 1, 7)
+    production.resident.dspark.states.get("a").anchor_token = 11
+    batch = _batch()
+    if mismatch == "position":
+        batch.seq_lens = [34]
+    else:
+        batch.token_ids = [12]
+    with pytest.raises(ValueError, match=f"scheduler {mismatch} disagrees"):
+        production.provider.lower_decode(model=object(), batch=batch)
+    assert production.engram_steps == []
 
 
 def test_draft_pages_follow_stable_slots_across_batch_reordering(production):
@@ -275,13 +317,16 @@ def test_persistent_drafter_epochs_follow_actual_dispatches(production, monkeypa
 
     resident.worker = SimpleNamespace(run=run)
     _reserve(production, "a", 1, 7, bootstrapped=False)
+    _retain_prefill(production)
     dispatch = production.provider.lower_prefill(
         model=object(), batch=_batch(), request_ids=("a",), sampled_token_ids=(123,))
     resident.run_dspark_prefill(
         dispatch.request_id, slot=dispatch.slot, generation=dispatch.generation,
         prompt_length=dispatch.prompt_length, anchor=dispatch.anchor, stages=(), lowered=dispatch.lowered)
-    lowered = production.provider.lower_decode(model=object(), batch=_batch()).lowered
-    production.provider.lower_decode(model=object(), batch=_batch())
+    decode_batch = _batch()
+    decode_batch.token_ids = [123]
+    lowered = production.provider.lower_decode(model=object(), batch=decode_batch).lowered
+    production.provider.lower_decode(model=object(), batch=decode_batch)
     assert [call["moe_epoch"] for call in drafter_calls] == [1]
     resident._run_dspark_orchestrator(lowered, phase="decode")
     # Reusing a lowered payload is a new dispatch and needs new completion values.
@@ -308,6 +353,7 @@ def test_production_bootstrap_reads_compact_sample_slot(production, prompt_lengt
     _reserve(production, "a", 1, 7, bootstrapped=False)
     batch = _batch()
     batch.prompt_lens = [prompt_length]
+    _retain_prefill(production, length=prompt_length)
     lowered = production.provider.lower_prefill(
         model=object(), batch=batch, request_ids=("a",), sampled_token_ids=(123,)).lowered
     workspace = lowered.workspace
@@ -334,6 +380,7 @@ def test_release_invalidates_draft_state_before_reusing_slot_pages(production):
     assert bool((host.state.slot_ids[1] == -1).all())
     assert bool((host.cache_tables["draft"][1] == -1).all())
     _reserve(production, "new", 1, 7, bootstrapped=False)
+    _retain_prefill(production, request_id="new")
     dispatch = production.provider.lower_prefill(
         model=object(), batch=_batch(("new",), (1,)),
         request_ids=("new",), sampled_token_ids=(123,))

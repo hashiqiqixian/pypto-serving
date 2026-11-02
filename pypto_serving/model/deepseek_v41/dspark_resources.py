@@ -338,9 +338,9 @@ def allocate_dspark_host_resources(layout: DSparkResourceLayout) -> DSparkHostRe
                  "context_valid", "context_positions"):
         decode[name].fill_(-1)
     prefill = dict(decode)
-    # Prefill geometry consumes the complete prompt-token axis, whereas decode
-    # only consumes the fixed six-row target axis.  Keep separate buffers for
-    # the dynamic axes so a long prompt cannot overwrite decode scratch.
+    # Prefill geometry consumes retained prompt taps, whereas decode consumes
+    # the fixed six-row target axis. Keep their capacities separate so the
+    # sliding prefill context cannot overwrite decode scratch.
     prefill["context_slots"] = _shared(
         (layout.dp_size, DSPARK_DRAFT_LAYERS, layout.max_prefill_tokens), torch.int64)
     prefill["context_rope_cos"] = _shared(

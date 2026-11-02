@@ -42,7 +42,7 @@ from .task_args import (
     validate_cache_groups,
 )
 from .engram import HostEngram
-from .dspark_resources import DSPARK_MAX_BATCH_PER_DP
+from .dspark_resources import DSPARK_MAX_BATCH_PER_DP, DSPARK_WINDOW
 from .dspark_runtime import (
     DECODE_STAGE_ORDER,
     PREFILL_STAGE_ORDER,
@@ -1663,7 +1663,21 @@ class V41ModelRunner:
         """Lower one decode batch through the resident provider."""
         if self.resources is None:
             raise MissingCompositeInterface("V4.1 DSpark resources are not initialized")
-        return self.resources.lower_dspark_decode(model=model, batch=batch)
+        with self._lock:
+            ledger = self._request_ledger()
+            requests = decode_requests(batch, model.config, self.runtime, self.bindings.cache_groups)
+            drafts = {key: self.resources.dspark.states.get(key).draft_ids for key in batch.request_ids}
+            validate_page_tables(
+                batch.block_ids_by_group, batch.cache_partitions,
+                [start + 1 + len(drafts[key]) for key, _, start, _, _ in requests],
+                self.bindings.cache_groups,
+            )
+            step = ledger.begin_decode(requests, drafts=drafts)
+            try:
+                return self.resources.lower_dspark_decode(model=model, batch=batch)
+            except Exception:
+                ledger.abort(step, self._reset_request)
+                raise
 
     def run_dspark_prefill_batch(self, batch):
         """Consume the typed DSpark prefill payload from a serving batch."""
@@ -1681,15 +1695,32 @@ class V41ModelRunner:
     def run_dspark_decode_batch(self, batch):
         """Consume the typed DSpark decode payload from a serving batch."""
         dispatch = DSparkDecodeDispatch.from_batch(batch)
-        return self.run_dspark_decode(
-            dispatch.request_ids,
-            stages=dispatch.stages,
-            accepted_counts=dispatch.accepted_counts,
-            last_sampled=dispatch.last_sampled,
-            draft_ids=dispatch.draft_ids,
-            lowered=dispatch.lowered,
-            request_ranks=dispatch.request_ranks,
-        )
+        with self._lock:
+            ledger = self._request_ledger()
+            step = ledger.pending
+            if step is None or tuple(request.request_id for request in step.requests) != tuple(dispatch.request_ids):
+                raise ValueError("DSpark decode requires its matching request transaction")
+            try:
+                result = self.run_dspark_decode(
+                    dispatch.request_ids,
+                    stages=dispatch.stages,
+                    accepted_counts=dispatch.accepted_counts,
+                    last_sampled=dispatch.last_sampled,
+                    draft_ids=dispatch.draft_ids,
+                    lowered=dispatch.lowered,
+                    request_ranks=dispatch.request_ranks,
+                )
+                self.bindings.wait(self.resources)
+                ledger.commit(step, accepted_counts=[len(tokens) for tokens in result.accepted_token_ids])
+                return result
+            except Exception:
+                try:
+                    self.bindings.wait(self.resources)
+                except Exception:
+                    self.failed = ledger.poisoned = True
+                    raise
+                ledger.abort(step, self._reset_request)
+                raise
 
 # prefill_segment
 _WEIGHTS = (
@@ -2028,7 +2059,7 @@ class HostEngramResources:
     def release_request(self, request_id):
         self.host.release_request(request_id)
 
-    def stage_lookup(self, target, step, topology):
+    def stage_lookup(self, target, step, topology, *, row_stride=None):
         if tuple(target.shape[1:]) != tuple(self.lookup.shape[1:]):
             raise ValueError("Engram lookup capacity disagrees with the forward ABI")
         target.zero_()
@@ -2038,10 +2069,12 @@ class HostEngramResources:
             values = self.host.lookup(request.token_ids, topology.capacity,
                                       request.start, request_id=request.request_id)
             count = len(request.token_ids)
+            if row_stride is not None and count > row_stride:
+                raise ValueError("Engram active rows exceed the request stride")
             for tp_rank in range(topology.tp):
                 rank = request.partition * topology.tp + tp_rank
                 target[rank, :, start:start + count].copy_(values[:, :count])
-            offsets[request.partition] += count
+            offsets[request.partition] += count if row_stride is None else row_stride
 
 
 class ResidentEngramWeights:
@@ -3503,35 +3536,72 @@ class V41ResidentResources:
             if not 0 <= rank < resources.layout.dp_size or row >= DSPARK_MAX_BATCH_PER_DP:
                 raise ValueError("DSpark batch row exceeds the selected DP topology")
             request_state = self.dspark.states.get(request_id)
-            if len(request_state.draft_ids) != 5:
+            if positions[index] != request_state.anchor:
+                raise ValueError("DSpark scheduler position disagrees with the committed anchor")
+            if request_state.anchor_token is not None and int(tokens[index]) != request_state.anchor_token:
+                raise ValueError("DSpark scheduler token disagrees with the committed anchor")
+            if len(request_state.draft_ids) not in (0, DSPARK_SPECULATIVE_TOKENS):
                 raise MissingCompositeInterface(
-                    f"DSpark request {request_id!r} has no five-token draft state")
+                    f"DSpark request {request_id!r} has invalid draft state")
+            active_tokens = (int(tokens[index]), *request_state.draft_ids)
+            width = len(active_tokens)
+            if not 0 <= positions[index] < positions[index] + width <= request_state.position_limit:
+                raise ValueError("DSpark active target rows exceed the request position limit")
             slot, generation = self._resolve_dspark_state(request_id)
             state.slot_ids[rank, row] = slot
             state.generations[rank, row] = generation
-            workspace["input_ids"][rank, row, 0] = int(tokens[index])
-            workspace["input_ids"][rank, row, 1:] = torch.tensor(
-                request_state.draft_ids, dtype=torch.int64)
-            workspace["target_positions"][rank, row] = torch.arange(
-                int(positions[index]), int(positions[index]) + DSPARK_ROWS_PER_REQUEST,
+            workspace["input_ids"][rank, row, :width] = torch.tensor(active_tokens, dtype=torch.int64)
+            workspace["target_positions"][rank, row, :width] = torch.arange(
+                int(positions[index]), int(positions[index]) + width,
                 dtype=torch.int32)
-            workspace["active_widths"][rank, row] = DSPARK_ROWS_PER_REQUEST
+            workspace["active_widths"][rank, row] = width
             workspace["zero_prefill_tokens"][rank, row] = 0
             workspace["state_block_table"][rank, row, 0] = slot
-            workspace["logit_row_indices"][rank, row] = (row + 1) * DSPARK_ROWS_PER_REQUEST - 1
+            workspace["logit_row_indices"][rank, row] = row * DSPARK_ROWS_PER_REQUEST + width - 1
             workspace["attention_num_tokens"][rank] = (row + 1) * DSPARK_ROWS_PER_REQUEST
             workspace["moe_num_tokens"][rank] = (row + 1) * DSPARK_ROWS_PER_REQUEST
             engram_requests.append(RequestSlice(
                 request_id, rank, slot, int(positions[index]),
-                (int(tokens[index]), *request_state.draft_ids), request_state.prompt_length,
+                active_tokens, request_state.prompt_length,
                 batch.block_ids_by_group[index],
             ))
         self._stage_dspark_tables(resources, batch, partitions, request_rows)
         if self.engram_host is not None:
             self.engram_host.stage_lookup(
                 self.decode_host.fields["engram_lookup"],
-                ForwardStep("decode", tuple(engram_requests), 0), self.decode_host.topology)
+                ForwardStep("decode", tuple(engram_requests), 0), self.decode_host.topology,
+                row_stride=DSPARK_ROWS_PER_REQUEST)
         return tuple(partitions), tuple(request_rows)
+
+    def _retain_dspark_prefill(self, step):
+        """Keep only the drafter's visible target taps across prefill chunks."""
+        resources = self.dspark_host_resources
+        if resources is None:
+            return
+        source = self.prefill_host.fields.get("dspark_target_hidden")
+        if source is None:
+            raise MissingCompositeInterface("target prefill did not expose dspark_target_hidden")
+        retained = resources.prefill_workspace["prefill_target_hidden"]
+        capacity = min(DSPARK_WINDOW, retained.shape[1])
+        progress = getattr(self, "_dspark_prefill_progress", {})
+        offsets = [0] * resources.layout.dp_size
+        for request in step.requests:
+            rank = request.partition
+            offset = offsets[rank]
+            size = len(request.token_ids)
+            offsets[rank] += size
+            if request.start and progress.get(rank) != (request.request_id, request.start):
+                raise ValueError("DSpark prefill taps must continue the same request")
+            if size >= capacity:
+                retained[rank, :capacity].copy_(source[rank, offset + size - capacity:offset + size])
+            else:
+                previous = min(request.start, capacity - size)
+                if previous:
+                    old_end = min(request.start, capacity)
+                    retained[rank, :previous].copy_(retained[rank, old_end - previous:old_end].clone())
+                retained[rank, previous:previous + size].copy_(source[rank, offset:offset + size])
+            progress[rank] = (request.request_id, request.end)
+        self._dspark_prefill_progress = progress
 
     def _stage_dspark_prefill(self, resources, batch, request_ids, sampled_token_ids):
         if len(request_ids) != 1:
@@ -3541,32 +3611,31 @@ class V41ResidentResources:
         rank = partitions[0] if partitions else 0
         slot, generation = self._resolve_dspark_state(request_id)
         workspace = resources.prefill_workspace
-        for value in workspace.values():
-            if isinstance(value, torch.Tensor):
+        for name, value in workspace.items():
+            if name != "prefill_target_hidden" and isinstance(value, torch.Tensor):
                 value.zero_()
         workspace["sampled_rows"].fill_(-1)
         workspace["prefill_positions"].fill_(-1)
         workspace["prefill_request_ids"].fill_(-1)
         prompt_length = int(batch.prompt_lens[0])
-        if not 0 < prompt_length <= resources.layout.max_prefill_tokens:
-            raise ValueError("DSpark prefill prompt exceeds the configured ABI capacity")
+        if not 0 < prompt_length <= resources.layout.max_seq_len:
+            raise ValueError("DSpark prefill prompt exceeds the configured context capacity")
+        if getattr(self, "_dspark_prefill_progress", {}).get(rank) != (request_id, prompt_length):
+            raise ValueError("DSpark bootstrap requires all target prefill chunks to complete")
+        retained_count = min(prompt_length, resources.layout.max_prefill_tokens, DSPARK_WINDOW)
+        if retained_count < min(prompt_length, DSPARK_WINDOW):
+            raise ValueError("DSpark prefill buffer cannot retain the visible draft context")
+        prefix_start = prompt_length - retained_count
         workspace["prompt_lengths"][rank, 0] = prompt_length
         workspace["position_limits"][rank, 0] = resources.layout.max_seq_len
         workspace["sampled_rows"][rank, 0] = 0
         workspace["next_prefill_tokens"][rank, 0] = int(sampled_token_ids[0])
-        workspace["prefill_counts"][rank, 0] = prompt_length
+        workspace["prefill_counts"][rank, 0] = retained_count
         workspace["first_query_positions"][rank, 0] = prompt_length
-        workspace["prefill_positions"][rank, :prompt_length] = torch.arange(
-            prompt_length, dtype=torch.int32)
-        workspace["prefill_request_ids"][rank, :prompt_length] = 0
+        workspace["prefill_positions"][rank, :retained_count] = torch.arange(
+            prefix_start, prompt_length, dtype=torch.int32)
+        workspace["prefill_request_ids"][rank, :retained_count] = 0
         workspace["prefill_sampled_ids"][rank, 0, 0] = int(sampled_token_ids[0])
-        # The full target prefill writes its three tap rows to the metadata
-        # field.  Copy only the active prefix into the DSpark-owned workspace.
-        source = self.prefill_host.fields.get("dspark_target_hidden")
-        if source is None:
-            raise MissingCompositeInterface("target prefill did not expose dspark_target_hidden")
-        workspace["prefill_target_hidden"][rank, :prompt_length].copy_(
-            source[rank, :prompt_length])
         groups = getattr(batch, "block_ids_by_group", ())
         if len(groups) != 1:
             raise ValueError("DSpark bootstrap requires one cache allocation")
@@ -3953,12 +4022,16 @@ class V41ResidentResources:
             rank, row = self._dspark_request_rows(lowered, 1)
             draft_ids = self._dspark_output_row(
                 draft_ids, rank=rank[0], row=row[0], kind="draft_ids")
-            self._validate_dspark_token_row(
-                draft_ids, kind="draft_ids", minimum=DSPARK_SPECULATIVE_TOKENS)
+            drafts = []
+            if anchor + DSPARK_SPECULATIVE_TOKENS < self.dspark.states.position_limit:
+                self._validate_dspark_token_row(
+                    draft_ids, kind="draft_ids", minimum=DSPARK_SPECULATIVE_TOKENS)
+                drafts = [int(token) for token in draft_ids.tolist()]
             state = self.dspark.record_bootstrap(
                 request_id, slot=slot, generation=generation,
                 prompt_length=prompt_length, anchor=anchor,
-                draft_ids=[int(token) for token in draft_ids.tolist()],
+                draft_ids=drafts,
+                anchor_token=int(lowered.workspace["next_prefill_tokens"][rank[0], row[0]]),
             )
             return state
         except BaseException:
@@ -3987,7 +4060,7 @@ class V41ResidentResources:
             sampled_tensor = self._read_dspark_output(lowered, "last_sampled")
             drafts_tensor = self._read_dspark_output(lowered, "draft_ids")
             ranks, rows = self._dspark_request_rows(lowered, len(request_ids))
-            accepted, counts, sampled, drafts = [], [], [], []
+            accepted, counts, sampled, drafts, proposed_counts = [], [], [], [], []
             for request_id, rank, row in zip(request_ids, ranks, rows, strict=True):
                 count = int(self._dspark_output_row(
                     counts_tensor, rank=rank, row=row, kind="accepted_counts"))
@@ -4000,12 +4073,16 @@ class V41ResidentResources:
                 token_ids = [int(token) for token in ids[:count].tolist()]
                 sampled_token = int(self._dspark_output_row(
                     sampled_tensor, rank=rank, row=row, kind="last_sampled"))
-                draft_row = self._dspark_output_row(
-                    drafts_tensor, rank=rank, row=row, kind="draft_ids")
-                self._validate_dspark_token_row(
-                    draft_row, kind="draft_ids", minimum=DSPARK_SPECULATIVE_TOKENS)
-                draft = [int(token) for token in draft_row[:5].tolist()]
-                self.dspark.states.get(request_id).validate_accept(count, sampled_token)
+                state = self.dspark.states.get(request_id)
+                proposed_counts.append(len(state.draft_ids))
+                state.validate_accept(count, sampled_token)
+                draft = []
+                if state.anchor + count + DSPARK_SPECULATIVE_TOKENS < state.position_limit:
+                    draft_row = self._dspark_output_row(
+                        drafts_tensor, rank=rank, row=row, kind="draft_ids")
+                    self._validate_dspark_token_row(
+                        draft_row, kind="draft_ids", minimum=DSPARK_SPECULATIVE_TOKENS)
+                    draft = [int(token) for token in draft_row[:DSPARK_SPECULATIVE_TOKENS].tolist()]
                 accepted.append(token_ids)
                 counts.append(count)
                 sampled.append(sampled_token)
@@ -4015,7 +4092,7 @@ class V41ResidentResources:
             )
             draft_counts = lowered.outputs.get("draft_counts", lowered.workspace.get("draft_counts"))
             if draft_counts is None:
-                draft_count_values = [5] * len(request_ids)
+                draft_count_values = proposed_counts
             else:
                 draft_counts_tensor = self._read_dspark_output(lowered, "draft_counts")
                 draft_count_values = [int(self._dspark_output_row(
@@ -4034,6 +4111,8 @@ class V41ResidentResources:
         if self.closed or step is not self._step:
             raise ValueError("final output must use the active request step")
         try:
+            if step.phase == "prefill" and self.dspark_host_resources is not None:
+                self._retain_dspark_prefill(step)
             return collect_final_logits(self.final.host.logits, self._output_rows)
         finally:
             self._step = self._inputs = self._group_counts = self._output_rows = None
@@ -4053,6 +4132,7 @@ class V41ResidentResources:
                 host.state.slot_ids[rank, released] = -1
                 host.state.generations[rank, released] = 0
                 host.cache_tables["draft"][rank, :, released] = -1
+                getattr(self, "_dspark_prefill_progress", {}).pop(rank, None)
                 # Slot-owned pages can be reused after this synchronous reset:
                 # bootstrap overwrites the visible prefix before publishing
                 # the new generation, so stale KV rows remain unreachable.
@@ -4316,7 +4396,7 @@ def make_production_bindings(
             dspark_host = allocate_dspark_host_resources(DSparkResourceLayout(
                 dp_size=topology.dp, max_seq_len=max_seq_len,
                 vocab_size=plan.weights.config.vocab_size,
-                max_prefill_tokens=min(max_seq_len, 8192),
+                max_prefill_tokens=min(max_seq_len, DSPARK_WINDOW),
             ))
             # Reuse the already validated target RoPE table.  The draft ABI
             # uses the same 32-wide adjacent-pair table as the target.

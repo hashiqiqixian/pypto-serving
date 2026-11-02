@@ -23,8 +23,8 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from pypto_serving.config.types import GenerateConfig
-from pypto_serving.serving.engine.async_engine import TokenOutput
+from pypto_serving.config.types import GenerateConfig, RuntimeConfig
+from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig, TokenOutput
 from pypto_serving.serving.reasoning import OutputParserSpec
 from pypto_serving.serving.server.server import (
     ChatCompletionRequest,
@@ -123,6 +123,27 @@ def test_non_streaming_scheduler_rejection_reaches_http_400_handler(method_name,
 
     assert response.status_code == 400
     assert json.loads(response.body)["message"] == message
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("chat", [False, True])
+def test_v41_k5_non_greedy_http_rejection_precedes_stream_headers(stream, chat):
+    engine = _FakeEngine([])
+    engine.config = EngineConfig(executor_cls="PyptoDeepSeekV41Executor",
+                                 runtime_config=RuntimeConfig(num_speculative_tokens=5))
+    engine.validate_generate_config = lambda config: AsyncLLMEngine.validate_generate_config(engine, config)
+    server = ServingServer(engine, "test-model", GenerateConfig())
+    payload = {"temperature": 0.7, "stream": stream}
+    payload.update({"messages": [{"role": "user", "content": "Go"}]} if chat else {"prompt": "Go"})
+    route = "/v1/chat/completions" if chat else "/v1/completions"
+
+    with TestClient(server.app) as client:
+        response = client.post(route, json=payload)
+
+    assert response.status_code == 400
+    assert "greedy sampling only" in response.json()["message"]
+    assert response.headers["content-type"].startswith("application/json")
+    assert engine.calls == []
 
 
 def test_stream_completion_terminal_usage_chunk():

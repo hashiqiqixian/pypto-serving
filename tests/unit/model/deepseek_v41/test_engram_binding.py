@@ -46,6 +46,29 @@ def test_engram_rows_keep_request_offsets_and_tp_replicas():
     assert torch.equal(target[:, 0], target[:, 1])
 
 
+def test_engram_fixed_request_stride_does_not_lookup_inactive_tail_rows():
+    calls = []
+
+    def lookup(token_ids, capacity, start_pos, *, request_id):
+        calls.append((request_id, tuple(token_ids), start_pos))
+        rows = torch.zeros((2, capacity, 1), dtype=torch.bfloat16)
+        rows[:, :len(token_ids), 0] = torch.tensor(token_ids)
+        return rows
+
+    host = HostEngramResources.__new__(HostEngramResources)
+    host.host = SimpleNamespace(lookup=lookup)
+    host.lookup = torch.empty((1, 2, 12, 1), dtype=torch.bfloat16)
+    target = torch.full_like(host.lookup, 99)
+    requests = tuple(SimpleNamespace(request_id=key, partition=0, token_ids=ids, start=start)
+                     for key, ids, start in (("tail", (11,), 127), ("full", (20, 21, 22, 23, 24, 25), 3)))
+
+    host.stage_lookup(target, SimpleNamespace(requests=requests),
+                      SimpleNamespace(dp=1, tp=1, capacity=12), row_stride=6)
+
+    assert calls == [("tail", (11,), 127), ("full", (20, 21, 22, 23, 24, 25), 3)]
+    assert target[0, 0, :, 0].tolist() == [11, 0, 0, 0, 0, 0, 20, 21, 22, 23, 24, 25]
+
+
 def test_request_release_keeps_device_weights_and_waits_before_host_cleanup():
     events = []
     resources = V41ResidentResources.__new__(V41ResidentResources)

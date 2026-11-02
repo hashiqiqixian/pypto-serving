@@ -85,6 +85,23 @@ def test_dspark_requires_five_drafts_and_matching_acceptance_state():
     assert DSPARK_SPECULATIVE_TOKENS == 5
 
 
+def test_dspark_keeps_last_full_slab_then_continues_one_token_to_context_limit():
+    runtime = V41DSparkRuntime(_DispatchLog(), max_seq_len=128)
+    state = runtime.record_bootstrap(
+        "tail", slot=0, generation=1, prompt_length=122, anchor=122,
+        anchor_token=9, draft_ids=[1, 2, 3, 4, 5],
+    )
+    assert state.draft_ids == (1, 2, 3, 4, 5)
+    for anchor in range(123, 129):
+        runtime.decode(
+            ["tail"], _stages(DECODE_STAGE_ORDER), accepted_counts=[1],
+            last_sampled=[anchor], draft_ids=[[]],
+        )
+        assert state.anchor == state.committed == anchor
+        assert state.anchor_token == anchor
+        assert state.draft_ids == ()
+
+
 def test_dspark_validates_acceptance_before_dispatch():
     dispatch = _DispatchLog()
     runtime = V41DSparkRuntime(dispatch, max_seq_len=128)

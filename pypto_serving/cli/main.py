@@ -433,7 +433,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         max_num_batched_tokens=step_tokens,
         max_prefill_tokens_per_request=step_tokens,
         requires_homogeneous_prefill_decode=True,
-        supports_chunked_prefill_with_speculation=not bool(dspark_tokens),
+        supports_chunked_prefill_with_speculation=True,
     )
     return EngineConfig(
         model_id=args.served_model_name or Path(model_dir).name,

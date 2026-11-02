@@ -207,6 +207,12 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
     def run_prefill(self, model, batch):
         return self.runners[model.config.model_id].run_prefill(model, batch)
 
+    @property
+    def max_prefill_batch_size(self) -> int | None:
+        if any(runner.runtime.num_speculative_tokens == 5 for runner in self.runners.values()):
+            return 1
+        return None
+
     def run_decode(self, model, batch):
         return self.runners[model.config.model_id].run_decode(model, batch)
 

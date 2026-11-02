@@ -56,6 +56,26 @@ def test_v41_dspark_rejects_missing_lowered_stage_payload():
         WorkerProcess._require_v41_dspark_stages(model, batch, phase="decode")
 
 
+@pytest.mark.parametrize("speculative_tokens,expected", [(0, [("a", "b")]), (5, [("a",), ("b",)])])
+def test_v41_worker_serializes_k5_prefill_without_changing_k0(speculative_tokens, expected):
+    from pypto_serving.model.deepseek_v41.npu_executor import DeepSeekV41PyptoExecutor
+
+    executor = DeepSeekV41PyptoExecutor.__new__(DeepSeekV41PyptoExecutor)
+    executor.runners = {"model": SimpleNamespace(runtime=SimpleNamespace(num_speculative_tokens=speculative_tokens))}
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.executor = executor
+    worker.model_record = SimpleNamespace(runtime_model=object())
+    calls = []
+    worker._batch_prefill = lambda requests, model, outputs: calls.append(tuple(r.request_id for r in requests))
+    requests = [SimpleNamespace(request_id=key, cache_partition=rank, chunk_tokens=[1, 2])
+                for key, rank in (("a", 0), ("b", 1))]
+
+    worker._execute_step(StepCommand(new_requests=[], prefill_requests=requests,
+                                     decode_requests=[], finished_request_ids=[]))
+
+    assert calls == expected
+
+
 def test_step_command_preserves_grouped_cache_metadata_on_preempted_restart():
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
     core._request_contexts = {}

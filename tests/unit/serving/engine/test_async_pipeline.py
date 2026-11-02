@@ -307,6 +307,31 @@ def test_min_tokens_reaches_worker_registration(executor_cls, speculative_tokens
     assert registration.initial_output_tokens == 0
 
 
+def test_v41_k5_rejects_non_greedy_before_request_admission():
+    core, dispatched = _async_pipeline_core(num_speculative_tokens=5)
+    core.config.executor_cls = "PyptoDeepSeekV41Executor"
+
+    async def enqueue():
+        async for _ in core.add_request(
+            "non-greedy", "prompt", GenerateConfig(temperature=0.7), prompt_token_ids=[1],
+        ):
+            pass
+
+    with pytest.raises(ValueError, match="greedy sampling only"):
+        asyncio.run(enqueue())
+    assert not core.scheduler.requests and not core._request_contexts and not dispatched
+
+
+@pytest.mark.parametrize("executor_cls,speculative_tokens", [
+    ("PyptoQwen14BExecutor", 0), ("PyptoDeepSeekV4Executor", 1),
+    ("PyptoDeepSeekV4DSparkExecutor", 7), ("PyptoDeepSeekV41Executor", 0),
+])
+def test_v41_greedy_guard_does_not_change_other_sampling_paths(executor_cls, speculative_tokens):
+    config = EngineConfig(executor_cls=executor_cls,
+                          runtime_config=RuntimeConfig(num_speculative_tokens=speculative_tokens))
+    config.validate_generate_config(GenerateConfig(temperature=0.7, top_p=0.9, top_k=20, seed=42))
+
+
 def test_restarted_request_registers_committed_output_length(monkeypatch):
     core, _ = _async_pipeline_core()
     request = Request(

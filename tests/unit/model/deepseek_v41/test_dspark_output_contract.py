@@ -15,6 +15,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from pypto_serving.model.deepseek_v41.npu_runner import V41ResidentResources
+from pypto_serving.model.deepseek_v41.dspark_runtime import V41DSparkRuntime
 
 
 def test_single_request_token_vectors_are_not_reduced_to_scalars():
@@ -46,3 +47,24 @@ def test_dspark_request_rows_reject_negative_values():
     )
     with pytest.raises(ValueError, match="request_rows must be nonnegative"):
         resources._dspark_request_rows(lowered, 1)
+
+
+def test_final_context_token_does_not_consume_inactive_draft_output():
+    resources = V41ResidentResources.__new__(V41ResidentResources)
+    resources.dspark = V41DSparkRuntime(resources, max_seq_len=128)
+    state = resources.dspark.record_bootstrap(
+        "tail", slot=0, generation=1, prompt_length=127, anchor=127,
+        anchor_token=11, draft_ids=[],
+    )
+    resources._run_dspark_orchestrator = lambda lowered, phase: None
+    lowered = SimpleNamespace(request_ranks=(0,), workspace={}, outputs={
+        "request_rows": (0,), "accepted_counts": torch.tensor([1]),
+        "accepted_ids": torch.tensor([17, -1, -1, -1, -1, -1]),
+        "last_sampled": torch.tensor([17]), "draft_ids": torch.empty(0, dtype=torch.int64),
+    })
+
+    result = resources.run_dspark_decode(("tail",), stages=(), lowered=lowered)
+
+    assert result.accepted_token_ids == [[17]]
+    assert result.num_draft_tokens == [0]
+    assert state.anchor == 128 and state.anchor_token == 17 and state.draft_ids == ()

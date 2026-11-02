@@ -168,7 +168,7 @@ def test_v41_checkpoint_cli_keeps_its_speculative_runtime_contract(tmp_path, mon
     assert runtime.num_speculative_tokens == draft_tokens
     assert runtime.kv_cache_groups == groups
     assert runtime.max_num_batched_tokens == 72
-    assert runtime.supports_chunked_prefill_with_speculation is (draft_tokens == 0)
+    assert runtime.supports_chunked_prefill_with_speculation
     assert config.worker_device_ids() == tuple(range(dp))
     assert config.executor_cls == cli._executor_cls_for_model_family("deepseek_v41")
 

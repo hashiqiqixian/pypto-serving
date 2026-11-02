@@ -283,6 +283,7 @@ class DSparkRequestState:
     committed: int = 0
     draft_ids: tuple[int, ...] = ()
     valid: bool = False
+    anchor_token: int | None = None
 
     def bootstrap(self, prompt_length: int, anchor: int) -> None:
         if prompt_length <= 0 or prompt_length > self.position_limit:
@@ -305,6 +306,7 @@ class DSparkRequestState:
         self.anchor += accepted_count
         self.committed += accepted_count
         self.draft_ids = ()
+        self.anchor_token = last_sampled
 
     def validate_accept(self, accepted_count: int, last_sampled: int) -> None:
         """Validate the next acceptance without changing request state."""
@@ -320,11 +322,11 @@ class DSparkRequestState:
     def commit(self, draft_ids: Sequence[int]) -> None:
         if not self.valid:
             raise RuntimeError("cannot commit drafts for an uninitialized DSpark state")
-        if len(draft_ids) != DSPARK_SPECULATIVE_TOKENS:
-            raise ValueError("DSpark must commit exactly five draft tokens")
-        if self.anchor + DSPARK_ROWS_PER_REQUEST >= self.position_limit:
+        if self.anchor + DSPARK_SPECULATIVE_TOKENS >= self.position_limit:
             self.draft_ids = ()
             return
+        if len(draft_ids) != DSPARK_SPECULATIVE_TOKENS:
+            raise ValueError("DSpark must commit exactly five draft tokens")
         self.draft_ids = tuple(int(token) for token in draft_ids)
 
 
@@ -395,7 +397,7 @@ class V41DSparkRuntime:
 
     def record_bootstrap(self, request_id: str, *, slot: int, generation: int,
                          prompt_length: int, anchor: int,
-                         draft_ids: Sequence[int]) -> DSparkRequestState:
+                         draft_ids: Sequence[int], anchor_token: int | None = None) -> DSparkRequestState:
         """Commit outputs already produced by the lib bootstrap composite.
 
         The device orchestration path has its own runner and therefore must not
@@ -407,6 +409,7 @@ class V41DSparkRuntime:
         try:
             state.bootstrap(prompt_length, anchor)
             state.commit(draft_ids)
+            state.anchor_token = anchor_token
         except BaseException:
             self.states.release((request_id,))
             raise
@@ -427,8 +430,12 @@ class V41DSparkRuntime:
         if draft_ids is not None:
             if len(draft_ids) != len(request_ids):
                 raise ValueError("DSpark draft state must match request order")
-            if any(len(drafts) != DSPARK_SPECULATIVE_TOKENS for drafts in draft_ids):
-                raise ValueError("DSpark must commit exactly five draft tokens")
+            for index, (request_id, drafts) in enumerate(zip(request_ids, draft_ids, strict=True)):
+                state = self.states.get(request_id)
+                next_anchor = state.anchor + (int(accepted_counts[index]) if accepted_counts is not None else 0)
+                if (next_anchor + DSPARK_SPECULATIVE_TOKENS < state.position_limit
+                        and len(drafts) != DSPARK_SPECULATIVE_TOKENS):
+                    raise ValueError("DSpark must commit exactly five draft tokens")
         # Validate device-produced acceptance values before dispatching any
         # stage.  A malformed sample must not leave a partially executed
         # target/drafter chain or mutate persistent request state.

@@ -40,7 +40,7 @@ and decoding but is not a full-checkpoint tokenizer validation.
 2. Selective checkpoint loading, weight formats and shard contracts (implemented on CPU).
 3. Executor/Runner lifecycle and explicit composite contract (framework implemented).
 4. Bounded CPU embedding rows from TP shards (implemented); device residual/pre-mix initialization is an adapter callback.
-5. Request/cache ownership and target-only chunked prefill (implemented); K=5 requires a single prefill dispatch.
+5. Request/cache ownership and chunked prefill, including K=5 target-tap retention (implemented).
 6. Decode continuity and prefill-to-decode transitions (framework implemented).
 7. Rank-owned weights and all backbone layers (dispatch implemented through full prefill/decode composites).
 8. Final HC/norm/head and lib-owned DSpark sampling (dispatch implemented); numerical acceptance remains pending.
@@ -283,11 +283,17 @@ is the default. Enable K=5 with
 This is the V4.1 native FP8/FP4 path; the V4 W8A8 K=7 deployment uses a separate
 executor and contract. A3 execution and vision remain outside this contract.
 
-The current production prefill capacity is 80 tokens per dispatch. K=5
-disables chunked prefill admission, and bootstrap currently requires a
-single-request prefill batch. Packed multi-request bootstrap and continuation
-near the context limit need further host integration; the current lowering
-requires five retained drafts. K=5 resolves `min_tokens` to zero because the
+The production prefill capacity is 80 tokens per dispatch. K=5 retains the
+last 128 target tap rows across chunks, with absolute positions, and runs
+bootstrap once after the terminal chunk. The worker dispatches one prefill
+request at a time; multiple requests can share a decode batch across DP
+partitions. Near the context limit, decoding continues with one anchor row
+when five drafts no longer fit. The request ledger retains every page touched
+by verification, including rejected proposals, until request release.
+
+K=5 supports greedy sampling only. Requests with a positive temperature are
+rejected before admission, including before HTTP streaming headers are sent;
+use K=0 for stochastic sampling. K=5 resolves `min_tokens` to zero because the
 target sampler does not accept a stop-token mask. For a fixed-length validation
 run, set `ignore_eos=true` together with the desired `max_new_tokens`.
 
