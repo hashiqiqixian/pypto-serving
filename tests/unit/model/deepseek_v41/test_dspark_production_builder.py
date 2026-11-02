@@ -25,7 +25,11 @@ from pypto_serving.model.deepseek_v41.dspark_resources import (
     _MARKOV_MODEL_KEYS,
     allocate_dspark_host_resources,
 )
-from pypto_serving.model.deepseek_v41.dspark_runtime import V41DSparkRuntime
+from pypto_serving.model.deepseek_v41.dspark_runtime import (
+    DECODE_STAGE_ORDER,
+    PREFILL_STAGE_ORDER,
+    V41DSparkRuntime,
+)
 from pypto_serving.model.deepseek_v41.npu_runner import (
     ResidentDSparkBuffers,
     ResidentDSparkCache,
@@ -45,6 +49,7 @@ def production(monkeypatch):
     resident.dspark = V41DSparkRuntime(resident, max_seq_len=256)
     resident.ledger = SimpleNamespace(owners={})
     resident._dspark_generations = {}
+    resident._dspark_drafter_epochs = {}
     resident._decode_fwd = None
     resident.dspark_embedding = SimpleNamespace(tensor=object())
     resident.dspark_cache = SimpleNamespace(window_cache=object(), window_cache_scale=object())
@@ -177,8 +182,7 @@ def test_draft_pages_follow_stable_slots_across_batch_reordering(production):
     assert bool((second.cache_tables["draft"][1, :, 1:] == -1).all())
 
 
-def test_production_payload_runs_selected_lib_host_orchestrator(production):
-    """Use the actual lib host composition and every stage's declared keys."""
+def _selected_lib_orchestrators(production):
     root = Path(os.environ.get("PYPTO_LIB_ROOT", Path(__file__).resolve().parents[4] / "pypto-lib"))
     model = root / "models" / "deepseek_v4_1_flash"
     if not (model / "decode_fwd_dspark.py").is_file():
@@ -204,9 +208,15 @@ def test_production_payload_runs_selected_lib_host_orchestrator(production):
     # programs remain signature objects; no PyPTO or model kernels are imported.
     host_code = ast.Module(body=[
         ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
-        functions["_run"], functions["decode_fwd_dspark"],
+        functions["_run"], functions["decode_fwd_dspark"], functions["prefill_bootstrap_dspark"],
     ], type_ignores=[])
     exec(compile(ast.fix_missing_locations(host_code), "selected_lib_host_orchestrator", "exec"), namespace)
+    return namespace
+
+
+def test_production_payload_runs_selected_lib_host_orchestrator(production):
+    """Use the actual lib host composition and every stage's declared keys."""
+    namespace = _selected_lib_orchestrators(production)
     _reserve(production, "a", 1, 7)
     lowered = production.provider.lower_decode(model=object(), batch=_batch()).lowered
     called = []
@@ -218,6 +228,72 @@ def test_production_payload_runs_selected_lib_host_orchestrator(production):
     assert called[2] == "l3_decode_fwd"
     assert called[-3:] == ["l3_dspark_drafter", "l3_markov_sample_from_hidden", "l3_commit_drafts"]
     assert len(called) == 15
+
+
+def test_persistent_drafter_epochs_follow_actual_dispatches(production, monkeypatch):
+    namespace = _selected_lib_orchestrators(production)
+    resident = production.resident
+    resident.closed = resident.failed = False
+    resident.run_config = object()
+    resident.dspark_programs, resident.dspark_param_names = {}, {}
+    compiled_names = {}
+    for stage in set(PREFILL_STAGE_ORDER + DECODE_STAGE_ORDER):
+        entry = {"target_decode": "l3_decode_fwd",
+                 "markov_sample": "l3_markov_sample_from_hidden"}.get(stage, "l3_" + stage)
+        if stage.startswith("sample_target_chunk_"):
+            entry = "l3_sample_target_chunk"
+        program = SimpleNamespace(compiled=object())
+        resident.dspark_programs[stage] = program
+        resident.dspark_param_names[stage] = namespace[entry].param_names
+        compiled_names[program.compiled] = stage
+    original_import = npu_runner.importlib.import_module
+
+    def import_module(name):
+        if name == "models.deepseek_v4_1_flash.decode_fwd_dspark":
+            return SimpleNamespace(**namespace)
+        if name == "models.deepseek_v4_1_flash.dspark_drafter":
+            return SimpleNamespace(DSPARK_CHUNK_REQUESTS=16, DSPARK_DRAFT_LAYERS=3)
+        return original_import(name)
+
+    monkeypatch.setattr(npu_runner.importlib, "import_module", import_module)
+    drafter_calls, logits_epochs = [], []
+
+    def run(compiled, *values, config):
+        stage = compiled_names[compiled]
+        arguments = dict(zip(resident.dspark_param_names[stage], values, strict=True))
+        if stage == "dspark_drafter":
+            drafter_calls.append(arguments)
+        if stage == "markov_sample":
+            logits_epochs.append(arguments["logits_epoch"])
+
+    resident.worker = SimpleNamespace(run=run)
+    _reserve(production, "a", 1, 7, bootstrapped=False)
+    dispatch = production.provider.lower_prefill(
+        model=object(), batch=_batch(), request_ids=("a",), sampled_token_ids=(123,))
+    resident.run_dspark_prefill(
+        dispatch.request_id, slot=dispatch.slot, generation=dispatch.generation,
+        prompt_length=dispatch.prompt_length, anchor=dispatch.anchor, stages=(), lowered=dispatch.lowered)
+    lowered = production.provider.lower_decode(model=object(), batch=_batch()).lowered
+    production.provider.lower_decode(model=object(), batch=_batch())
+    assert [call["moe_epoch"] for call in drafter_calls] == [1]
+    resident._run_dspark_orchestrator(lowered, phase="decode")
+    # Reusing a lowered payload is a new dispatch and needs new completion values.
+    resident._run_dspark_orchestrator(lowered, phase="decode")
+    assert [call["attention_epoch"] for call in drafter_calls] == [1, 4, 7]
+    assert [call["moe_epoch"] for call in drafter_calls] == [1, 4, 7]
+    assert logits_epochs == [1, 1, 1]
+
+    original = resident.dspark_programs["dspark_drafter"]
+    another = SimpleNamespace(compiled=object())
+    compiled_names[another.compiled] = "dspark_drafter"
+    resident.dspark_programs["dspark_drafter"] = another
+    resident._run_dspark_orchestrator(lowered, phase="decode")
+    assert drafter_calls[-1]["moe_epoch"] == 1
+    resident.dspark_programs["dspark_drafter"] = original
+    two_chunks = dict(drafter_calls[-1], head_hidden=SimpleNamespace(shape=(4, 17, 5, 5120)))
+    resident.dispatch_dspark("dspark_drafter", two_chunks)
+    resident.dispatch_dspark("dspark_drafter", two_chunks)
+    assert [call["moe_epoch"] for call in drafter_calls[-2:]] == [10, 16]
 
 
 @pytest.mark.parametrize("prompt_length", (1, 8, 32))

@@ -3309,6 +3309,7 @@ class V41ResidentResources:
         self.dspark_buffers = None
         self.ledger = None
         self._dspark_generations = {}
+        self._dspark_drafter_epochs = {}
         self._owned = []
         self._step = None
         self._inputs = None
@@ -3786,8 +3787,24 @@ class V41ResidentResources:
                 f"DSpark stage {stage} ABI mismatch: "
                 f"missing={sorted(required - supplied)} extra={sorted(supplied - required)}"
             )
+        bound = arguments
+        if stage == "dspark_drafter":
+            module = importlib.import_module("models.deepseek_v4_1_flash.dspark_drafter")
+            batch = int(arguments["head_hidden"].shape[1])
+            chunks = (batch + module.DSPARK_CHUNK_REQUESTS - 1) // module.DSPARK_CHUNK_REQUESTS
+            stride = chunks * module.DSPARK_DRAFT_LAYERS
+            key = id(program.compiled)
+            epoch = self._dspark_drafter_epochs.get(key, 1)
+            if epoch + stride - 1 > (2**31 - 1) // 2:
+                raise OverflowError("DSpark communication epoch exhausted; recreate worker")
+            # These windows persist across both bootstrap and decode. Allocate
+            # epochs at dispatch, so repeated lowering cannot consume them and
+            # replaying an already lowered payload cannot reuse old signals.
+            bound = dict(arguments, attention_epoch=epoch, moe_epoch=epoch)
         self.worker.run(program.compiled,
-                        *(arguments[name] for name in param_names), config=self.run_config)
+                        *(bound[name] for name in param_names), config=self.run_config)
+        if stage == "dspark_drafter":
+            self._dspark_drafter_epochs[key] = epoch + stride
 
     def _run_dspark_orchestrator(self, lowered: DSparkLoweredInputs, *, phase: str) -> None:
         """Run the lib-owned orchestration against resident compiled stages."""
