@@ -201,6 +201,7 @@ jobs:
           run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout"
           run_cmd="$run_cmd PYPTO_DSV41_MODEL_DIR=$PYPTO_DSV41_MODEL_DIR"
           run_cmd="$run_cmd PYPTO_DSV41_SMOKE_SPECULATIVE_TOKENS=5"
+          run_cmd="$run_cmd PYPTO_WORKER_INIT_TIMEOUT=2400"
           run_cmd="$run_cmd python -m pytest tests/test_deepseek_v41_serving.py::test_v41_dp4_http_answer -q -s"
           task-submit --device auto --device-num 4 \
             --timeout 3600 --max-time 3600 --run "$run_cmd"
