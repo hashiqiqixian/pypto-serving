@@ -3592,7 +3592,6 @@ class V41ResidentResources:
         heads = self.dspark_weights
         markov = {name: heads.full(name) for name in _MARKOV_MODEL_KEYS
                   if name in heads.tensors}
-        markov["final_norm_weight"] = self.final.norm_weight
         markov["lm_head_weight"] = self.final.head_weight
         if phase == "decode":
             ranks, rows = self._stage_dspark_decode(resources, batch)

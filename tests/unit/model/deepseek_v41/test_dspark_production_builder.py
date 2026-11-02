@@ -146,6 +146,11 @@ def test_production_decode_binds_six_rows_counts_outputs_and_current_tables(prod
     assert target["c1a_index_block_table"] is lowered.cache_tables["target_c1a"]
     assert target["logits"] is production.arguments["logits"]
     assert target["sampled_ids"] is production.arguments["sampled_ids"]
+    assert target["final_norm_weight"] is production.resident.final.norm_weight
+    assert lowered.markov_model["final_norm_weight"] is production.resident.dspark_weights.full(
+        "final_norm_weight")
+    assert lowered.markov_model["final_norm_weight"] is not target["final_norm_weight"]
+    assert lowered.markov_model["lm_head_weight"] is production.resident.final.head_weight
     assert torch.count_nonzero(target["logits"]) == 0
     assert bool((target["sampled_ids"] == -1).all())
     assert work["x_hc"].shape[1] == 80
