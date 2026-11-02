@@ -18,6 +18,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from pypto_serving.model.deepseek_v41 import npu_runner
+from pypto_serving.model.common.compiler.l3_callable import L3Callable
 from pypto_serving.model.deepseek_v41.dspark_resources import (
     DSparkResourceLayout,
     V41DSparkLoweringProvider,
@@ -354,3 +355,39 @@ def test_runner_shares_its_request_ledger_with_dspark_resources():
     runner.plan = SimpleNamespace(placement=SimpleNamespace(dp_size=4))
     runner.resources = SimpleNamespace(dspark=object())
     assert runner._request_ledger() is runner.resources.ledger
+
+
+def test_production_registers_each_compiled_object_once():
+    prefill = L3Callable(object(), "prefill")
+    decode = L3Callable(object(), "decode")
+    final = L3Callable(object(), "final")
+    draft = L3Callable(object(), "draft")
+    decode_alias = L3Callable(decode.compiled, "target_decode")
+    assert L3Callable.__hash__ is None
+    namespace = dict(prefill=prefill, decode=decode, final=final, dspark_programs={
+        "target_decode": decode,
+        "dspark_drafter": draft,
+        "decode_alias": decode_alias,
+        "drafter_alias": draft,
+    })
+
+    # Run the production registration assembly without checkpoint staging or
+    # device compilation. Its input handles are the real, unhashable class.
+    source = ast.parse(Path(npu_runner.__file__).read_text(encoding="utf-8"))
+    factory = next(node for node in source.body if isinstance(node, ast.FunctionDef)
+                   and node.name == "make_production_bindings")
+    allocate = next(node for node in factory.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "allocate")
+    end = next(index for index, node in enumerate(allocate.body)
+               if isinstance(node, ast.Assign)
+               and any(isinstance(target, ast.Name) and target.id == "programs"
+                       for target in node.targets))
+    start = end
+    while start and isinstance(allocate.body[start - 1], (ast.Assign, ast.For)):
+        start -= 1
+    assembly = ast.Module(body=allocate.body[start:end + 1], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(assembly), "production_program_registration", "exec"), namespace)
+
+    programs = namespace["programs"]
+    assert tuple(id(program) for program in programs) == tuple(map(id, (prefill, decode, final, draft)))
+    assert sum(program.compiled is decode.compiled for program in programs) == 1

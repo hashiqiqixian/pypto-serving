@@ -4329,7 +4329,10 @@ def make_production_bindings(
             dspark_host.rope_tables["draft_sin"].copy_(decode_host.fields["freqs_sin"])
         # ``target_decode`` deliberately aliases the full decode program above;
         # register each compiled object once with the shared worker.
-        programs = tuple(dict.fromkeys((prefill, decode, final, *dspark_programs.values())))
+        programs_by_id = {}
+        for program in (prefill, decode, final, *dspark_programs.values()):
+            programs_by_id.setdefault(id(program.compiled), program)
+        programs = tuple(programs_by_id.values())
         resident_started = time.perf_counter()
         resident = V41ResidentResources(
             programs, run_config, weight_bank=bank, weight_param_names=decode_names,
