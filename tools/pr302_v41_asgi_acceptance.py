@@ -178,8 +178,8 @@ async def _run(args):
         selected.add("natural_eos")
     summary["selected_cases"] = sorted(selected)
 
-    def event(name, **values):
-        record = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "event": name, **values}
+    def event(event_type, **values):
+        record = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "event": event_type, **values}
         line = json.dumps(record, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         print(line, flush=True)
         with (destination / "events.jsonl").open("a", encoding="utf-8") as handle:
