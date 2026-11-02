@@ -9,6 +9,7 @@
 """Exercise the production DSpark payload builder without compiling a device program."""
 
 import ast
+import ctypes
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ from pypto_serving.model.deepseek_v41 import npu_runner
 from pypto_serving.model.common.compiler.l3_callable import L3Callable
 from pypto_serving.model.deepseek_v41.dspark_resources import (
     DSparkResourceLayout,
+    DSparkHostState,
     V41DSparkLoweringProvider,
     _DRAFT_MODEL_KEYS,
     _MARKOV_MODEL_KEYS,
@@ -349,6 +351,58 @@ def test_private_draft_cache_reserves_all_stable_slots(monkeypatch):
     monkeypatch.setattr(npu_runner, "alloc_device_buffer", allocate)
     ResidentDSparkCache(object(), 4, 256)
     assert shapes == [(4, 3, 24, 128, 1, 512), (4, 3, 24, 128, 1, 16)]
+
+
+@pytest.mark.parametrize("world", (4, 8))
+def test_resident_counts_keep_shared_vector_abi_and_rows_stay_sharded(monkeypatch, world):
+    allocated = {}
+    copies = []
+
+    def allocate(worker, shape, dtype, *, stacked):
+        assert stacked and shape[0] == world and shape[1:], "empty per-device shape"
+        shards = []
+        for rank in range(world):
+            data = torch.empty(shape[1:], dtype=dtype)
+            pointer = data.data_ptr()
+            allocated[pointer] = (rank, data)
+            shards.append(SimpleNamespace(data_ptr=pointer, data=data))
+        return SimpleNamespace(shards=shards)
+
+    def copy_to(destination, source, nbytes, *, dst_offset, worker_id):
+        rank, data = allocated[destination]
+        assert rank == worker_id and dst_offset == 0
+        assert nbytes == data.numel() * data.element_size()
+        copies.append((worker_id, nbytes))
+        ctypes.memmove(destination, source, nbytes)
+
+    monkeypatch.setattr(npu_runner, "alloc_device_buffer", allocate)
+    workspace = {
+        "attention_num_tokens": (torch.arange(world, dtype=torch.int32) * 6).share_memory_(),
+        "moe_num_tokens": (torch.arange(world, dtype=torch.int32) * 6 + 1).share_memory_(),
+        "rows": torch.arange(world * 2, dtype=torch.int32).reshape(world, 2),
+    }
+    state = DSparkHostState(*(torch.zeros(world, 2, dtype=torch.int32) for _ in range(4)))
+    host = SimpleNamespace(
+        layout=SimpleNamespace(dp_size=world), state=state,
+        decode_workspace=workspace, prefill_workspace=workspace,
+        cache_tables={}, rope_tables={}, for_phase=lambda phase: workspace)
+    worker = SimpleNamespace(copy_to=copy_to, free_stacked_tensor=lambda value: None)
+    buffers = ResidentDSparkBuffers(worker, host)
+    try:
+        for name in ("attention_num_tokens", "moe_num_tokens"):
+            assert buffers.prefill_workspace[name] is buffers.decode_workspace[name]
+            assert buffers.decode_workspace[name] is workspace[name]
+            assert workspace[name].shape == (world,)
+            assert workspace[name].is_shared()
+            workspace[name].add_(12)
+            copied = len(copies)
+            buffers.sync(name, phase="prefill")
+            assert len(copies) == copied
+            assert buffers.prefill_workspace[name] is workspace[name]
+        assert all(torch.equal(shard.data, workspace["rows"][rank])
+                   for rank, shard in enumerate(buffers.decode_workspace["rows"].shards))
+    finally:
+        buffers.close()
 
 
 def test_runner_shares_its_request_ledger_with_dspark_resources():

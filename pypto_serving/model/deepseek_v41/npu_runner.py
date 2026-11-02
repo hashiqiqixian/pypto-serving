@@ -3173,12 +3173,18 @@ class ResidentDSparkBuffers:
             raise
 
     def _alloc(self, host):
+        # Counts have the public Tensor[EP] ABI, without a leading shard axis.
+        # Their pre-fork shared storage is replicated by the runtime at dispatch.
+        if host.ndim == 1:
+            return host
         value = alloc_device_buffer(self.worker, tuple(host.shape), host.dtype, stacked=True)
         self._owned.append(value)
         self._copy(host, value)
         return value
 
     def _copy(self, host, device):
+        if device is host:
+            return
         for rank, shard in enumerate(device.shards):
             destination = shard.data_ptr
             if callable(destination):
