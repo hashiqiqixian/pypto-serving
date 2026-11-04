@@ -202,7 +202,7 @@ def backbone_weight_specs(config: Mapping[str, Any]) -> dict[str, TensorSpec]:
             add(f"{base}.hc_{sublayer}_fn", (mix, hc * dim), "F32")
             add(f"{base}.hc_{sublayer}_base", (mix,), "F32")
             add(f"{base}.hc_{sublayer}_scale", (3,), "F32")
-        add(base + ".ffn.gate.weight", (experts, dim), "BF16", "cast_to_fp32_for_routing")
+        add(base + ".ffn.gate.weight", (experts, dim), "BF16")
         add(base + ".ffn.gate.bias", (experts,), "F32")
         for expert_id in range(experts):
             expert(f"{base}.ffn.experts.{expert_id}", routed=True)
