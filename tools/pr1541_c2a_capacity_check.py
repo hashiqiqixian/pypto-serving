@@ -105,7 +105,7 @@ result = run(
         'state_cache': ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
         'latent': ratio_allclose(atol=1e-3, rtol=1e-3, valid_rows=ACTIVE, zero_tail=True),
     },
-    config={'backend_type': 'a5', 'device_id': args.device},
+    config={'backend_type': 'a5', 'device_id': args.device, 'execution_mode': False},
 )
 print(result)
 if not result.passed:
