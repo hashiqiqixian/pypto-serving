@@ -252,7 +252,7 @@ async def _run(args):
     selected = standard_cases if args.cases == "all" else set(args.cases.split(","))
     if args.cases == "none":
         selected = set()
-    if not selected or selected - standard_cases:
+    if selected - standard_cases or (not selected and not args.benchmark_repeats):
         raise ValueError(f"Unknown/unavailable cases: {sorted(selected - standard_cases)}")
     if any(name.startswith("repeat_") or name in ("stream_parity", "final_repeat") for name in selected):
         selected.add("natural_eos")
@@ -301,6 +301,9 @@ async def _run(args):
         "transport": "httpx.ASGITransport; no listener; SSE buffered by transport",
         "native_compile_pool_max_workers": 4,
     })
+    if args.validate_config_only:
+        print("CONFIG PASS: no engine or device worker was started", flush=True)
+        return 0
 
     class ObservedEngine(AsyncLLMEngine):
         """Read-only observation of terminal TokenOutput; all calls delegate unchanged."""
@@ -657,6 +660,7 @@ def main():
                         help="Comma-separated case names; none runs only the configured benchmark")
     parser.add_argument("--compare-results", type=Path)
     parser.add_argument("--use-compile-cache", action="store_true")
+    parser.add_argument("--validate-config-only", action="store_true")
     parser.add_argument("--startup-timeout", type=float, default=2400)
     parser.add_argument("--case-timeout", type=float, default=600)
     parser.add_argument("--shutdown-timeout", type=float, default=180)
