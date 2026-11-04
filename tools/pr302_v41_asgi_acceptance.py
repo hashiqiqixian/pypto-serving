@@ -250,6 +250,8 @@ async def _run(args):
     if args.long_prompt_tokens is not None:
         standard_cases.add("long_prompt")
     selected = standard_cases if args.cases == "all" else set(args.cases.split(","))
+    if args.cases == "none":
+        selected = set()
     if not selected or selected - standard_cases:
         raise ValueError(f"Unknown/unavailable cases: {sorted(selected - standard_cases)}")
     if any(name.startswith("repeat_") or name in ("stream_parity", "final_repeat") for name in selected):
@@ -652,7 +654,7 @@ def main():
     parser.add_argument("--long-prompt-tokens", type=int,
                         help="Add an exact-length chat prompt with a 128-token natural-EOS generation budget")
     parser.add_argument("--cases", default="all",
-                        help="Comma-separated case names, e.g. long_prompt for an isolated 8K check")
+                        help="Comma-separated case names; none runs only the configured benchmark")
     parser.add_argument("--compare-results", type=Path)
     parser.add_argument("--use-compile-cache", action="store_true")
     parser.add_argument("--startup-timeout", type=float, default=2400)
