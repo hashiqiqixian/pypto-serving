@@ -44,8 +44,9 @@ def probe_rank(
         for step in pl.range(INCREMENTS):
             pld.system.notify(signal, peer=rank, offsets=[0, 0], value=1, op=pld.NotifyOp.AtomicAdd)
     with pl.spmd(1, name_hint="read_signal", deps=[updated]):
-        value = pld.tile.remote_load(signal, peer=rank, offsets=[0, 0], shape=[1, 16])
-        observed = pl.tile.store(value, [0, 0], observed)
+        block = pl.tile.get_block_idx()
+        value = pld.tile.remote_load(signal, peer=rank, offsets=[block, 0], shape=[1, 16])
+        observed = pl.tile.store(value, [block, 0], observed)
 
 
 @pl.jit.host
