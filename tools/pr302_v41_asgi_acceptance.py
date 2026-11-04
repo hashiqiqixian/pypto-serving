@@ -24,6 +24,7 @@ import json
 import os
 from pathlib import Path
 import re
+import statistics
 import sys
 import time
 import traceback
@@ -79,10 +80,10 @@ def _render(tokenizer, payload):
                                          **payload["chat_template_kwargs"])
 
 
-def _exact_prompt(tokenizer, target):
+def _exact_prompt(tokenizer, target, *, question=None):
     """Find bounded natural text with exactly the requested rendered token count."""
     prefix = "Read this background and answer the final question. Background:"
-    suffix = "\nFinal question: What is 17 times 19? Answer with the number only."
+    suffix = "\nFinal question: " + (question or "What is 17 times 19? Answer with the number only.")
     for unit in (" x", " a", " 0", " item", " text", "\nx"):
         low, high = 0, target + 16
         while low < high:
@@ -142,6 +143,63 @@ def _parse_response(response, stream):
         raise AssertionError(f"Invalid terminal SSE contract: done={done}, finishes={finishes}, usages={usages}")
     return {"request_id": request_id, "text": "".join(text), "reasoning": "".join(reasoning),
             "finish_reason": finishes[0], "usage": usages[0], "chunks": chunks}
+
+
+async def _benchmark_engine(engine, tokenizer, args, destination, event, idle):
+    """Time token-bearing engine events; ASGI buffering is outside this metric."""
+    from pypto_serving.config.types import GenerateConfig
+    from pypto_serving.serving.engine.async_engine import AsyncLLMEngine
+
+    result = {"scope": "single active request; engine admission to token events; no TCP",
+              "warmups_per_prompt": args.benchmark_warmups, "repeats": args.benchmark_repeats,
+              "output_tokens": args.benchmark_output_tokens, "scenarios": {}}
+    question = ("Explain step by step how to multiply 17 by 19, then describe several ways to "
+                "verify the result. Write a detailed tutorial of at least 300 words.")
+    for length in args.benchmark_prompt_tokens:
+        prompt = _render(tokenizer, _chat_payload(_exact_prompt(tokenizer, length, question=question)))
+        runs = []
+        for iteration in range(args.benchmark_warmups + args.benchmark_repeats):
+            await idle()
+            config = GenerateConfig(max_new_tokens=args.benchmark_output_tokens, temperature=0.0,
+                                    stream=True, ignore_eos=True)
+            request_id = f"bench-{length}-{iteration}"
+            events, terminal = [], None
+            observed = 0
+            start = time.perf_counter()
+            outputs = AsyncLLMEngine.add_request(engine, request_id, prompt, config)
+            async with contextlib.aclosing(outputs):
+                async for output in outputs:
+                    now = time.perf_counter()
+                    if output.completion_tokens > observed:
+                        events.append({"seconds": now - start, "tokens": output.completion_tokens})
+                        observed = output.completion_tokens
+                    if output.finished:
+                        terminal = output
+            if terminal is None or terminal.completion_tokens != args.benchmark_output_tokens:
+                raise AssertionError(f"Benchmark did not generate the fixed output length: {terminal}")
+            if len(events) < 2:
+                raise AssertionError("Engine events were buffered; TTFT/TPOT cannot be measured")
+            first, last = events[0]["seconds"], events[-1]["seconds"]
+            tpot = (last - first) / (terminal.completion_tokens - 1)
+            warmup = iteration < args.benchmark_warmups
+            record = {"warmup": warmup, "iteration": iteration, "prompt_tokens": length,
+                      "output_tokens": terminal.completion_tokens, "ttft_ms": first * 1000,
+                      "tpot_ms": tpot * 1000, "decode_tokens_per_second": 1 / tpot,
+                      "last_token_seconds": last, "events": events, "text": terminal.text,
+                      "token_ids": list(terminal.token_ids),
+                      "eos_tokens": list(terminal.token_ids).count(tokenizer.eos_token_id)}
+            runs.append(record)
+            event("benchmark_sample", prompt_tokens=length, warmup=warmup,
+                  ttft_ms=record["ttft_ms"], tpot_ms=record["tpot_ms"])
+        measured = [row for row in runs if not row["warmup"]]
+        result["scenarios"][str(length)] = {
+            "median_ttft_ms": statistics.median(row["ttft_ms"] for row in measured),
+            "median_tpot_ms": statistics.median(row["tpot_ms"] for row in measured),
+            "median_decode_tokens_per_second": statistics.median(row["decode_tokens_per_second"] for row in measured),
+            "runs": runs,
+        }
+        _write_json(destination / "benchmark.json", result)
+    return result
 
 
 async def _run(args):
@@ -347,7 +405,9 @@ async def _run(args):
 
     try:
         event("engine_start", mode=args.mode, prompt_token_counts=rendered_counts)
+        startup_started = time.perf_counter()
         await asyncio.wait_for(engine.start(), args.startup_timeout)
+        summary["startup_seconds"] = time.perf_counter() - startup_started
         await idle()
         event("engine_ready", mode=args.mode)
         baseline = await case("natural_eos", lambda: request(_chat_payload(questions["arithmetic"]), natural_eos=True, answer="323"))
@@ -513,6 +573,11 @@ async def _run(args):
                     return result
                 await case(f"non_greedy_400_{'stream' if stream else 'plain'}", reject)
         await case("final_repeat", repeat)
+        if args.benchmark_repeats:
+            summary["benchmark"] = await asyncio.wait_for(
+                _benchmark_engine(engine, tokenizer, args, destination, event, idle),
+                args.benchmark_timeout,
+            )
         summary["passed"] = all(record["passed"] for record in summary["cases"].values())
         if args.compare_results is not None:
             other = json.loads(args.compare_results.read_text(encoding="utf-8"))
@@ -573,7 +638,17 @@ def main():
     parser.add_argument("--startup-timeout", type=float, default=2400)
     parser.add_argument("--case-timeout", type=float, default=600)
     parser.add_argument("--shutdown-timeout", type=float, default=180)
+    parser.add_argument("--benchmark-repeats", type=int, default=0)
+    parser.add_argument("--benchmark-warmups", type=int, default=1)
+    parser.add_argument("--benchmark-prompt-tokens", type=int, nargs="+", default=[128, 1024])
+    parser.add_argument("--benchmark-output-tokens", type=int, default=64)
+    parser.add_argument("--benchmark-timeout", type=float, default=600)
     args = parser.parse_args()
+    if args.benchmark_repeats < 0 or args.benchmark_warmups < 0 or args.benchmark_output_tokens < 2:
+        parser.error("Invalid benchmark sample counts or output length")
+    if any(length < 128 or length + args.benchmark_output_tokens > args.max_model_len
+           for length in args.benchmark_prompt_tokens):
+        parser.error("Benchmark prompt/output length is outside the configured model capacity")
     if min(args.startup_timeout, args.case_timeout, args.shutdown_timeout) <= 0:
         parser.error("Timeouts must be positive")
     if args.max_model_len < 192:
