@@ -20,8 +20,8 @@ parser.add_argument('--lib-root', type=Path, required=True)
 parser.add_argument('-d', '--device', type=int, required=True)
 args = parser.parse_args()
 sys.path.insert(0, str(args.lib_root / 'models/deepseek_v4_1_flash'))
-from compressor import COMPRESSED_CACHE_GROUP, HEAD_DIM, ROPE_DIM, c2a_compressor_publish, golden_c2a_compressor
-from config import MOE_TOKENS, STATE_CAPACITY, STATE_WIDTH
+from compressor import COMPRESSED_CACHE_GROUP, HEAD_DIM, ROPE_DIM, STATE_WIDTH, c2a_compressor_publish, golden_c2a_compressor
+from config import MOE_TOKENS, STATE_CAPACITY
 from golden import TensorSpec, ratio_allclose, run
 from quant import pack_bf16_nz
 
