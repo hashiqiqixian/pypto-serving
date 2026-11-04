@@ -3852,6 +3852,7 @@ class V41ResidentResources:
                 f"missing={sorted(required - supplied)} extra={sorted(supplied - required)}"
             )
         bound = arguments
+        reset_windows = False
         if stage == "dspark_drafter":
             module = importlib.import_module("models.deepseek_v4_1_flash.dspark_drafter")
             batch = int(arguments["head_hidden"].shape[1])
@@ -3859,14 +3860,26 @@ class V41ResidentResources:
             stride = chunks * module.DSPARK_DRAFT_LAYERS
             key = id(program.compiled)
             epoch = self._dspark_drafter_epochs.get(key, 1)
+            # The pinned A5 int32 AtomicAdd signal stops advancing at 2048.
+            # Reuse the prefill epoch bound before a three-layer call crosses it.
+            reset_windows = epoch + stride - 1 > 512
+            if reset_windows:
+                epoch = 1
             if epoch + stride - 1 > (2**31 - 1) // 2:
                 raise OverflowError("DSpark communication epoch exhausted; recreate worker")
             # These windows persist across both bootstrap and decode. Allocate
             # epochs at dispatch, so repeated lowering cannot consume them and
             # replaying an already lowered payload cannot reuse old signals.
             bound = dict(arguments, attention_epoch=epoch, moe_epoch=epoch)
-        self.worker.run(program.compiled,
-                        *(bound[name] for name in param_names), config=self.run_config)
+        if reset_windows:
+            previous_reset = self.worker._reset_persistent_windows
+            self.worker._reset_persistent_windows = True
+        try:
+            self.worker.run(program.compiled,
+                            *(bound[name] for name in param_names), config=self.run_config)
+        finally:
+            if reset_windows:
+                self.worker._reset_persistent_windows = previous_reset
         if stage == "dspark_drafter":
             self._dspark_drafter_epochs[key] = epoch + stride
 
