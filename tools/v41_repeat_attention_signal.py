@@ -18,6 +18,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--lib-root", type=Path, required=True)
 parser.add_argument("--devices", required=True)
 parser.add_argument("--rounds", type=int, default=600)
+parser.add_argument("--compile-only", action="store_true")
 args = parser.parse_args()
 devices = [int(value) for value in args.devices.split(",")]
 sys.path.insert(0, str(args.lib_root))
@@ -39,7 +40,7 @@ assert TP_SIZE == 1 and args.rounds > 0
 torch.set_num_threads(1)
 
 
-@pl.jit.inline(auto_scope=False)
+@pl.jit
 def repeat_rank(
     source: pl.Tensor[[ROWS, D], pl.BF16],
     output: pl.Out[pl.Tensor[[LAYERS, ROWS, D], pl.BF16]],
@@ -55,7 +56,7 @@ def repeat_rank(
         )
 
 
-@pl.jit
+@pl.jit.host
 def repeat(
     source: pl.Tensor[[WORLD, ROWS, D], pl.BF16],
     output: pl.Out[pl.Tensor[[WORLD, LAYERS, ROWS, D], pl.BF16]],
@@ -84,6 +85,9 @@ config = {
 result = run(fn=repeat, specs=specs, config=config, compile_only=True)
 if not result.passed:
     raise RuntimeError(result.error)
+if args.compile_only:
+    print(f"COMPILE PASS: {result.work_dir}", flush=True)
+    raise SystemExit(0)
 cfg = normalize_config(config)
 compiled = DistributedCompiledProgram.from_dir(
     result.work_dir, backend_type=cfg.backend_type, execution_mode=cfg.execution_mode,
