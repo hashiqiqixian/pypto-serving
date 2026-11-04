@@ -1305,11 +1305,6 @@ def load_prepacked_bank(model_dir, layout, parameter_names, *, path=None):
         tensors = _map_shared_prepacked_tensors(fd, _ALL)
         for name, dtype in float8_fields.items():
             tensors[name] = tensors[name].view(_FLOAT8[dtype])
-        gate_weight = tensors["gate_weight"]
-        if gate_weight.dtype == torch.float32:
-            tensors["gate_weight"] = gate_weight.to(torch.bfloat16).share_memory_()
-        elif gate_weight.dtype != torch.bfloat16:
-            raise ValueError("V4.1 sidecar router weights must be FP32 or BF16")
         bank = DecodeWeightBank(layout)
         bank.tensors = tensors
         bank.allocated_bytes = sum(value.numel() * value.element_size() for value in tensors.values())

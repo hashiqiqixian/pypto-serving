@@ -544,7 +544,7 @@ class V41DSparkWeightContract:
                 result[abi_name] = pack_nz(weight)
                 result[abi_name + "_scale"] = scale
             elif suffix == "ffn.gate.weight":
-                result[abi_name] = value.to(torch.bfloat16).contiguous()
+                result[abi_name] = value.float().contiguous()
             else:
                 result[abi_name] = value.contiguous()
 
