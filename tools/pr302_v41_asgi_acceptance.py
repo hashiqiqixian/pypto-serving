@@ -155,16 +155,26 @@ async def _benchmark_engine(engine, tokenizer, args, destination, event, idle):
               "output_tokens": args.benchmark_output_tokens, "scenarios": {}}
     question = ("Explain step by step how to multiply 17 by 19, then describe several ways to "
                 "verify the result. Write a detailed tutorial of at least 300 words.")
-    for length in args.benchmark_prompt_tokens:
-        prompt = _render(tokenizer, _chat_payload(_exact_prompt(tokenizer, length, question=question)))
+    respect_eos = args.benchmark_respect_eos or args.benchmark_output_tokens == 0
+    result.update(question=question if args.benchmark_raw_prompt is None else None,
+                  raw_prompt=args.benchmark_raw_prompt, ignore_eos=not respect_eos)
+    lengths = ([len(tokenizer.encode(args.benchmark_raw_prompt))]
+               if args.benchmark_raw_prompt is not None else args.benchmark_prompt_tokens)
+    for length in lengths:
+        prompt = (args.benchmark_raw_prompt if args.benchmark_raw_prompt is not None else
+                  _render(tokenizer, _chat_payload(_exact_prompt(tokenizer, length, question=question))))
+        output_budget = args.benchmark_output_tokens or args.max_model_len - length
+        if length < 1 or output_budget < 2 or length + output_budget > args.max_model_len:
+            raise ValueError("Benchmark prompt/output length is outside model capacity")
         runs = []
         for iteration in range(args.benchmark_warmups + args.benchmark_repeats):
             await idle()
-            config = GenerateConfig(max_new_tokens=args.benchmark_output_tokens, temperature=0.0,
-                                    stream=True, ignore_eos=True)
+            config = GenerateConfig(max_new_tokens=output_budget, temperature=0.0,
+                                    stream=True, ignore_eos=not respect_eos)
             request_id = f"bench-{length}-{iteration}"
             events, terminal = [], None
             observed = 0
+            saved_tokens = 0
             start = time.perf_counter()
             outputs = AsyncLLMEngine.add_request(engine, request_id, prompt, config)
             async with contextlib.aclosing(outputs):
@@ -173,9 +183,17 @@ async def _benchmark_engine(engine, tokenizer, args, destination, event, idle):
                     if output.completion_tokens > observed:
                         events.append({"seconds": now - start, "tokens": output.completion_tokens})
                         observed = output.completion_tokens
+                    if args.benchmark_raw_prompt is not None and (output.finished or observed - saved_tokens >= 64):
+                        _write_json(destination / f"{request_id}-progress.json", {
+                            "completion_tokens": observed, "text": output.text, "finished": output.finished,
+                            "finish_reason": output.finish_reason, "elapsed_seconds": now - start,
+                        })
+                        saved_tokens = observed
                     if output.finished:
                         terminal = output
-            if terminal is None or terminal.completion_tokens != args.benchmark_output_tokens:
+            if terminal is None or not 2 <= terminal.completion_tokens <= output_budget:
+                raise AssertionError(f"Benchmark did not generate a measurable output: {terminal}")
+            if not respect_eos and terminal.completion_tokens != output_budget:
                 raise AssertionError(f"Benchmark did not generate the fixed output length: {terminal}")
             if len(events) < 2:
                 raise AssertionError("Engine events were buffered; TTFT/TPOT cannot be measured")
@@ -187,6 +205,8 @@ async def _benchmark_engine(engine, tokenizer, args, destination, event, idle):
                       "tpot_ms": tpot * 1000, "decode_tokens_per_second": 1 / tpot,
                       "last_token_seconds": last, "events": events, "text": terminal.text,
                       "token_ids": list(terminal.token_ids),
+                      "finish_reason": terminal.finish_reason,
+                      "output_token_budget": output_budget,
                       "eos_tokens": list(terminal.token_ids).count(tokenizer.eos_token_id)}
             runs.append(record)
             event("benchmark_sample", prompt_tokens=length, warmup=warmup,
@@ -641,13 +661,19 @@ def main():
     parser.add_argument("--benchmark-repeats", type=int, default=0)
     parser.add_argument("--benchmark-warmups", type=int, default=1)
     parser.add_argument("--benchmark-prompt-tokens", type=int, nargs="+", default=[128, 1024])
-    parser.add_argument("--benchmark-output-tokens", type=int, default=64)
+    parser.add_argument("--benchmark-output-tokens", type=int, default=64,
+                        help="0 uses remaining model context capacity and permits natural EOS")
+    parser.add_argument("--benchmark-raw-prompt",
+                        help="Exact raw prompt; bypass chat template and padding")
+    parser.add_argument("--benchmark-respect-eos", action="store_true")
     parser.add_argument("--benchmark-timeout", type=float, default=600)
     args = parser.parse_args()
-    if args.benchmark_repeats < 0 or args.benchmark_warmups < 0 or args.benchmark_output_tokens < 2:
+    if (args.benchmark_repeats < 0 or args.benchmark_warmups < 0
+            or args.benchmark_output_tokens < 0 or args.benchmark_output_tokens == 1):
         parser.error("Invalid benchmark sample counts or output length")
-    if any(length < 128 or length + args.benchmark_output_tokens > args.max_model_len
-           for length in args.benchmark_prompt_tokens):
+    if args.benchmark_raw_prompt is None and any(
+            length < 128 or length + args.benchmark_output_tokens > args.max_model_len
+            for length in args.benchmark_prompt_tokens):
         parser.error("Benchmark prompt/output length is outside the configured model capacity")
     if min(args.startup_timeout, args.case_timeout, args.shutdown_timeout) <= 0:
         parser.error("Timeouts must be positive")
