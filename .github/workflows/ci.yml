@@ -89,6 +89,7 @@ jobs:
         with:
           checkout-path: dist-checkout
           needs-device: 'true'
+          runtime-platform: a2a3
           toolchain: bundle
           # CI_CACHE_ROOT is shared with pypto and pypto-lib, whose jobs already
           # claim `serving` / `pip-serving`. Name both after this repo so the two
@@ -188,11 +189,15 @@ jobs:
         with:
           checkout-path: dist-checkout
           needs-device: 'true'
+          runtime-platform: a5
           toolchain: bundle
           build-namespace: pypto-serving-v41-a5
           pip-cache-name: pip-pypto-serving-v41-a5
 
-      - name: Run V4.1 DP4 HTTP answer guard
+      - name: Run V4.1 DSpark HTTP guard (K=5, one 4-card server)
+        env:
+          # Cold K5 startup compiles the draft programs and stages real weights.
+          PYPTO_WORKER_INIT_TIMEOUT: '3600'
         run: |
           source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
           run_cmd="cd $GITHUB_WORKSPACE/dist-checkout"
@@ -200,9 +205,10 @@ jobs:
           run_cmd="$run_cmd && TASK_DEVICE=\$TASK_DEVICE"
           run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout"
           run_cmd="$run_cmd PYPTO_DSV41_MODEL_DIR=$PYPTO_DSV41_MODEL_DIR"
-          run_cmd="$run_cmd python -m pytest tests/test_deepseek_v41_serving.py::test_v41_dp4_http_answer -q -s"
+          run_cmd="$run_cmd PYPTO_WORKER_INIT_TIMEOUT=$PYPTO_WORKER_INIT_TIMEOUT"
+          run_cmd="$run_cmd python -m pytest 'tests/test_deepseek_v41_serving.py::test_v41_dp4_http_answer[k5]' -q -s"
           task-submit --device auto --device-num 4 \
-            --timeout 3600 --max-time 3600 --run "$run_cmd"
+            --timeout 4500 --max-time 4500 --run "$run_cmd"
 
       - name: Kill orphaned task-submit tasks
         if: always()
