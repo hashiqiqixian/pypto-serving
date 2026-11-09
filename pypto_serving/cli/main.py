@@ -111,11 +111,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-model-len", type=int, default=1024, help="Maximum sequence length (prompt + generated; default: 1024).")
     parser.add_argument("--block-size", type=int, default=128, help="KV cache block size (default: 128).")
     parser.add_argument(
-        "--use-compile-cache",
-        action="store_true",
-        help="Reuse compiled V4.1 lib programs when the build cache matches.",
-    )
-    parser.add_argument(
         "--npu-memory-utilization",
         type=float,
         default=0.90,
@@ -443,7 +438,6 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         device_ids=devices,
         parallel_config=parallel,
         executor_cls=_executor_cls_for_model_family("deepseek_v41"),
-        executor_kwargs={"use_compile_cache": args.use_compile_cache},
         runtime_config=runtime,
         profile_config=_build_profile_config(args),
         max_num_running_reqs=args.max_num_seqs,

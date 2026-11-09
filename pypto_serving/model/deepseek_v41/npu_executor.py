@@ -145,7 +145,7 @@ class DeepSeekV41DirectoryLoader(SafetensorsDirectoryLoader):
 class DeepSeekV41PyptoExecutor(ModelExecutor):
     """Shared worker interface with a synchronous, collective V4.1 runner."""
     def __init__(self, kv_cache_manager=None, *, platform="a5", device_ids=tuple(range(8)),
-                 pypto_build_dir=None, use_compile_cache=False, bindings=None,
+                 pypto_build_dir=None, bindings=None,
                  dspark_lowering_provider: DSparkLoweringProvider | None = None):
         super().__init__(kv_cache_manager)
         if platform != "a5":
@@ -156,7 +156,6 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         self._failed_runners = []
         self.platform = platform
         self.pypto_build_dir = pypto_build_dir
-        self.use_compile_cache = use_compile_cache
         self.dspark_lowering_provider = dspark_lowering_provider
 
     def register_model(self, model_id, record):
@@ -186,7 +185,7 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         )
         runner = V41ModelRunner(
             plan, bindings, device_ids=self.device_ids, runtime=record.runtime,
-            build_options=BuildOptions(self.platform, self.pypto_build_dir, self.use_compile_cache),
+            build_options=BuildOptions(self.platform, self.pypto_build_dir),
         )
         try:
             pages = runner.preflight()
