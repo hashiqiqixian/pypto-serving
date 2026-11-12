@@ -953,7 +953,8 @@ def load_segment_modules(lib_root, topology):
         config = importlib.import_module(package + ".config")
         if Path(config.__file__).resolve() != expected:
             raise RuntimeError("import resolved to a different lib checkout")
-        if (config.TP_SIZE, config.EP_SIZE, config.MOE_TOKENS) != (
+        lib_tp = getattr(config, "TP_SIZE", getattr(config, "LM_HEAD_TP_SIZE", 1))
+        if (lib_tp, config.EP_SIZE, config.MOE_TOKENS) != (
             topology.tp, topology.world, topology.local_capacity
         ):
             raise ValueError("lib topology/MOE_TOKENS disagrees with the segment capacity")
@@ -3229,10 +3230,11 @@ class V41ResidentResources:
         runner = _DSparkOrchestratorRunner(self, phase)
         try:
             kwargs = dict(
-                attention_epoch=lowered.attention_epoch,
                 moe_epoch=lowered.moe_epoch,
                 logits_epoch=lowered.logits_epoch,
             )
+            if "attention_epoch" in inspect.signature(function).parameters:
+                kwargs["attention_epoch"] = lowered.attention_epoch
             if phase == "prefill":
                 function(
                     runner, lowered.state, lowered.workspace, lowered.draft_model,
@@ -3518,14 +3520,15 @@ def selected_decode_topology(lib_root=None, *, dp_size=None):
             continue
         target = statement.targets[0]
         if not isinstance(target, ast.Name) or target.id not in (
-                "MAX_BATCH_PER_DP", "DSPARK_SPEC_TOKENS", "DECODE_ROWS_PER_REQUEST"):
+                "MAX_BATCH_PER_DP", "DSPARK_SPEC_TOKENS", "DECODE_ROWS_PER_REQUEST",
+                "DECODE_BATCH", "DECODE_SEQ"):
             continue
         if target.id in values:
             raise MissingCompositeInterface(f"duplicate V4.1 lib decode config: {target.id}")
         values[target.id] = statement.value
-    batch = values.get("MAX_BATCH_PER_DP")
+    batch = values.get("DECODE_BATCH", values.get("MAX_BATCH_PER_DP"))
     spec = values.get("DSPARK_SPEC_TOKENS")
-    rows = values.get("DECODE_ROWS_PER_REQUEST")
+    rows = values.get("DECODE_SEQ", values.get("DECODE_ROWS_PER_REQUEST"))
     if (not isinstance(batch, ast.Constant) or type(batch.value) is not int or batch.value != 12
             or not isinstance(spec, ast.Constant) or type(spec.value) is not int or spec.value != 5
             or not isinstance(rows, ast.BinOp) or not isinstance(rows.op, ast.Add)
