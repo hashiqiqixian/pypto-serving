@@ -1157,14 +1157,14 @@ def compile_decode_fwd_dspark(compiler, lib_root, topology):
     load_segment_modules(lib_root, topology)
     module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd_dspark")
     entries = {"decode": module.l3_decode_fwd_dspark}
-    state = importlib.import_module("models.deepseek_v4_1_flash.dspark_state")
+    state = importlib.import_module("models.deepseek_v4_1_flash.dspark_init")
     entries.update({name.removeprefix("l3_"): getattr(state, name) for name in (
         "l3_bootstrap_inputs", "l3_publish_bootstrap",
         "l3_prepare_prefill_drafter_geometry")})
     entries["dspark_drafter"] = importlib.import_module(
         "models.deepseek_v4_1_flash.dspark_drafter").l3_dspark_drafter
     entries["markov_sample"] = importlib.import_module(
-        "models.deepseek_v4_1_flash.dspark_markov").l3_markov_sample_from_hidden
+        "models.deepseek_v4_1_flash.markov").l3_markov_output
     programs = {}
     param_names = {}
     for name, entry in entries.items():
@@ -3341,7 +3341,9 @@ class V41ResidentResources:
                     "V4.1 DSpark lowering is missing mappings: " + ", ".join(missing)
                 )
             try:
-                module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd_dspark")
+                module = importlib.import_module("models.deepseek_v4_1_flash.dspark_init"
+                                                  if phase == "prefill"
+                                                  else "models.deepseek_v4_1_flash.decode_fwd_dspark")
                 function = (module.prefill_bootstrap_dspark if phase == "prefill"
                             else module.decode_fwd_dspark)
             except (ImportError, AttributeError) as exc:
