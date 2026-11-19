@@ -1163,6 +1163,8 @@ def compile_decode_fwd_dspark(compiler, lib_root, topology):
         "l3_prepare_prefill_drafter_geometry")})
     entries["dspark_drafter"] = importlib.import_module(
         "models.deepseek_v4_1_flash.dspark_drafter").l3_dspark_drafter
+    entries["prefill_context_kv"] = importlib.import_module(
+        "models.deepseek_v4_1_flash.dspark_drafter").l3_dspark_prefill_context_kv
     entries["markov_sample"] = importlib.import_module(
         "models.deepseek_v4_1_flash.markov").l3_markov_output
     programs = {}
