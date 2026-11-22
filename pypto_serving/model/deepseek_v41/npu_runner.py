@@ -2116,11 +2116,12 @@ class InputStateRuntime:
             self.close()
             raise
 
-    def stage(self, embeddings: torch.Tensor, step: ForwardStep) -> tuple[LayerState, SegmentInputs]:
+    def stage(self, embeddings: torch.Tensor, step: ForwardStep, *, packed=None) -> tuple[LayerState, SegmentInputs]:
         with profile_span('v41.InputStateRuntime.stage', cat='v41.host', level='verbose'):
             if self.failed:
                 raise RuntimeError("input upload failed; recreate the worker before reuse")
-            packed = prepare_segment_inputs(embeddings, step, self.host.topology)
+            if packed is None:
+                packed = prepare_segment_inputs(embeddings, step, self.host.topology)
             self.host.residual.copy_(packed.residual)
             self.host.pre_mix.copy_(packed.pre_mix)
             try:
@@ -2298,7 +2299,7 @@ class PrefillMetadataResources:
                     self.fields["compressed_rope_sin"].copy_(rows[1])
             return swa.group_counts
 
-    def stage_full(self, step, embeddings, engram=None):
+    def stage_full(self, step, embeddings, engram=None, *, packed=None):
         """Lower one chunk into the two-stage lib prefill ABI using scheduler pages."""
         with profile_span('v41.PrefillMetadataResources.stage_full', cat='v41.host', level='verbose'):
             if self.full_hidden_size is None:
@@ -2306,7 +2307,8 @@ class PrefillMetadataResources:
             if embeddings.shape[-1] != self.full_hidden_size:
                 raise ValueError("full prefill embedding width disagrees with the checkpoint")
             counts = self.stage(step, engram)
-            packed = prepare_segment_inputs(embeddings, step, self.topology)
+            if packed is None:
+                packed = prepare_segment_inputs(embeddings, step, self.topology)
             f = self.fields
             f["full_embedding"].zero_()
             active = packed.row_indices >= 0
@@ -3341,13 +3343,17 @@ class V41ResidentResources:
                 for partition in padding_partitions:
                     self.cache.reset_padding(partition)
             host = self.prefill_host if step.phase == "prefill" else self.decode_host
-            counts = (host.stage_full(dispatch_step, embeddings, self.engram_host)
-                      if step.phase == "prefill" and self._prefill_fwd is not None else
-                      host.stage(dispatch_step, self.engram_host) if host is not None else None)
             input_runtime = self.decode_input if step.phase == "decode" else self.input
             if input_runtime is None:
                 raise ValueError("decode requires its own TP-local input capacity")
-            state, inputs = input_runtime.stage(embeddings, dispatch_step)
+            packed = None
+            if step.phase == "prefill" and self._prefill_fwd is not None:
+                if host.topology == input_runtime.host.topology:
+                    packed = prepare_segment_inputs(embeddings, dispatch_step, host.topology)
+                counts = host.stage_full(dispatch_step, embeddings, self.engram_host, packed=packed)
+            else:
+                counts = host.stage(dispatch_step, self.engram_host) if host is not None else None
+            state, inputs = input_runtime.stage(embeddings, dispatch_step, packed=packed)
             if dispatch_step is not step:
                 inputs = replace(inputs, request_last_rows=inputs.request_last_rows[:len(step.requests)])
             self._output_rows = prepare_final_output_rows(
