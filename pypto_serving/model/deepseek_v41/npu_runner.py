@@ -1678,6 +1678,7 @@ def prepare_segment_inputs(
     topology: SegmentTopology,
     *,
     max_prepare_bytes: int = 4 << 30,
+    broadcast_hc: bool = False,
 ) -> SegmentInputs:
     """Pack fresh embedding inputs without depending on request batch order.
 
@@ -1721,12 +1722,13 @@ def prepare_segment_inputs(
         hidden = embeddings.shape[1]
         # Include output storage and the largest temporary expanded FP32 row block.
         allocated_rows = topology.world * topology.local_capacity
-        estimate = allocated_rows * (4 * hidden * 4 + 4 * 4 + 8) + offset * hidden * 4
+        stored_lanes = 1 if broadcast_hc else 4
+        estimate = allocated_rows * (stored_lanes * hidden * 4 + 4 * 4 + 8) + offset * hidden * 4
         if estimate > max_prepare_bytes:
             raise ValueError(f"segment preparation requires estimated {estimate} bytes; budget={max_prepare_bytes}")
         if not bool(torch.isfinite(embeddings).all()):
             raise ValueError("embeddings must be finite")
-        residual = torch.zeros(topology.dp, topology.capacity, 4, hidden, dtype=torch.float32)
+        residual = torch.zeros(topology.dp, topology.capacity, stored_lanes, hidden, dtype=torch.float32)
         pre_mix = torch.zeros(topology.dp, topology.capacity, 4, dtype=torch.float32)
         row_indices = torch.full((topology.dp, topology.capacity), -1, dtype=torch.int64)
         for partition, start, source, count in source_ranges:
@@ -1734,7 +1736,7 @@ def prepare_segment_inputs(
             pre_mix[partition, start:start + count, 0] = 1
             row_indices[partition, start:start + count] = torch.arange(source, source + count)
         return SegmentInputs(
-            residual.reshape(topology.world, topology.local_capacity, 4, hidden),
+            residual.reshape(topology.world, topology.local_capacity, stored_lanes, hidden).expand(-1, -1, 4, -1),
             pre_mix.reshape(topology.world, topology.local_capacity, 4),
             row_indices.reshape(topology.world, topology.local_capacity),
             tuple(last_rows), tuple(counts),
@@ -3349,7 +3351,7 @@ class V41ResidentResources:
             packed = None
             if step.phase == "prefill" and self._prefill_fwd is not None:
                 if host.topology == input_runtime.host.topology:
-                    packed = prepare_segment_inputs(embeddings, dispatch_step, host.topology)
+                    packed = prepare_segment_inputs(embeddings, dispatch_step, host.topology, broadcast_hc=True)
                 counts = host.stage_full(dispatch_step, embeddings, self.engram_host, packed=packed)
             else:
                 counts = host.stage(dispatch_step, self.engram_host) if host is not None else None
