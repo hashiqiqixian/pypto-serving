@@ -15,10 +15,11 @@ from run import CompilePool
 device_runner.ThreadPoolExecutor = CompilePool
 lib = Path(os.environ["PYPTO_LIB_ROOT"])
 slab = int(os.environ["PREFILL_SLAB"])
+capacity = int(os.environ.get("PREFILL_CAPACITY", "512"))
 load_segment_modules(lib, selected_decode_topology(lib, dp_size=4))
-sys.argv = [sys.argv[0], "--ep", "4", "--dp", "4", "--capacity", "512", "--moe-tokens", str(slab)]
+sys.argv = [sys.argv[0], "--ep", "4", "--dp", "4", "--capacity", str(capacity), "--moe-tokens", str(slab)]
 mod = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd")
-assert (mod.CAPACITY, mod.RANKS, mod.MOE_TOKENS) == (512, 4, slab)
+assert (mod.CAPACITY, mod.RANKS, mod.MOE_TOKENS) == (capacity, 4, slab)
 assert sys.modules["prefill_moe"].MOE_TOKENS == slab
 cfg = build_pypto_run_config(platform="a5", device_ids=[0, 1, 2, 3], pypto_build_dir=None)
 cfg = replace(cfg, ring_heap=(1073741824, 2147483648, 4294967296, 1073741824), ring_dep_pool=262144)
