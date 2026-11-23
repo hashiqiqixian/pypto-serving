@@ -9,6 +9,8 @@ from pathlib import Path
 import statistics
 import sys
 import time
+import faulthandler
+import signal
 
 
 class CompilePool(ThreadPoolExecutor):
@@ -17,6 +19,7 @@ class CompilePool(ThreadPoolExecutor):
 
 
 def bounded_worker(*args):
+    faulthandler.register(signal.SIGUSR1)
     import torch
     from pypto.runtime import device_runner
     from pypto_serving.serving.server import serving_worker
@@ -134,7 +137,25 @@ async def main():
         (destination/'metadata.json').write_text(json.dumps(metadata, indent=2))
         for repeat in (-1, 0, 1):
             for case in cases:
-                await asyncio.wait_for(measure(case, repeat), timeout=180)
+                measurement = asyncio.create_task(measure(case, repeat))
+                core = engine.single_core()
+                done, _ = await asyncio.wait([measurement, core._loop_task], timeout=60,
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if core._loop_task in done:
+                    core._loop_task.result()
+                    raise RuntimeError('Engine loop exited before request completion')
+                if measurement not in done:
+                    print('STALLED_SCHEDULER_CONFIG', core.scheduler.config, flush=True)
+                    print('STALLED_BATCH_QUEUE', list(core._batch_queue), flush=True)
+                    for queue_name in ('waiting', 'running'):
+                        print('STALLED_REQUESTS', queue_name, [
+                            {key: getattr(request, key, None) for key in (
+                                'request_id', 'status', 'num_computed_tokens', 'num_prompt_tokens',
+                                'prefill_complete', 'terminal_prefill_in_flight', 'scheduling_held')}
+                            for request in getattr(core.scheduler, queue_name)], flush=True)
+                    core._loop_task.print_stack()
+                    os.kill(core._worker_process.pid, signal.SIGUSR1)
+                await asyncio.wait_for(measurement, timeout=120)
     finally:
         await asyncio.wait_for(engine.stop(), timeout=120)
     assert len(rows) == 32
