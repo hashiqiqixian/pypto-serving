@@ -3353,7 +3353,13 @@ class V41ResidentResources:
                 counts = host.stage_full(dispatch_step, embeddings, self.engram_host, packed=packed)
             else:
                 counts = host.stage(dispatch_step, self.engram_host) if host is not None else None
-            state, inputs = input_runtime.stage(embeddings, dispatch_step, packed=packed)
+            if packed is not None:
+                # The full prefill graph reads full_embedding from its own
+                # host binding. The segmented device inputs have no consumer.
+                inputs = packed
+                state = LayerState(inputs.residual, inputs.pre_mix, "tp_local_token")
+            else:
+                state, inputs = input_runtime.stage(embeddings, dispatch_step)
             if dispatch_step is not step:
                 inputs = replace(inputs, request_last_rows=inputs.request_last_rows[:len(step.requests)])
             self._output_rows = prepare_final_output_rows(
