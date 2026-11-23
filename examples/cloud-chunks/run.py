@@ -46,6 +46,9 @@ def bounded_worker(*args):
         return L3Callable(program, name, cfg.distributed_config.aicpu_thread_num)
 
     KernelCompiler.compile = restore
+    if os.environ.get("BENCH_TAIL_PREFILL_DIR"):
+        from prefill_tail import install
+        install(Path(os.environ["BENCH_TAIL_PREFILL_DIR"]))
     serving_worker._worker_entry(*args)
 
 

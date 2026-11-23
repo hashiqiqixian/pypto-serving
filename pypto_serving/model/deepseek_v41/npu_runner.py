@@ -3348,8 +3348,7 @@ class V41ResidentResources:
                 raise ValueError("decode requires its own TP-local input capacity")
             packed = None
             if step.phase == "prefill" and self._prefill_fwd is not None:
-                if host.topology == input_runtime.host.topology:
-                    packed = prepare_segment_inputs(embeddings, dispatch_step, host.topology)
+                packed = prepare_segment_inputs(embeddings, dispatch_step, host.topology)
                 counts = host.stage_full(dispatch_step, embeddings, self.engram_host, packed=packed)
             else:
                 counts = host.stage(dispatch_step, self.engram_host) if host is not None else None
