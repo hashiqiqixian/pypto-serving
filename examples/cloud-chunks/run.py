@@ -33,6 +33,8 @@ def bounded_worker(*args):
     root = Path('/data/pyptouser/chenshenai/tasks/pypto-official-chunks-20261123')
     artifacts = json.loads((root/'compiled-80.json').read_text())
     artifacts.update(json.loads((root/f'compiled-{os.environ["PERF_CHUNK"]}.json').read_text()))
+    if os.environ.get('DECODE_MANIFEST'):
+        artifacts.update(json.loads(Path(os.environ['DECODE_MANIFEST']).read_text()))
 
     def restore(self, name, entry, **kwargs):
         key = {'v41_decode_fwd': 'backbone', 'v41_prefill_fwd': 'prefill',
@@ -135,7 +137,7 @@ async def main():
         await asyncio.wait_for(engine.start(), timeout=2460)
         metadata['ready_seconds'] = time.perf_counter()-started
         (destination/'metadata.json').write_text(json.dumps(metadata, indent=2))
-        for repeat in (-1, 0, 1):
+        for repeat in (-1, 0):
             for case in cases:
                 measurement = asyncio.create_task(measure(case, repeat))
                 core = engine.single_core()
@@ -158,7 +160,7 @@ async def main():
                 await asyncio.wait_for(measurement, timeout=120)
     finally:
         await asyncio.wait_for(engine.stop(), timeout=120)
-    assert len(rows) == 32
+    assert len(rows) == 16
     summary = dict(requests=len(rows), chunk=chunk, output_tokens=sum(r['completion_tokens'] for r in rows),
                    median_ttft_ms=statistics.median(r['ttft_ms'] for r in rows),
                    median_tpot_ms=statistics.median(r['tpot_ms'] for r in rows))
