@@ -23,7 +23,7 @@ def bounded_worker(*args):
     import torch
     from pypto.runtime import device_runner
     from pypto_serving.serving.server import serving_worker
-    torch.set_num_threads(1)
+    torch.set_num_threads(int(os.environ.get("BENCH_WORKER_THREADS", "1")))
     device_runner.ThreadPoolExecutor = CompilePool
     # Load artifacts compiled from this exact official revision and configuration.
     # No ABI, model, kernel, scheduler, or argument adaptation is performed.
@@ -96,7 +96,11 @@ async def main():
                     lib_sha='eac6fb1f7de2e26ec36e2f5092f0222fcd3be2f5',
                     pypto_sha='3db18db1286bdbb44266179e3aedae659174b711',
                     fixture_sha256=hashlib.sha256(fixture.read_bytes()).hexdigest(),
-                    abi_adapter=False, torch_num_threads=1,
+                    abi_adapter=False, torch_num_threads=int(os.environ.get("BENCH_WORKER_THREADS", "1")),
+                    decode_manifest=os.environ.get("DECODE_MANIFEST"),
+                    serving_checkout=os.environ.get("BENCH_SERVING_HEAD"),
+                    decode_lib_revision=os.environ.get("BENCH_DECODE_LIB"),
+                    decode_capacity_per_dp=os.environ.get("PYPTO_V41_DECODE_BATCH_PER_DP"),
                     compiler_policy='load CPU-prepared artifacts from the same official revision')
     (destination/'metadata.json').write_text(json.dumps(metadata, indent=2))
     rows = []
