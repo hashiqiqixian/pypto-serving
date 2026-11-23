@@ -22,12 +22,15 @@ config = build_pypto_run_config(platform='a5', device_ids=[0, 1, 2, 3], pypto_bu
 config = replace(config, ring_heap=(1073741824,2147483648,4294967296,1073741824), ring_dep_pool=262144)
 compiler = KernelCompiler(run_config=config)
 topology = selected_decode_topology(root, dp_size=4)
-decode = compile_decode_fwd(compiler, root, topology)[0]
-programs, _ = compile_decode_fwd_dspark(compiler, root, topology)
+programs = {}
+if chunk != 512:
+    decode = compile_decode_fwd(compiler, root, topology)[0]
+    programs, _ = compile_decode_fwd_dspark(compiler, root, topology)
+    programs['backbone'] = decode
 prefill = compile_prefill_fwd(compiler, root, SegmentTopology.for_prefill(dp=4, max_tokens=chunk))[0]
 head = compiler.compile('v41_generation_head',
     importlib.import_module('models.deepseek_v4_1_flash.prefill_fwd').l3_generation_head)
-programs.update(backbone=decode, prefill=prefill, head=head)
+programs.update(prefill=prefill, head=head)
 manifest = {name: str(program.compiled.output_dir) for name, program in programs.items()}
 (root.parent/f'compiled-{chunk}.json').write_text(json.dumps(manifest, indent=2))
 for name, program in programs.items():

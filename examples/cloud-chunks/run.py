@@ -22,6 +22,25 @@ def bounded_worker(*args):
     from pypto_serving.serving.server import serving_worker
     torch.set_num_threads(1)
     device_runner.ThreadPoolExecutor = CompilePool
+    # Load artifacts compiled from this exact official revision and configuration.
+    # No ABI, model, kernel, scheduler, or argument adaptation is performed.
+    from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
+    from pypto_serving.model.common.compiler.compiler import KernelCompiler
+    from pypto_serving.model.common.compiler.l3_callable import L3Callable
+    root = Path('/data/pyptouser/chenshenai/tasks/pypto-official-chunks-20261123')
+    artifacts = json.loads((root/'compiled-80.json').read_text())
+    artifacts.update(json.loads((root/f'compiled-{os.environ["PERF_CHUNK"]}.json').read_text()))
+
+    def restore(self, name, entry, **kwargs):
+        key = {'v41_decode_fwd': 'backbone', 'v41_prefill_fwd': 'prefill',
+               'v41_generation_head': 'head'}.get(name, name.removeprefix('v41_dspark_'))
+        cfg = self._run_config
+        program = DistributedCompiledProgram.from_dir(
+            Path(artifacts[key]), backend_type=cfg.backend_type, execution_mode=cfg.execution_mode,
+            distributed_config=cfg.distributed_config)
+        return L3Callable(program, name, cfg.distributed_config.aicpu_thread_num)
+
+    KernelCompiler.compile = restore
     serving_worker._worker_entry(*args)
 
 
@@ -42,6 +61,7 @@ async def main():
     from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, ReplicaEngineCore
     chunk = int(sys.argv[1])
     assert chunk in (80, 128, 512)
+    os.environ['PERF_CHUNK'] = str(chunk)
     root = Path('/data/pyptouser/chenshenai/tasks/pypto-official-chunks-20261123')
     destination = root/'results'/os.environ.get('PERF_RUN_LABEL', f'official-{chunk}')
     destination.mkdir(exist_ok=False)
@@ -71,7 +91,8 @@ async def main():
                     lib_sha='eac6fb1f7de2e26ec36e2f5092f0222fcd3be2f5',
                     pypto_sha='3db18db1286bdbb44266179e3aedae659174b711',
                     fixture_sha256=hashlib.sha256(fixture.read_bytes()).hexdigest(),
-                    abi_adapter=False, torch_num_threads=1)
+                    abi_adapter=False, torch_num_threads=1,
+                    compiler_policy='load CPU-prepared artifacts from the same official revision')
     (destination/'metadata.json').write_text(json.dumps(metadata, indent=2))
     rows = []
     first = {}
