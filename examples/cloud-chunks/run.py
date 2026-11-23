@@ -114,7 +114,7 @@ async def main():
             final = output
         assert final is not None and final.finished and count == len(final.token_ids) and count > 1
         inputs = list(tokenizer.encode(case['prompt']))
-        row = dict(id=case['id'], repeat=repeat, warmup=warmup, input_token_ids=inputs,
+        row = dict(id=case['id'], request_id=request_id, repeat=repeat, warmup=warmup, input_token_ids=inputs,
                    prompt_tokens=len(inputs), completion_tokens=count, token_ids=list(final.token_ids),
                    finish_reason=final.finish_reason, text=final.text,
                    ttft_ms=(first_ns-start)/1e6, tpot_ms=(last_ns-first_ns)/1e6/(count-1))
