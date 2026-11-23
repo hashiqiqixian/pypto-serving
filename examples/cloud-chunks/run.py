@@ -46,6 +46,9 @@ def bounded_worker(*args):
         return L3Callable(program, name, cfg.distributed_config.aicpu_thread_num)
 
     KernelCompiler.compile = restore
+    if os.environ.get("BENCH_NATIVE_PROJECTION") == "1":
+        from projection_binding import install
+        install()
     serving_worker._worker_entry(*args)
 
 
@@ -101,7 +104,8 @@ async def main():
                     serving_checkout=os.environ.get("BENCH_SERVING_HEAD"),
                     decode_lib_revision=os.environ.get("BENCH_DECODE_LIB"),
                     decode_capacity_per_dp=os.environ.get("PYPTO_V41_DECODE_BATCH_PER_DP"),
-                    compiler_policy='load CPU-prepared artifacts from the same official revision')
+                    native_projection=os.environ.get("BENCH_NATIVE_PROJECTION") == "1",
+                    compiler_policy='load CPU-prepared pinned artifacts and the selected recurrent revision')
     (destination/'metadata.json').write_text(json.dumps(metadata, indent=2))
     rows = []
     first = {}
